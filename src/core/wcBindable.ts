@@ -18,7 +18,7 @@ import { IWcBindable } from "../types.js";
  * definition only: the Shell imports `STRIPE_CORE_WC_BINDABLE` from here,
  * and only uses `StripeCore` via `import type { StripeCore }` (type refs
  * are erased at emit time). `StripeCore.ts` remains a node-only module
- * reached through `@wc-bindable/stripe/server`.
+ * reached through `@csbc-dev/stripe/server`.
  */
 export const STRIPE_CORE_WC_BINDABLE: IWcBindable = {
   protocol: "wc-bindable",

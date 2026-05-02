@@ -8,10 +8,10 @@ export function registerComponents(): void {
   // `customElements.get(...)` access below. That failure mode is hostile
   // for SSR setups that accidentally evaluate the browser barrel on the
   // server: the actual misuse (wrong entry point — use
-  // `@wc-bindable/stripe/server` for Node) is invisible. Surface it
+  // `@csbc-dev/stripe/server` for Node) is invisible. Surface it
   // with a formatted message instead.
   if (typeof customElements === "undefined") {
-    raiseError("registerComponents() requires a browser — customElements is undefined. Use @wc-bindable/stripe/server for Node.");
+    raiseError("registerComponents() requires a browser — customElements is undefined. Use @csbc-dev/stripe/server for Node.");
   }
   const tag = getConfig().tagNames.stripe;
   const existing = customElements.get(tag);

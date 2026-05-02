@@ -1,9 +1,7 @@
 {
   "permissions": {
     "allow": [
-      "Read(//c/Users/kikuzawa/Documents/git/**)",
       "Bash(npm view *)",
-      "PowerShell($src = \"C:\\\\Users\\\\kikuzawa\\\\Documents\\\\git\\\\wc-bindable-protocol\\\\wc-bindable-protocol\\\\packages\\\\stripe\"; $dst = \"C:\\\\Users\\\\kikuzawa\\\\Documents\\\\git\\\\csbc-dev\\\\stripe\"; $exclude = @\\('node_modules','dist','test-results'\\); Get-ChildItem -Path $src -Force | Where-Object { $exclude -notcontains $_.Name -and $_.Name -ne 'tsconfig.tsbuildinfo' } | ForEach-Object { Copy-Item -Path $_.FullName -Destination $dst -Recurse -Force }; Get-ChildItem -Path $dst -Force | Select-Object Name)",
       "Bash(npm install *)"
     ]
   }

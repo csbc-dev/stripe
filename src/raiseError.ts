@@ -1,3 +1,3 @@
 export function raiseError(message: string): never {
-  throw new Error(`[@wc-bindable/stripe] ${message}`);
+  throw new Error(`[@csbc-dev/stripe] ${message}`);
 }

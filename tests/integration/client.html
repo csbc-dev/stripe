@@ -8,7 +8,7 @@
     "imports": {
       "@wc-bindable/core": "/packages/core/dist/index.js",
       "@wc-bindable/remote": "/packages/remote/dist/index.js",
-      "@wc-bindable/stripe": "/packages/stripe/dist/index.js"
+      "@csbc-dev/stripe": "/packages/stripe/dist/index.js"
     }
   }
   </script>
@@ -22,7 +22,7 @@
 
     const params = new URLSearchParams(location.search);
     const scenario = params.get("scenario") ?? "submit";
-    const { bootstrapStripe, WcsStripe } = await import("@wc-bindable/stripe");
+    const { bootstrapStripe, WcsStripe } = await import("@csbc-dev/stripe");
 
     const loaderCalls = [];
     const confirmCalls = [];

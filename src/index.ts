@@ -5,7 +5,7 @@
 // base with a `typeof` fallback so *this* barrel stays evaluable under
 // plain Node (SSR pre-render, test pre-scanners, bundler graph walks); the
 // fallback does not make the component functional on the server — the
-// supported Node entry is still `@wc-bindable/stripe/server` (see
+// supported Node entry is still `@csbc-dev/stripe/server` (see
 // `./server.ts` and README §Server).
 export { bootstrapStripe } from "./bootstrapStripe.js";
 export { getConfig, getRemoteCoreUrl } from "./config.js";

@@ -23,6 +23,9 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Claude Code (local-only settings)
+.claude/settings.local.json
+
 # Env
 .env
 .env.*

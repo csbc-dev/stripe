@@ -457,7 +457,7 @@ export class StripeCore extends EventTarget {
    * StripeAPIError, …) or is one of the known Stripe API object tokens
    * in `_STRIPE_KNOWN_TYPES` (card_error, invalid_request_error,
    * api_error, …) 窶・or (b) one of our own
-   * `[@wc-bindable/stripe]`-prefixed internal errors whose messages
+   * `[@csbc-dev/stripe]`-prefixed internal errors whose messages
    * are hand-curated. Anything else
    * (IntentBuilder throwing a raw `new Error("DB auth failed for user=...")`,
    * a network-layer exception whose `.message` contains internal hostnames,
@@ -510,7 +510,7 @@ export class StripeCore extends EventTarget {
       const stripeShaped = type !== undefined
         && (StripeCore._STRIPE_CLASS_NAME_RE.test(type) || StripeCore._STRIPE_KNOWN_TYPES.has(type));
       const internal = rawMessage !== undefined
-        && rawMessage.startsWith("[@wc-bindable/stripe]");
+        && rawMessage.startsWith("[@csbc-dev/stripe]");
       const safeMessage = (stripeShaped || internal) && rawMessage !== undefined
         ? rawMessage
         : "Payment failed.";
@@ -677,7 +677,7 @@ export class StripeCore extends EventTarget {
       } else if (this._cancelSetupIntents && this._provider.cancelSetupIntent) {
         this._provider.cancelSetupIntent(creation.intentId).catch(() => { /* best-effort */ });
       }
-      throw new Error("[@wc-bindable/stripe] requestIntent superseded.");
+      throw new Error("[@csbc-dev/stripe] requestIntent superseded.");
     }
 
     this._activeIntent = { id: creation.intentId, mode, generation: gen };

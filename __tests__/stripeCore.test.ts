@@ -1937,17 +1937,17 @@ describe("StripeCore", () => {
       expect(c.error?.message).toBe("Payment failed.");
     });
 
-    it("forwards our own [@wc-bindable/stripe]-prefixed internal errors", async () => {
+    it("forwards our own [@csbc-dev/stripe]-prefixed internal errors", async () => {
       // Internal errors are hand-curated and carry useful programmer-facing
       // info (e.g. "provider returned no id/client_secret"). They are not
       // Stripe-shaped (no .type) so they would otherwise collapse to the
       // generic message, hurting debuggability.
       const c = new StripeCore(provider);
       c.registerIntentBuilder(() => {
-        throw new Error("[@wc-bindable/stripe] builder invariant violated.");
+        throw new Error("[@csbc-dev/stripe] builder invariant violated.");
       });
       await expect(c.requestIntent({ mode: "payment", hint: {} })).rejects.toThrow();
-      expect(c.error?.message).toBe("[@wc-bindable/stripe] builder invariant violated.");
+      expect(c.error?.message).toBe("[@csbc-dev/stripe] builder invariant violated.");
     });
 
     it("falls back to generic message when the thrown value has no usable shape", async () => {

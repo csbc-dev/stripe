@@ -1,6 +1,6 @@
-# @wc-bindable/stripe
+# @csbc-dev/stripe
 
-`@wc-bindable/stripe` is a headless **Stripe payments** component built on wc-bindable-protocol.
+`@csbc-dev/stripe` is a headless **Stripe payments** component built on wc-bindable-protocol.
 
 It is not a visual UI widget.
 It is an **I/O node** that connects Stripe's PaymentIntent / SetupIntent + Elements flow to reactive state — with PCI-safe card entry, 3DS redirect handling, and server-side webhook reconciliation.
@@ -8,13 +8,13 @@ It is an **I/O node** that connects Stripe's PaymentIntent / SetupIntent + Eleme
 - **input / command surface**: `mode`, `amount-value`, `amount-currency`, `customer-id`, `publishable-key`, `return-url`, `prepare()`, `submit()`, `reset()`, `abort()`
 - **output state surface**: `status`, `loading`, `amount`, `paymentMethod`, `intentId`, `error`
 
-`@wc-bindable/stripe` follows the [HAWC](https://github.com/wc-bindable-protocol/wc-bindable-protocol/blob/main/packages/hawc/README.md) architecture:
+`@csbc-dev/stripe` follows the **CSBC (Core/Shell Bindable Component)** architecture:
 
 - **Core** (`StripeCore`) lives server-side. Owns the Stripe secret key (via `IStripeProvider`), creates PaymentIntents / SetupIntents, verifies and dispatches webhook events.
 - **Shell** (`<stripe-checkout>`) lives in the browser. Loads Stripe.js, mounts the Payment Element in an iframe **sandboxed by Stripe**, drives `confirmPayment` / `confirmSetup`, handles the 3DS redirect return.
 - **Card data never traverses the WebSocket** — Stripe Elements posts it directly to Stripe from within its iframe; only PaymentIntent creation, confirmation outcomes, and webhook-driven status updates flow through our server.
 
-In the HAWC taxonomy this is the **Case C** shape: the Core owns decisions and policy on the server, while the Shell is a browser-anchored execution engine for a data plane the server cannot perform on the browser's behalf.
+In the CSBC taxonomy this is the **Case C** shape: the Core owns decisions and policy on the server, while the Shell is a browser-anchored execution engine for a data plane the server cannot perform on the browser's behalf.
 
 See [SPEC.md](./SPEC.md) for the full protocol — state machine, wcBindable surface, authorization model for 3DS resume, PCI scope invariants, webhook pipeline, and the security section that apps must follow in production.
 
@@ -22,7 +22,7 @@ See [SPEC.md](./SPEC.md) for the full protocol — state machine, wcBindable sur
 
 ### Server
 
-Server-side code **must** import from the `/server` subpath. The bare package name `@wc-bindable/stripe` is the browser barrel — it re-exports `<stripe-checkout>` (a Custom Element built on `HTMLElement`). The component guards its `HTMLElement` base with a `typeof` fallback so the barrel *evaluates* under plain Node without crashing (useful for SSR pre-render, test pre-scanners, and bundler graph walks that touch the root specifier), but the component is **not functional on the server** — there is no `customElements` registry, no DOM, no Stripe.js. `StripeCore` / `StripeSdkProvider` are exported **only** from `/server` so Node-side code reaches the headless pieces through the entry intended for it, not through the browser surface.
+Server-side code **must** import from the `/server` subpath. The bare package name `@csbc-dev/stripe` is the browser barrel — it re-exports `<stripe-checkout>` (a Custom Element built on `HTMLElement`). The component guards its `HTMLElement` base with a `typeof` fallback so the barrel *evaluates* under plain Node without crashing (useful for SSR pre-render, test pre-scanners, and bundler graph walks that touch the root specifier), but the component is **not functional on the server** — there is no `customElements` registry, no DOM, no Stripe.js. `StripeCore` / `StripeSdkProvider` are exported **only** from `/server` so Node-side code reaches the headless pieces through the entry intended for it, not through the browser surface.
 
 > ⚠️ **Lifecycle note**: this Quick Start shows the Core wired up **at request / connection time** — `authenticatedUser` and `activeCartId` are per-request values resolved by your auth middleware. Do NOT build a single module-level `StripeCore` at server startup and try to close over request-scoped variables — that pattern captures `undefined` at module-eval time and, worse, shares one `userContext` across every tenant. Two production-safe shapes:
 >
@@ -51,7 +51,7 @@ Server-side code **must** import from the `/server` subpath. The bare package na
 
 ```ts
 import Stripe from "stripe";
-import { StripeCore, StripeSdkProvider } from "@wc-bindable/stripe/server";
+import { StripeCore, StripeSdkProvider } from "@csbc-dev/stripe/server";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
 const provider = new StripeSdkProvider(stripe, {
@@ -97,7 +97,7 @@ core.registerWebhookHandler("payment_intent.succeeded", async (event) => {
 //       · stripe-checkout input/config guards (missing rawBody, missing
 //         stripe-signature header, webhookSecret not configured on the
 //         Core). These come through as plain Errors whose `message`
-//         starts with `[@wc-bindable/stripe]`.
+//         starts with `[@csbc-dev/stripe]`.
 //   5xx — Stripe retries per its delivery policy. Reserve for fatal
 //     fulfillment handler failures (DB write failed, downstream 5xx).
 // StripeCore keeps a best-effort in-memory dedup window keyed by
@@ -111,7 +111,7 @@ app.post("/webhooks/stripe", async (req, res) => {
     const e = err as { type?: string; message?: string };
     const isSignatureError = e?.type === "StripeSignatureVerificationError";
     const isInputOrConfigError =
-      typeof e?.message === "string" && e.message.startsWith("[@wc-bindable/stripe]");
+      typeof e?.message === "string" && e.message.startsWith("[@csbc-dev/stripe]");
     res.status(isSignatureError || isInputOrConfigError ? 400 : 500).end();
   }
 });
@@ -146,7 +146,7 @@ The Quick Start is **deliberately minimal** and **not production-ready**. Before
 - **Keep webhook handlers idempotent** even with Core dedup enabled. Core suppresses duplicate `event.id` deliveries only within an in-memory per-process window; multi-process routing and process restarts still require DB-backed idempotency keyed by `event.id`.
 - **Consider `registerResumeAuthorizer`** for multi-tenant deployments so a leaked `client_secret` alone cannot resume a foreign user's intent.
 - **Handle WebSocket disconnects in your app** (remote mode only). The `<stripe-checkout>` element connects once per mount and does NOT auto-reconnect on `close` / `error` events (mobile network drop, server rolling deploy, LB idle timeout). Subscribe to `stripe-checkout:error` and, on `code: "transport_unavailable"`, remove + re-append the element — or prompt the user to retry. See SPEC §9.3 for the rationale (auto-reconnect would push backoff policy, in-flight promise handling, and infinite-retry safety onto the library).
-- **Sanitize errors** that cross the wire: the built-in sanitizer keeps `code` / `decline_code` / `type` and forwards `message` only for Stripe-shaped errors (type starts with `Stripe` or matches a known Stripe taxonomy token like `card_error` / `invalid_request_error`) and our own `[@wc-bindable/stripe]`-prefixed internals — anything else collapses to a generic `"Payment failed."` so a raw `new Error("FATAL: ...")` from an `IntentBuilder` does not reach the browser. **Do not fake Stripe type tokens on your own errors** (`Object.assign(err, { type: "card_error" })`) — that bypasses the allowlist. Custom handlers you add (webhook fulfillment, authorizers) must be equally careful. See SPEC §6.3.1.
+- **Sanitize errors** that cross the wire: the built-in sanitizer keeps `code` / `decline_code` / `type` and forwards `message` only for Stripe-shaped errors (type starts with `Stripe` or matches a known Stripe taxonomy token like `card_error` / `invalid_request_error`) and our own `[@csbc-dev/stripe]`-prefixed internals — anything else collapses to a generic `"Payment failed."` so a raw `new Error("FATAL: ...")` from an `IntentBuilder` does not reach the browser. **Do not fake Stripe type tokens on your own errors** (`Object.assign(err, { type: "card_error" })`) — that bypasses the allowlist. Custom handlers you add (webhook fulfillment, authorizers) must be equally careful. See SPEC §6.3.1.
 - **Keep `publishable-key` and the server Core's secret key aligned to the same Stripe account**. The Shell (browser) is bound to `publishable-key`, the Core (server) holds the secret key via its injected `IStripeProvider`. A `publishable-key` swap invalidates cached Stripe.js and cancels the orphan intent on the *previously active* account, but it does NOT reconfigure the Core — the Core will keep creating intents under the old secret key until you construct a new `StripeCore` with a provider pointing at the new account. For multi-account routing, build one Core per account and route requests before they reach `requestIntent`.
 
 Core observability events include `stripe-checkout:webhook-deduped` with `detail: { eventId, type }` whenever a duplicate authenticated webhook is suppressed by the dedup window.
@@ -154,7 +154,7 @@ Core observability events include `stripe-checkout:webhook-deduped` with `detail
 ## Install
 
 ```bash
-npm install @wc-bindable/stripe stripe @stripe/stripe-js
+npm install @csbc-dev/stripe stripe @stripe/stripe-js
 ```
 
 `stripe` (server SDK) and `@stripe/stripe-js` (browser loader) are declared as optional peer dependencies. Install whichever side you consume.

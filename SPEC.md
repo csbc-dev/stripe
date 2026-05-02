@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-`stripe-checkout` は Stripe 決済を HAWC アーキテクチャに載せる。HAWC 分類上は **Case C(browser-anchored execution Shell)** に属する。
+`stripe-checkout` は Stripe 決済を CSBC アーキテクチャに載せる。CSBC 分類上は **Case C(browser-anchored execution Shell)** に属する。
 
 - **なぜ Case C か**: Stripe Elements の card input は PCI / XSS 隔離のため iframe として DOM に mount される必要があり、これは WebSocket 越しにサーバー Core へ委譲できない platform-anchored execution である。
 - **なぜ Core が必要か**: PaymentIntent / SetupIntent の作成には `STRIPE_SECRET_KEY` が必須で、これをブラウザに渡せば PCI / 認可の両方で破綻する。webhook 検証も同様にサーバー側でしか成立しない。
@@ -401,7 +401,7 @@ Stripe.js の契約上、`confirmPayment` / `confirmSetup` の戻り値は `{ pa
   - ❌ `throw Object.assign(new Error("DB credentials at 10.0.0.5 rejected"), { type: "card_error" });`
   - `type: "card_error"` を捏造すると、本来 wire 転送しない内部メッセージが allowlist を通過してしまう。
 - **DB / 外部サービス由来の生例外はサニタイズしてから throw する**。例:
-  - ✅ `throw Object.assign(new Error("[@wc-bindable/stripe] builder: cart lookup failed"), {});`
+  - ✅ `throw Object.assign(new Error("[@csbc-dev/stripe] builder: cart lookup failed"), {});`
   - ✅ `try { ... } catch { raiseError("builder: unable to resolve amount for cart"); }`
 - Stripe SDK が自然に throw する `StripeCardError` 等は **そのまま** 通して良い。Stripe 側のメッセージはユーザー向けに設計されている。
 
@@ -605,7 +605,7 @@ auth0-gate における token 非露出と同じ哲学。
 packages/stripe/
   SPEC.md                       (this document)
   README.md                     (quick start / install / API ref)
-  package.json                  @wc-bindable/stripe
+  package.json                  @csbc-dev/stripe
   src/
     core/StripeCore.ts
     components/Stripe.ts        (<stripe-checkout> HTMLElement)
@@ -619,7 +619,7 @@ packages/stripe/
   tests/                        (playwright e2e, Elements mount 検証)
 ```
 
-- npm scope: `@wc-bindable/stripe`
+- npm scope: `@csbc-dev/stripe`
 - tag: `<stripe-checkout>`
 - peerDependencies: `stripe`(server Provider が使う。optional: true)、`@stripe/stripe-js`(Shell がロードに使う。optional: true)
 

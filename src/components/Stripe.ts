@@ -1079,7 +1079,7 @@ export class Stripe extends HTMLElementCtor {
     // Without this, a mispasted secret key (`sk_live_...`) gets all the
     // way to Stripe.js before failing with an opaque "Invalid API Key"
     // message — the local fail-loud here turns a DX cliff into an
-    // `[@wc-bindable/stripe]`-prefixed diagnostic.
+    // `[@csbc-dev/stripe]`-prefixed diagnostic.
     if (!this.publishableKey.startsWith("pk_")) {
       raiseError('publishable-key must be a Stripe publishable key (starts with "pk_").');
     }
@@ -1220,7 +1220,7 @@ export class Stripe extends HTMLElementCtor {
       await this.prepare();
     }
     if (!this._paymentElement || !this._elements || !this._clientSecret) {
-      const err = new Error("[@wc-bindable/stripe] Elements not mounted — prepare() did not complete.");
+      const err = new Error("[@csbc-dev/stripe] Elements not mounted — prepare() did not complete.");
       this._setErrorState({ message: err.message });
       throw err;
     }

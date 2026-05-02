@@ -1,7 +1,7 @@
 /**
  * Server-side entry point.
  *
- * The default barrel (`@wc-bindable/stripe`) re-exports `<stripe-checkout>`
+ * The default barrel (`@csbc-dev/stripe`) re-exports `<stripe-checkout>`
  * which extends `HTMLElement`. Loading that class from Node throws
  * `ReferenceError: HTMLElement is not defined`, so server-side consumers
  * (Express/Fastify/Hono routes that create intents, handle webhooks, or

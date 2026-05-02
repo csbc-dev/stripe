@@ -1,6 +1,6 @@
 // @vitest-environment node
 //
-// Regression guard: the package root `@wc-bindable/stripe` must
+// Regression guard: the package root `@csbc-dev/stripe` must
 // *evaluate* under plain Node. The component barrel transitively pulls
 // `components/Stripe.ts` which extends `HTMLElement`, so without the
 // `typeof HTMLElement` fallback introduced in that file the module crashes
@@ -31,7 +31,7 @@
 // to mount Elements into. These tests assert only that import does not
 // throw and that the surface is what the publish contract promises.
 // Runtime server-side usage remains routed through
-// `@wc-bindable/stripe/server`.
+// `@csbc-dev/stripe/server`.
 
 import { describe, it, expect } from "vitest";
 import { existsSync, readFileSync } from "node:fs";

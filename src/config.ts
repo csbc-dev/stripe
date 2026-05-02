@@ -130,7 +130,7 @@ function validatePartialConfig(partialConfig: IWritableConfig): void {
     // `null` slips past `!== undefined` but breaks the `in` operator below
     // with a TypeError whose message predates raiseError's formatting. Reject
     // non-object shapes explicitly so callers see the consistent
-    // `[@wc-bindable/stripe]`-prefixed error.
+    // `[@csbc-dev/stripe]`-prefixed error.
     if (typeof partialConfig.tagNames !== "object" || partialConfig.tagNames === null) {
       raiseError("config.tagNames must be an object.");
     }
