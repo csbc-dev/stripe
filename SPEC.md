@@ -423,6 +423,8 @@ Stripe.js の契約上、`confirmPayment` / `confirmSetup` の戻り値は `{ pa
 ></stripe-checkout>
 ```
 
+**内部 mount コンテナについて**: Shell は `prepare()` が成功すると `<stripe-checkout>` の子として `<div data-stripe-checkout-mount="">` を 1 つ生成し、その div に Stripe Elements の Payment Element を mount する。`reset()` / `abort()` / `disconnectedCallback` で破棄される。この属性は **internal anchor** であり後方互換は保証しない — テストやスタイルから tag 経由 (`stripe-checkout > div`) で参照するに留め、属性値そのもの (`[data-stripe-checkout-mount]`) を CSS / JS のセレクタにハードコードしないこと。将来この命名は予告なく変更されうる。
+
 ### 7.2 JS Properties(bindable surface と同じ)
 
 読み取り: `el.status`, `el.loading`, `el.amount`, `el.paymentMethod`, `el.intentId`, `el.error`
@@ -449,6 +451,12 @@ Stripe.js の契約上、`confirmPayment` / `confirmSetup` の戻り値は `{ pa
 - `stripe-checkout:element-ready` — Stripe Elements の Payment Element が `ready` を発火したとき。`detail` なし
 - `stripe-checkout:element-change` — Payment Element の `change` イベント。`detail: { complete: boolean }` のみ (入力値そのものは PCI スコープを避けるため転送しない)
 - `stripe-checkout:stale-config` — `prepare()` 成功後に `mode` / `amount-value` / `amount-currency` / `customer-id` 属性が変更されたとき。現在の mounted Elements はその時点の値に束縛されているため、変更を効かせるには `reset()` / `abort()` + 再 `prepare()` が必要。`detail: { field, message }`
+- `stripe-checkout:input-warning` — `attributeChangedCallback` で属性値が想定形式でなかったとき。発火条件は以下の 3 ケース:
+  - `amount-value` が finite な数値に解釈できない (例: `amount-value="abc"`)。DOM 属性は raw 文字列を保持するが getter / Core 同期値は `null` に collapse するため、subscription 側でズレを検知できるよう警告する。
+  - `mode` が `"payment"` / `"setup"` / 空文字 / unset 以外 (例: `mode="subscription"`)。getter は `"payment"` にフォールバックするが、属性値とのズレを警告する。
+  - `publishable-key` が `pk_` で始まらない (例: 秘密キー `sk_live_...` の mispaste)。prepare() は別途 reject するが、診断ループ短縮のため早期に警告する。
+  
+  `detail: { field, value?, message }`。`value` は raw 属性文字列だが、機微な属性 (現状 `publishable-key`) では意図的に omit する — 明らかに誤った値であっても本物の `sk_live_...` 秘密キーである可能性があり、warning フレームに乗せると observability sink へ秘密が再伝搬してしまうため。新たに機微フィールドを追加する場合も同じ判断を踏襲する。
 - `stripe-checkout:unknown-status` — Stripe.js confirm 結果または retrieve の `status` が既知ユニオン外だったとき、あるいは Stripe.js が `{ paymentIntent, setupIntent, error }` いずれも返さない malformed レスポンスを返したとき。`detail: UnknownStatusDetail = { source, intentId, mode, status, reason? }`。`source` で派生を識別: `"shell-confirm"` (Shell `_applyIntentOutcome` default) / `"shell-malformed"` (Stripe.js 異常応答) / `"core"` (Core `_reconcileFromIntentView` default, retrieve 由来)。webhook 権威に委ねる運用のためエラーとは扱わないが、webhook 未配送時のタイムアウト / エスカレーション判断に使える
 - `stripe-checkout:missing-return-url-warning` — `submit()` 到達時点で `return-url` 未設定かつ `mode="payment"` だった場合に一度だけ発火 (prepare ライフサイクルごとに再武装)。redirect を要する PM (3DS cards, Konbini, wallets, Klarna, 等) では confirm 時に Stripe.js が throw する
 - `stripe-checkout:dispose-warning` — remote モードの disconnect 時 best-effort cleanup (`cancelIntent` / `reset` / `unbind` / `proxy.dispose` / `ws.close`) が失敗したときに、`detail: { phase, error }` で通知。要素は DOM-detached 直前のため、`el.addEventListener` で先行登録された listener (テスト / オブザーバビリティ) のみが受け取る
@@ -459,7 +467,7 @@ Stripe.js の契約上、`confirmPayment` / `confirmSetup` の戻り値は `{ pa
 - `stripe-checkout:authorizer-error` — `registerResumeAuthorizer` が登録した authorizer が throw したとき。`detail: { error, intentId, mode }` (server-side 運用者向け; 生例外は wire には流さず denial として扱う)
 - `stripe-checkout:unknown-status` — Core 側の `_reconcileFromIntentView` が未知 Stripe status を観測したとき。`detail: { source: "core", intentId, mode, status }`
 
-`error` は `-changed` サフィックスを持たない (Core の `wcBindable.properties` 宣言と一致)。`-warning` 接尾辞は「UI を壊さない補足情報」の共通ファミリー (`appearance-warning` / `webhook-warning` / `missing-return-url-warning` / `dispose-warning`)。
+`error` は `-changed` サフィックスを持たない (Core の `wcBindable.properties` 宣言と一致)。`-warning` 接尾辞は「UI を壊さない補足情報」の共通ファミリー (`appearance-warning` / `webhook-warning` / `missing-return-url-warning` / `dispose-warning` / `input-warning`)。
 
 ### 7.5 disconnectedCallback の契約
 
@@ -479,6 +487,26 @@ Stripe.js の契約上、`confirmPayment` / `confirmSetup` の戻り値は `{ pa
 Core が作成した intent が Stripe 自然 expiry まで残存する可能性がある。
 Core の `reset` は Stripe API cancel を叩かない設計であるため。実害はないが
 stale row が気になるアプリは DOM 削除前に `await el.abort()` を呼ぶ。
+
+### 7.6 Static observability hooks
+
+Shell クラス (`Stripe`) はモジュール realm 共有の static 注入点を 2 つ公開する。
+どちらも全 `<stripe-checkout>` 要素に共通で作用する global 状態のため、
+テストで一時的に差し替えた場合は teardown で reset すること。
+
+- `Stripe.setLoader(loader)` / `Stripe.resetLoader()` — Stripe.js のロード関数を差し替える。
+  シグネチャは `(publishableKey: string) => Promise<StripeJsLike>`。テストでモック注入、
+  あるいは複数 PK を多重ロードする CDN フォールバック等のための seam。
+  default は `loadStripe` ベースで `STRIPE_JS_URL` を尊重するローダ。
+- `Stripe.setLogger(logger)` / `Stripe.resetLogger()` — best-effort cleanup 経路 (remote
+  disconnect の `_disposeRemoteWithBestEffortReset`、`abort()` の `_teardownElements` 等)
+  で発生した例外の観測 sink を差し替える。シグネチャは `(phase: string, error: unknown) => void`。
+  default は no-op。`stripe-checkout:dispose-warning` がバブルできない (要素が DOM-detached
+  済み) 状況でも production observability に流すための fanout。logger が throw しても
+  cleanup は継続する (内部で try/catch される)。
+
+両者とも `private static` なので外部から `Stripe._loader = ...` のような直接代入はできない。
+公開された setter / resetter のみが正規の入口。
 
 ---
 
@@ -623,6 +651,20 @@ packages/stripe/
 - tag: `<stripe-checkout>`
 - peerDependencies: `stripe`(server Provider が使う。optional: true)、`@stripe/stripe-js`(Shell がロードに使う。optional: true)
 
+### 11.1 Runtime requirements(server entry)
+
+`@csbc-dev/stripe/server`(= `StripeCore` / `StripeSdkProvider`) は **Node.js 専用**である:
+
+- `StripeCore` は `clientSecret` 定数時間比較に `node:crypto` の `timingSafeEqual` と `Buffer` を使う(`src/core/StripeCore.ts` の `clientSecretEquals`)。
+- `StripeSdkProvider` は `stripe` (stripe-node) を直接ロードする。stripe-node は内部で Node-only モジュール (`node:https`, `node:zlib`, `node:tls`) を使う。
+
+CSBC の一般原則として "Core は EventTarget のみ要求するので Deno / Workers でも動く" と書かれているが、`@csbc-dev/stripe` の場合はこの一般原則を **意図的に Node 専用に絞っている**:
+
+1. Stripe webhook 署名検証(stripe-node の `webhooks.constructEvent`)が Node の `crypto` ハッシュ API に依存する。
+2. `clientSecret` の constant-time compare は Web Crypto に同等 API がない(`crypto.subtle.timingSafeEqual` は ECMAScript 標準にも Web Crypto WG にも存在しない)。
+
+将来 Deno / Workers / Bun への移植が必要になった場合は、`clientSecretEquals` を自前 XOR ループに書き直し、provider seam を runtime ごとに分岐させることで対応可能だが、v1 では Node-only と確定している。
+
 ---
 
 ## 12. Versioning
@@ -630,3 +672,5 @@ packages/stripe/
 - v1.0: 本 SPEC の範囲(PaymentIntent + SetupIntent + webhook + 3DS)
 - v1.x: Appearance API の preset、i18n、Apple Pay / Google Pay の Payment Request Button 統合
 - v2.0: `payment-abstract` 抽象との統合、または Checkout / Connect 追加に伴う breaking change が必要になった時点
+
+> Note: ここでの "v1.0" は **SPEC のバージョン**であって `@csbc-dev/stripe` パッケージのバージョンではない。npm 上の `@csbc-dev/stripe@0.x` は SPEC v1 の実装フェーズで、API は SPEC v1 の輪郭に従いつつ実装ディテールがまだ揺れる可能性があることを `0.x` で表明している。パッケージが `1.0.0` に上がるのは実装が安定した時点で、それより前から SPEC v1 の不変条件 (PCI scope / clientSecret 非露出 / IntentBuilder 必須 / webhook raw body 等) は維持される。

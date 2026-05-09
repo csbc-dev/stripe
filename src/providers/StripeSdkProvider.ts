@@ -70,6 +70,23 @@ function extractAmount(obj: Record<string, unknown>): StripeAmount | undefined {
   return undefined;
 }
 
+/**
+ * Extract `last_payment_error` / `last_setup_error` from a retrieved
+ * Stripe intent into the `StripeError` shape `StripeIntentView` carries.
+ *
+ * **Caller MUST sanitize the result before letting it cross the wire or
+ * reach observable state.** This helper performs only typeof / shape
+ * normalization (`code`, `decline_code` → `declineCode`, `type`,
+ * `message`); it does NOT taxonomy-gate `code` / `declineCode` / `type`,
+ * does NOT length-cap `message`, and does NOT collapse non-Stripe-shaped
+ * errors to "Payment failed." The Core's `_reconcileFromIntentView`
+ * re-runs `_sanitizeError` on `view.lastPaymentError` before any
+ * `_setError` call, which is the boundary where the allowlist + length
+ * cap + Stripe-shape check actually run. Provider-level callers that
+ * surface this struct anywhere else (custom IStripeProvider wrappers,
+ * test introspection on a `StripeIntentView`) MUST mirror that
+ * sanitization before broadcast.
+ */
 function extractLastPaymentError(obj: Record<string, unknown>): StripeError | undefined {
   const err = obj.last_payment_error ?? obj.last_setup_error;
   if (err && typeof err === "object") {

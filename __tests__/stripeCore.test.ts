@@ -1153,7 +1153,7 @@ describe("StripeCore", () => {
       expect(() => core.registerResumeAuthorizer(() => true)).toThrow(/disposed/);
     });
 
-    it("is idempotent 窶・second dispose() is a no-op and does not throw", () => {
+    it("is idempotent — second dispose() is a no-op and does not throw", () => {
       core.dispose();
       expect(() => core.dispose()).not.toThrow();
     });
@@ -1202,7 +1202,7 @@ describe("StripeCore", () => {
       // webhookSecret was non-null at construction (`whsec_test` above).
       // After dispose the public command gate fires first, so we cannot
       // directly observe the null — the test captures the invariant via
-      // the dispose→handleWebhook error path instead.
+      // the dispose→ handleWebhook error path instead.
       core.dispose();
       await expect(core.handleWebhook("{}", "sig")).rejects.toThrow(/disposed/);
     });

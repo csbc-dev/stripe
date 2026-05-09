@@ -58,6 +58,9 @@
       "optional": true
     }
   },
+  "engines": {
+    "node": ">=18"
+  },
   "devDependencies": {
     "@playwright/test": "^1.59.1",
     "@stripe/stripe-js": "^5.0.0",

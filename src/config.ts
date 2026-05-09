@@ -50,8 +50,14 @@ const _config: IInternalConfig = {
 function deepFreeze<T>(obj: T): T {
   if (obj === null || typeof obj !== "object") return obj;
   Object.freeze(obj);
-  for (const key of Object.keys(obj)) {
-    deepFreeze((obj as Record<string, unknown>)[key]);
+  // `Reflect.ownKeys` covers symbol-keyed and non-enumerable properties in
+  // addition to the enumerable string keys `Object.keys` returns. For the
+  // current schema this is purely defensive — every config slot is a plain
+  // string-keyed enumerable own property — but a future symbol-keyed
+  // metadata field would otherwise slip past freezing and quietly remain
+  // mutable through the deep-frozen surface.
+  for (const key of Reflect.ownKeys(obj)) {
+    deepFreeze((obj as Record<string | symbol, unknown>)[key]);
   }
   return obj;
 }
@@ -94,6 +100,11 @@ let frozenConfig: IConfig | null = null;
  *
  * Every getter returns a value off the deep-frozen `getConfig()` snapshot, so
  * deep mutations (`config.remote.remoteCoreUrl = "x"`) also fail.
+ *
+ * TODO(v2): remove this export. The only remaining consumer is the
+ * `__tests__/config.test.ts` readback assertion suite — once those move to
+ * `getConfig()`, drop this binding and shrink the publish surface to
+ * `getConfig` / `setConfig` / `getRemoteCoreUrl`.
  */
 export const config: IConfig = Object.freeze(
   Object.defineProperties({} as IConfig, {
@@ -140,8 +151,23 @@ function validatePartialConfig(partialConfig: IWritableConfig): void {
         raiseError(`config.tagNames: unknown key "${k}".`);
       }
     }
-    if ("stripe" in t && t.stripe !== undefined && typeof t.stripe !== "string") {
-      raiseError("config.tagNames.stripe must be a string.");
+    if ("stripe" in t && t.stripe !== undefined) {
+      if (typeof t.stripe !== "string") {
+        raiseError("config.tagNames.stripe must be a string.");
+      }
+      // Custom-element name validation (HTML spec, simplified): must be
+      // non-empty, start with an ASCII lowercase letter, contain at least
+      // one hyphen (so it cannot collide with a built-in element), and use
+      // only the conservative subset of PCEN code points we actually need
+      // (`a-z 0-9 . - _`). Without this, `setConfig({ tagNames: { stripe:
+      // "FooBar" } })` lets `customElements.define()` throw an opaque
+      // DOMException at registration time, which is much harder to map
+      // back to its origin than a fail-loud setConfig error.
+      if (!/^[a-z][a-z0-9.\-_]*-[a-z0-9.\-_]*$/.test(t.stripe)) {
+        raiseError(
+          "config.tagNames.stripe must be a non-empty hyphen-containing custom element name (e.g. \"stripe-checkout\").",
+        );
+      }
     }
   }
 

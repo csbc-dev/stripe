@@ -62,8 +62,6 @@ function createFakeStripeJs() {
     elements: () => elements,
     async confirmPayment(opts) { confirmCalls.push({ kind: "payment", opts }); return nextConfirmResult ?? { paymentIntent: { id: "pi_shell", status: "succeeded" } }; },
     async confirmSetup(opts) { confirmCalls.push({ kind: "setup", opts }); return nextConfirmResult ?? { setupIntent: { id: "seti_shell", status: "succeeded" } }; },
-    async retrievePaymentIntent() { return { paymentIntent: { id: "pi_shell", status: "succeeded" } }; },
-    async retrieveSetupIntent() { return { setupIntent: { id: "seti_shell", status: "succeeded" } }; },
   };
   return {
     stripeJs,
@@ -161,6 +159,63 @@ describe("<stripe-checkout> Shell", () => {
       expect(el.intentId).toBe("pi_shell");
     });
 
+    it("attachLocalCore injects the element as the Core's event target — status-changed bubbles to el listeners", async () => {
+      // Regression: `_setStatus` / `_setLoading` / etc. dispatch on
+      // `core._target`. Without target injection on attach, the target
+      // defaults to the Core itself and `el.addEventListener("...:status-
+      // changed", ...)` on the Shell never fires — UIs wired through the
+      // standard Custom Element event surface would silently miss every
+      // local-mode property update.
+      const statusEvents: unknown[] = [];
+      const intentIdEvents: unknown[] = [];
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_123" });
+      el.addEventListener("stripe-checkout:status-changed", (e) => statusEvents.push((e as CustomEvent).detail));
+      el.addEventListener("stripe-checkout:intentId-changed", (e) => intentIdEvents.push((e as CustomEvent).detail));
+      el.attachLocalCore(core);
+      await el.prepare();
+      // `processing` (intent create in flight) → `collecting` (mount done)
+      expect(statusEvents).toContain("collecting");
+      // `intentId-changed` should also have arrived on the element.
+      expect(intentIdEvents).toContain("pi_shell");
+    });
+
+    it("attachLocalCore rejects when a remote proxy is already attached", () => {
+      // Mixing local + remote leaves observable getters reading from
+      // different sources depending on path; fail loud at attach time.
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_123" });
+      const { client, server } = createMockTransportPair();
+      const shellProxy = new RemoteShellProxy(core, server);
+      try {
+        el._connectRemote(client);
+        expect(() => el.attachLocalCore(core)).toThrow(/remote Core proxy is attached/);
+      } finally {
+        shellProxy.dispose();
+      }
+    });
+
+    it("_connectRemote rejects when a local Core is already attached", () => {
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_123" });
+      el.attachLocalCore(core);
+      const { client, server } = createMockTransportPair();
+      const shellProxy = new RemoteShellProxy(core, server);
+      try {
+        expect(() => el._connectRemote(client)).toThrow(/local Core is attached/);
+      } finally {
+        shellProxy.dispose();
+      }
+    });
+
+    it("disconnectedCallback survives reset() throwing on a disposed Core", () => {
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_123" });
+      el.attachLocalCore(core);
+      // Dispose the Core while the element is still attached — a later
+      // `disconnectedCallback` will reach `core.reset()` which throws on
+      // disposed instances. The Custom Element detach lifecycle must not
+      // bubble that throw out (would corrupt the parent DOM mutation).
+      core.dispose();
+      expect(() => document.body.removeChild(el)).not.toThrow();
+    });
+
     it("prepare() is idempotent — concurrent callers share one in-flight promise", async () => {
       el = createEl({ mode: "payment", "publishable-key": "pk_test_123" });
       el.attachLocalCore(core);
@@ -190,7 +245,14 @@ describe("<stripe-checkout> Shell", () => {
       el = createEl({ mode: "payment", "publishable-key": "pk_test_123" });
       el.attachLocalCore(core);
       const original = provider.createPaymentIntent.bind(provider);
-      provider.createPaymentIntent = async () => { throw new Error("stripe down"); };
+      // Use a Stripe-shaped error so the sanitizer's allowlist forwards
+      // the message verbatim. A plain `new Error("stripe down")` would
+      // collapse to "Payment failed." per SPEC §9.3 — covered by
+      // stripeCore.test.ts's "redacts the message of a non-Stripe error"
+      // suite — and the wedge-check below does not depend on the message.
+      provider.createPaymentIntent = async () => {
+        throw Object.assign(new Error("stripe down"), { type: "StripeAPIError" });
+      };
       await expect(el.prepare()).rejects.toThrow(/stripe down/);
       provider.createPaymentIntent = original;
       await el.prepare();
@@ -734,6 +796,93 @@ describe("<stripe-checkout> Shell", () => {
         expect(el.status).toBe("idle");
         expect(el.error).toBeNull();
       });
+    });
+
+    it("submit() with a stale prepare promise that resolves AFTER a user-abort gen bump fails loud with submit_superseded (regression)", async () => {
+      // Contract guard for the pre-enter generation snapshot in
+      // `_submitImpl`: when submit() awaits a prepare promise that
+      // resolves AFTER a user-abort supersede has bumped the generation
+      // (reset / abort / disconnect interleaving with submit's await),
+      // the auto-prepare fallback below MUST NOT silently create a fresh
+      // PaymentIntent. That would bypass the user's abort and reopen a
+      // duplicate-charge surface. submit() must reject loud with
+      // `code: "submit_superseded"`.
+      //
+      // Driving the natural race (gated provider + reset() between
+      // submit's `if (this._preparePromise)` and its `await`) is brittle
+      // because the prepare's own supersede checks normally turn it into
+      // a rejection. Pin the contract by INJECTING a `_preparePromise`
+      // that bumps the generation when awaited — exactly the
+      // observable shape "prepare resolved while submit was parked, but
+      // a user-abort landed in the same microtask round."
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_123" });
+      el.attachLocalCore(core);
+      // Let any auto-prepare from attachLocalCore settle first so we can
+      // overwrite `_preparePromise` cleanly.
+      await new Promise(r => setTimeout(r, 0));
+      await new Promise(r => setTimeout(r, 0));
+
+      const priv = el as unknown as {
+        _preparePromise: Promise<void> | null;
+        _prepareGeneration: number;
+        _supersedeIsUserAbort: boolean;
+        _markSupersede: (userAbort: boolean) => void;
+      };
+
+      // A staged promise that, on `await`, advances the generation as if
+      // a reset()/abort() landed during submit's wait. By the time
+      // submit's continuation runs the gen-check, `_prepareGeneration`
+      // has moved past `preEnterGen` AND `_supersedeIsUserAbort = true`.
+      const stagedPrepare = Promise.resolve().then(() => {
+        priv._markSupersede(true);
+      });
+      priv._preparePromise = stagedPrepare;
+
+      const errorEvents: CustomEvent[] = [];
+      el.addEventListener("stripe-checkout:error", (e) => errorEvents.push(e as CustomEvent));
+
+      await expect(el.submit()).rejects.toThrow(/submit\(\) superseded/);
+
+      // Local error state surfaces the dedicated code.
+      expect(el.error?.code).toBe("submit_superseded");
+      // The error was observable as a `stripe-checkout:error` event too.
+      const errorWithCode = errorEvents
+        .map(e => e.detail as { code?: string } | null)
+        .find(d => d?.code === "submit_superseded");
+      expect(errorWithCode).toBeDefined();
+      // No confirm was attempted.
+      expect(fakes.confirmCalls).toHaveLength(0);
+    });
+
+    it("submit() with a CONFIG-change supersede during the prepare wait falls through to auto-prepare (regression)", async () => {
+      // Symmetry guard for the previous test: a config-change supersede
+      // (`_supersedeIsUserAbort = false`, set by `_invalidateForKeyChange`)
+      // schedules its OWN auto-prepare from the cleanup, so submit() must
+      // NOT fail loud — it should fall through to the auto-prepare branch
+      // and end up confirming on the freshly built intent. Without the
+      // `_supersedeIsUserAbort` qualifier on the gen-check, a key swap
+      // mid-prepare would produce spurious submit_superseded errors.
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_123" });
+      el.attachLocalCore(core);
+      await new Promise(r => setTimeout(r, 0));
+      await new Promise(r => setTimeout(r, 0));
+
+      const priv = el as unknown as {
+        _preparePromise: Promise<void> | null;
+        _markSupersede: (userAbort: boolean) => void;
+      };
+
+      // Prepare resolves with a CONFIG-flavor supersede mid-await.
+      const stagedPrepare = Promise.resolve().then(() => {
+        priv._markSupersede(false); // config-change supersede
+      });
+      priv._preparePromise = stagedPrepare;
+
+      // submit() falls through to auto-prepare and confirms. Should NOT
+      // surface submit_superseded.
+      await el.submit();
+      expect(el.error).toBeNull();
+      expect(fakes.confirmCalls).toHaveLength(1);
     });
 
     it("reset() + re-prepare lets mode change take effect", async () => {
@@ -1878,6 +2027,74 @@ describe("<stripe-checkout> Shell", () => {
       expect(core.customerId).toBe("cus_1");
     });
 
+    it("amount-value attribute that does not parse to a finite number dispatches stripe-checkout:input-warning", () => {
+      // Pin SPEC §7.4 contract: an unparseable `amount-value` (e.g. "abc")
+      // collapses the getter / Core-synced value to `null` BUT leaves the
+      // raw string on the DOM attribute. Without an explicit warning,
+      // subscribers wired to the attribute would see "abc" while the Core
+      // observed `null` — silent divergence. The warning carries `field`,
+      // `value` (the raw attribute string), and `message`.
+      const warnings: CustomEvent[] = [];
+      el.addEventListener("stripe-checkout:input-warning", (e) => warnings.push(e as CustomEvent));
+
+      el.setAttribute("amount-value", "abc");
+
+      expect(warnings).toHaveLength(1);
+      const detail = warnings[0].detail as { field: string; value: string; message: string };
+      expect(detail.field).toBe("amountValue");
+      expect(detail.value).toBe("abc");
+      expect(typeof detail.message).toBe("string");
+      // Core / getter collapsed to null; raw attribute is preserved.
+      expect(core.amountValue).toBeNull();
+      expect(el.getAttribute("amount-value")).toBe("abc");
+    });
+
+    it("amount-value attribute with a finite number does NOT dispatch stripe-checkout:input-warning", () => {
+      // Negative path: a parseable value must NOT fire the warning, or the
+      // event becomes noise that subscribers learn to ignore.
+      const warnings: CustomEvent[] = [];
+      el.addEventListener("stripe-checkout:input-warning", (e) => warnings.push(e as CustomEvent));
+
+      el.setAttribute("amount-value", "1000");
+
+      expect(warnings).toHaveLength(0);
+      expect(core.amountValue).toBe(1000);
+    });
+
+    it('mode attribute that is not "payment" or "setup" dispatches stripe-checkout:input-warning', () => {
+      // Pin the symmetric contract for `mode`: the getter collapses every
+      // unrecognized value to "payment", so a typo (`mode="setpu"`) would
+      // silently route an app intending "setup" through the payment path.
+      // The warning carries the raw attribute value so subscribers can
+      // distinguish "unset" from "typo'd unset" without re-reading the DOM.
+      const warnings: CustomEvent[] = [];
+      el.addEventListener("stripe-checkout:input-warning", (e) => warnings.push(e as CustomEvent));
+
+      el.setAttribute("mode", "setpu");
+
+      expect(warnings).toHaveLength(1);
+      const detail = warnings[0].detail as { field: string; value: string; message: string };
+      expect(detail.field).toBe("mode");
+      expect(detail.value).toBe("setpu");
+      expect(typeof detail.message).toBe("string");
+      // Raw attribute is preserved; Core / getter collapsed to the default.
+      expect(el.getAttribute("mode")).toBe("setpu");
+      expect(core.mode).toBe("payment");
+    });
+
+    it('mode attribute that is "payment" or "setup" does NOT dispatch stripe-checkout:input-warning', () => {
+      // Negative path: parseable values must NOT fire the warning, or the
+      // event becomes noise that subscribers learn to ignore. Cover both
+      // legal tokens in one test — they share the same code path.
+      const warnings: CustomEvent[] = [];
+      el.addEventListener("stripe-checkout:input-warning", (e) => warnings.push(e as CustomEvent));
+
+      el.setAttribute("mode", "setup");
+      el.setAttribute("mode", "payment");
+
+      expect(warnings).toHaveLength(0);
+    });
+
     it("trigger=true fires submit()", async () => {
       const submitSpy = vi.spyOn(el, "submit");
       el.trigger = true;
@@ -1904,8 +2121,6 @@ describe("<stripe-checkout> Shell", () => {
         elements: () => elements,
         async confirmPayment() { return { paymentIntent: { id: "pi_shell", status: "succeeded" } }; },
         async confirmSetup() { return { setupIntent: { id: "seti_shell", status: "succeeded" } }; },
-        async retrievePaymentIntent() { return { paymentIntent: { id: "pi_shell", status: "succeeded" } }; },
-        async retrieveSetupIntent() { return { setupIntent: { id: "seti_shell", status: "succeeded" } }; },
       };
       WcsStripe.setLoader(async () => stripeJs);
 
@@ -1948,8 +2163,6 @@ describe("<stripe-checkout> Shell", () => {
         elements: () => elements,
         async confirmPayment() { return { paymentIntent: { id: "pi_shell", status: "succeeded" } }; },
         async confirmSetup() { return { setupIntent: { id: "seti_shell", status: "succeeded" } }; },
-        async retrievePaymentIntent() { return { paymentIntent: { id: "pi_shell", status: "succeeded" } }; },
-        async retrieveSetupIntent() { return { setupIntent: { id: "seti_shell", status: "succeeded" } }; },
       };
       WcsStripe.setLoader(async () => stripeJs);
 
@@ -2006,6 +2219,107 @@ describe("<stripe-checkout> Shell", () => {
       }).not.toThrow();
       // Reinstate the fake loader for other tests.
       WcsStripe.setLoader(async () => fakes.stripeJs);
+    });
+  });
+
+  describe("setLogger / resetLogger", () => {
+    // The static logger is a global no-op-by-default sink that
+    // `_disposeRemoteWithBestEffortReset` fans `reportFailure(...)` out to
+    // alongside the `stripe-checkout:dispose-warning` event. Because that
+    // cleanup runs AFTER the element is DOM-detached, regular bubbling
+    // listeners at `document` / global level can no longer see those
+    // events — the static logger is what production observability hooks
+    // for those failure phases.
+
+    afterEach(() => {
+      // Avoid cross-test leakage of the installed sink.
+      WcsStripe.resetLogger();
+    });
+
+    it("setLogger validates input — non-function values are coerced to no-op (typeof guard)", () => {
+      // The setter's `typeof logger === "function"` guard exists so a
+      // caller passing `null` / `undefined` / a string does not break the
+      // dispose path with a `TypeError: Stripe._logger is not a function`.
+      WcsStripe.setLogger(null as unknown as (phase: string, error: unknown) => void);
+      const active = (WcsStripe as unknown as { _logger: unknown })._logger;
+      expect(typeof active).toBe("function");
+      // The coerced no-op must not throw when called.
+      expect(() => (active as (p: string, e: unknown) => void)("phase", new Error("x"))).not.toThrow();
+    });
+
+    it("resetLogger restores the default no-op sink", () => {
+      const sink: { phase: string; error: unknown }[] = [];
+      WcsStripe.setLogger((phase, error) => sink.push({ phase, error }));
+      WcsStripe.resetLogger();
+      // After reset, calling the active logger must be a no-op — the
+      // sink we installed is no longer reachable.
+      const active = (WcsStripe as unknown as { _logger: (p: string, e: unknown) => void })._logger;
+      active("phase", new Error("x"));
+      expect(sink).toHaveLength(0);
+    });
+
+    it("_disposeRemoteWithBestEffortReset routes reportFailure through the installed logger", async () => {
+      // The dispose-cleanup phase logger sees every cleanup phase whose
+      // callback throws (cancelIntent / reset / unbind / proxy.dispose /
+      // ws.close). This pins that wiring — the production observability
+      // surface that this whole feature exists for.
+      const calls: { phase: string; error: unknown }[] = [];
+      WcsStripe.setLogger((phase, error) => calls.push({ phase, error }));
+
+      el = createEl({ mode: "payment" });
+      // Build a proxy whose `reset` rejects so the dispose path's
+      // `reportFailure("reset", e)` fires.
+      const proxy = {
+        invoke: async (name: string) => {
+          if (name === "reset") throw new Error("synthetic reset failure");
+        },
+        invokeWithOptions: async () => {},
+        dispose: () => {},
+      };
+      (el as unknown as { _proxy: unknown })._proxy = proxy;
+      (el as unknown as { _unbind: (() => void) | null })._unbind = () => {};
+      (el as unknown as { _ws: { close: () => void } | null })._ws = { close: () => {} };
+
+      el.remove();
+      await flushTransport(4);
+
+      // The logger received the reset-phase failure. Bubbling
+      // `stripe-checkout:dispose-warning` events alone would not reach a
+      // global / document-level subscriber on the now-detached element —
+      // the logger is the only path that can.
+      const resetCalls = calls.filter(c => c.phase === "reset");
+      expect(resetCalls).toHaveLength(1);
+      expect((resetCalls[0].error as Error).message).toBe("synthetic reset failure");
+    });
+
+    it("a misbehaving logger does not break the dispose-cleanup path", async () => {
+      // The `try { Stripe._logger(phase, error); } catch { /* ... */ }`
+      // guard exists so a logger throw cannot half-tear-down the element.
+      // Verify by installing a logger that always throws, then asserting
+      // the rest of the cleanup (proxy.dispose / ws.close) still runs.
+      WcsStripe.setLogger(() => { throw new Error("logger crashed"); });
+
+      el = createEl({ mode: "payment" });
+      const order: string[] = [];
+      const proxy = {
+        invoke: async (name: string) => {
+          if (name === "reset") throw new Error("synthetic reset failure");
+        },
+        invokeWithOptions: async () => {},
+        dispose: () => { order.push("dispose"); },
+      };
+      (el as unknown as { _proxy: unknown })._proxy = proxy;
+      (el as unknown as { _unbind: (() => void) | null })._unbind = () => { order.push("unbind"); };
+      (el as unknown as { _ws: { close: () => void } | null })._ws = { close: () => { order.push("ws.close"); } };
+
+      el.remove();
+      await flushTransport(4);
+
+      // Despite the logger throwing on the reset-phase failure, the
+      // remaining cleanup must still run.
+      expect(order).toContain("unbind");
+      expect(order).toContain("dispose");
+      expect(order).toContain("ws.close");
     });
   });
 

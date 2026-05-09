@@ -12,6 +12,12 @@ import {
 import type { StripeCore } from "../core/StripeCore.js";
 import { STRIPE_CORE_WC_BINDABLE } from "../core/wcBindable.js";
 import { extractCardPaymentMethod } from "../internal/paymentMethodShape.js";
+import {
+  STRIPE_TAXONOMY_TOKEN_RE,
+  STRIPE_ERROR_CODE_RE,
+  STRIPE_CLASS_NAME_RE,
+  MAX_ERROR_MESSAGE_LENGTH,
+} from "../internal/errorTaxonomy.js";
 import { raiseError } from "../raiseError.js";
 import {
   createRemoteCoreProxy,
@@ -25,6 +31,16 @@ import { bind } from "@wc-bindable/core";
  * Minimal structural subset of `@stripe/stripe-js`'s `Stripe` / `Elements`
  * surface. Typed here rather than imported so `@stripe/stripe-js` stays a
  * truly-optional peer dependency and tests can inject a mock loader.
+ *
+ * 3DS resume is intentionally NOT modeled here. The post-redirect flow is
+ * authoritatively driven server-side via `StripeCore.resumeIntent`, which
+ * calls `provider.retrieveIntent` with the secret key. The earlier design
+ * routed Stripe.js's own `stripe.retrievePaymentIntent(clientSecret)` /
+ * `stripe.retrieveSetupIntent(clientSecret)` results through
+ * `reportConfirmation`, but that path was a silent no-op after the
+ * post-reload Core had no `_activeIntent` (see `_resumeFromRedirect`'s
+ * docstring). Keeping those methods on this interface only grows the
+ * loader contract — and the test fake surface — without any consumer.
  */
 export interface StripeJsLike {
   elements(opts: { clientSecret: string; appearance?: Record<string, unknown> }): StripeElementsLike;
@@ -40,8 +56,6 @@ export interface StripeJsLike {
     confirmParams?: { return_url?: string };
     redirect?: "always" | "if_required";
   }): Promise<{ setupIntent?: Record<string, unknown>; error?: Record<string, unknown> }>;
-  retrievePaymentIntent(clientSecret: string): Promise<{ paymentIntent?: Record<string, unknown>; error?: Record<string, unknown> }>;
-  retrieveSetupIntent(clientSecret: string): Promise<{ setupIntent?: Record<string, unknown>; error?: Record<string, unknown> }>;
 }
 
 export interface StripeElementsLike {
@@ -80,7 +94,23 @@ export type StripeJsLoader = (publishableKey: string) => Promise<StripeJsLike>;
 const HTMLElementCtor: typeof HTMLElement =
   typeof HTMLElement !== "undefined"
     ? HTMLElement
-    : (class {} as unknown as typeof HTMLElement);
+    // Node-side fallback. The class is reachable only because some tooling
+    // chains (SSR pre-render, bundler graph walks) evaluate the browser
+    // barrel under plain Node — see the docstring above. *Importing* must
+    // not throw; *instantiating* should, because none of the DOM API the
+    // Shell relies on (`getAttribute`, `appendChild`, `dispatchEvent`, …)
+    // exists here, and a swallowed instantiation would surface as an
+    // ambiguous `TypeError: this.getAttribute is not a function` deep in
+    // a later `_syncInput` / mount path. Fail loud at construction time so
+    // the actual misuse — wrong entry point — is visible at the call site.
+    : (class {
+      constructor() {
+        throw new Error(
+          "[@csbc-dev/stripe] <stripe-checkout> cannot be instantiated outside a browser. "
+          + "Use @csbc-dev/stripe/server for Node-side StripeCore/StripeSdkProvider.",
+        );
+      }
+    } as unknown as typeof HTMLElement);
 
 /**
  * Browser shell for `<stripe-checkout>`. Mounts Stripe's Payment Element in a
@@ -94,12 +124,41 @@ const HTMLElementCtor: typeof HTMLElement =
  */
 export class Stripe extends HTMLElementCtor {
   /**
-   * Upper bound on the sanitized `message` length that reaches the DOM.
-   * Mirrors `StripeCore._MAX_ERROR_MESSAGE_LENGTH` so a
-   * Stripe.js-originated error and a Core-sanitized error cannot diverge
-   * in permitted size on the Shell surface.
+   * Stripe error taxonomy constants are hoisted to
+   * `internal/errorTaxonomy.ts` so the Core's wire-side allowlist and
+   * this Shell's purely-local allowlist cannot drift. The Core sanitizes
+   * its wire emissions, but `_setErrorStateFromUnknown` is also reachable
+   * from purely-local error sources (transport throws, key-change cmd
+   * rejections, attribute-warning paths) that never touched the Core's
+   * sanitizer — the local gate has to use the same allowlist.
+   *
+   * `private static` aliases keep the existing call sites
+   * (`Stripe._STRIPE_TAXONOMY_TOKEN_RE.test(...)`) compiling unchanged
+   * while the source of truth is shared.
    */
-  private static readonly _MAX_ERROR_MESSAGE_LENGTH: number = 512;
+  private static readonly _MAX_ERROR_MESSAGE_LENGTH: number = MAX_ERROR_MESSAGE_LENGTH;
+  private static readonly _STRIPE_TAXONOMY_TOKEN_RE = STRIPE_TAXONOMY_TOKEN_RE;
+  private static readonly _STRIPE_ERROR_CODE_RE = STRIPE_ERROR_CODE_RE;
+  private static readonly _STRIPE_CLASS_NAME_RE = STRIPE_CLASS_NAME_RE;
+
+  /**
+   * Validate a Stripe-taxonomy token before it is forwarded to the
+   * `error` observable / `stripe-checkout:error` detail. Returns the
+   * input string on pass, `undefined` on fail (drop the token, keep the
+   * surrounding error shape valid).
+   */
+  private static _safeToken(value: unknown, re: RegExp): string | undefined {
+    return typeof value === "string" && re.test(value) ? value : undefined;
+  }
+  /**
+   * `type` accepts both lowercase taxonomy and PascalCase SDK class shapes.
+   */
+  private static _safeType(value: unknown): string | undefined {
+    if (typeof value !== "string") return undefined;
+    return Stripe._STRIPE_TAXONOMY_TOKEN_RE.test(value) || Stripe._STRIPE_CLASS_NAME_RE.test(value)
+      ? value
+      : undefined;
+  }
 
   /**
    * Default Stripe.js loader. Captured as a frozen reference so
@@ -141,6 +200,22 @@ export class Stripe extends HTMLElementCtor {
    * test B's `<stripe-checkout>` if B forgot to override.
    */
   static setLoader(loader: StripeJsLoader): void {
+    // Reject non-function inputs at the entry point so a misuse fails loudly
+    // here instead of surfacing as a `TypeError: Stripe._loader is not a
+    // function` deep inside `_ensureStripeJs` after a partial async setup.
+    // Same defensive shape as `registerIntentBuilder` /
+    // `registerWebhookHandler` on the Core.
+    //
+    // NOTE: This deliberately does NOT match `setLogger`, which silently
+    // coerces non-function inputs to a no-op. The asymmetry is intentional:
+    // a missing logger fails open (cleanup proceeds, observability is the
+    // only thing degraded), but a missing loader fails closed (no Stripe.js
+    // → no Elements → no payment can complete). A coerced no-op loader
+    // would manifest as a confusing async hang on the first prepare()
+    // instead of a synchronous, easy-to-read setup-time error.
+    if (typeof loader !== "function") {
+      raiseError("setLoader requires a function.");
+    }
     Stripe._loader = loader;
   }
 
@@ -153,6 +228,47 @@ export class Stripe extends HTMLElementCtor {
    */
   static resetLoader(): void {
     Stripe._loader = Stripe._DEFAULT_LOADER;
+  }
+
+  /**
+   * Optional logger sink for shell-side cleanup / lifecycle warnings that
+   * cannot reach a regular `addEventListener` listener.
+   *
+   * The `_disposeRemoteWithBestEffortReset` cleanup runs AFTER the element
+   * has been DOM-detached (`disconnectedCallback`), so any
+   * `this.dispatchEvent(...)` inside that path only reaches listeners that
+   * were attached directly via `el.addEventListener(...)` — bubbling no
+   * longer leaves the element. Production operators usually wire
+   * observability at the `document` / global level, which never sees those
+   * events. This logger gives a single global sink for those failure phases
+   * (cancelIntent / reset / unbind / proxy.dispose / ws.close).
+   *
+   * Default is a no-op so the path stays silent unless the integrator
+   * explicitly opts in. Logger receives `(phase: string, error: unknown)`
+   * — the same payload the `stripe-checkout:dispose-warning` event detail
+   * carries.
+   *
+   * `private` so external code cannot bypass the `setLogger` typeof guard
+   * by writing `Stripe._logger = badLogger` directly. Mirrors `_loader` —
+   * the only supported entry points are `setLogger` / `resetLogger`.
+   */
+  private static _logger: (phase: string, error: unknown) => void = () => {};
+
+  /**
+   * Install a logger sink. Mirrors `setLoader` / `resetLoader` — global
+   * static state shared by every `<stripe-checkout>` element in the
+   * module realm. Tests calling `setLogger()` should call `resetLogger()`
+   * in teardown to prevent cross-test leakage.
+   */
+  static setLogger(logger: (phase: string, error: unknown) => void): void {
+    Stripe._logger = typeof logger === "function" ? logger : (() => {});
+  }
+
+  /**
+   * Restore the default no-op logger.
+   */
+  static resetLogger(): void {
+    Stripe._logger = () => {};
   }
 
   static wcBindable: IWcBindable = {
@@ -297,8 +413,19 @@ export class Stripe extends HTMLElementCtor {
   private _resuming: boolean = false;
   /**
    * Set once a resume has run to terminal (successful `_coreResume` OR a
-   * swallowed error) on this element instance. Prevents re-resume when
-   * `attachLocalCore` is called after `_connectRemote` or vice versa.
+   * swallowed Core-decisive error) on this element instance. Prevents
+   * re-resume when `attachLocalCore` is called after `_connectRemote` or
+   * vice versa.
+   *
+   * Lifetime: persists for the entire element-instance lifetime — `reset()`
+   * and `abort()` deliberately do NOT clear it. Once a 3DS redirect-return
+   * has been folded into observable state, re-running resume on the same
+   * element would re-hydrate possibly-stale state from the URL even though
+   * the user explicitly asked for idle. Apps that need to run a *new*
+   * payment flow after a successful resume should detach + re-mount the
+   * element (which gets a fresh `_resumed = false`); this matches the
+   * `disconnectedCallback → connectedCallback` boundary the auto-prepare
+   * pipeline already treats as a session reset.
    */
   private _resumed: boolean = false;
   /**
@@ -325,10 +452,6 @@ export class Stripe extends HTMLElementCtor {
     return this._proxy !== null;
   }
 
-  constructor() {
-    super();
-  }
-
   // --- Remote wiring ---
 
   private _initRemote(): void {
@@ -341,13 +464,35 @@ export class Stripe extends HTMLElementCtor {
     let opened = false;
     let failed = false;
     ws.addEventListener("open", () => { opened = true; }, { once: true });
+    // Strip secrets before letting the URL flow into observable error
+    // state. `_setErrorState` writes through to `el.error`, the
+    // `stripe-checkout:error` event detail, and (when remote logging is
+    // wired) wire payloads. Operators sometimes carry a session token in
+    // a query parameter, or — less recommended but seen in the wild —
+    // basic-auth credentials in the userinfo of the WebSocket URL. None
+    // of those should reappear on the DOM. Reduce to `protocol//host
+    // /path` and drop `username`, `password`, `search`, and `hash`.
+    // Falls back to a fixed placeholder if URL parsing fails (we still
+    // tried to construct the WebSocket above, so a parse failure here
+    // would be exotic — but never echo the raw string).
+    let safeUrl: string;
+    try {
+      const u = new URL(url);
+      u.username = "";
+      u.password = "";
+      u.search = "";
+      u.hash = "";
+      safeUrl = u.toString();
+    } catch {
+      safeUrl = "<unparseable>";
+    }
     const onFail = (): void => {
       if (failed) return;
       failed = true;
       if (this._ws !== ws) return;
       this._setErrorState({
         code: "transport_unavailable",
-        message: `WebSocket connection ${opened ? "lost" : "failed"}: ${url}`,
+        message: `WebSocket connection ${opened ? "lost" : "failed"}: ${safeUrl}`,
       });
       this._resetRemoteBusyState();
       this._disposeRemote();
@@ -419,11 +564,18 @@ export class Stripe extends HTMLElementCtor {
     // directly via `el.addEventListener(...)` — but that is exactly the
     // surface a debugger / test can grab, which is what this event is
     // for. Silent failures in this cleanup block are otherwise invisible.
+    //
+    // Also fan out to the static `Stripe._logger` sink so production
+    // operators wired at `document` / global level see the failure even
+    // when bubbling cannot leave the now-detached element. The default
+    // logger is a no-op (`Stripe.resetLogger()` for explicit reset).
     const reportFailure = (phase: string, error: unknown): void => {
       this.dispatchEvent(new CustomEvent("stripe-checkout:dispose-warning", {
         detail: { phase, error },
         bubbles: true,
       }));
+      try { Stripe._logger(phase, error); }
+      catch { /* a misbehaving logger must not break cleanup */ }
     };
 
     void (async () => {
@@ -481,6 +633,19 @@ export class Stripe extends HTMLElementCtor {
   }
 
   private _setErrorState(err: StripeError): void {
+    // Dedup identical successive errors so a controlled-prop framework
+    // re-driving the same failure path (React StrictMode double-invoke,
+    // a retry button that hits the same network shape) does not flood
+    // listeners with duplicate `stripe-checkout:error` events. Mirrors
+    // the Core's `_setError` set-based equality check.
+    const prev = this._errorState;
+    if (this._hasLocalError && prev && this._errorShapeEquals(prev, err)) {
+      // Re-snapshot the seq even on dedup so a subsequent remote
+      // publish that arrives between this no-op set and the next local
+      // set is correctly identified as fresh by `_setErrorStateFromUnknown`.
+      this._localErrorSeqSync = this._remoteErrorSeq;
+      return;
+    }
     this._errorState = err;
     this._hasLocalError = true;
     // Snapshot the remote error-update counter at the moment we take
@@ -491,6 +656,19 @@ export class Stripe extends HTMLElementCtor {
     // prior unrelated failure.
     this._localErrorSeqSync = this._remoteErrorSeq;
     this.dispatchEvent(new CustomEvent("stripe-checkout:error", { detail: err, bubbles: true }));
+  }
+
+  /**
+   * Set-based equality on the canonical `StripeError` keys. Mirrors the
+   * Core's dedup shape so that two errors with the same observable
+   * fields — even if they were constructed at different sites — collapse
+   * to a single dispatch.
+   */
+  private _errorShapeEquals(a: StripeError, b: StripeError): boolean {
+    return a.code === b.code
+      && a.declineCode === b.declineCode
+      && a.type === b.type
+      && a.message === b.message;
   }
 
   private _clearErrorState(): void {
@@ -509,6 +687,17 @@ export class Stripe extends HTMLElementCtor {
 
   /** @internal — visible for testing */
   _connectRemote(transport: ClientTransport): void {
+    // Reject the remote-on-local race symmetric with `attachLocalCore`'s
+    // local-on-remote check. With both attached, observable getters and
+    // `prepare()` would route to different Cores depending on path
+    // (`_isRemote` favors the proxy; `_syncInput` falls through to
+    // `_core`). Failing loud here keeps the lifecycle to ONE active
+    // Core source.
+    if (this._core) {
+      raiseError(
+        "_connectRemote called while a local Core is attached; detach the local Core (reset / disconnectedCallback) before connecting remote.",
+      );
+    }
     this._proxy = createRemoteCoreProxy(STRIPE_CORE_WC_BINDABLE, transport);
     this._unbind = bind(this._proxy, (name, value) => {
       this._remoteValues[name] = value;
@@ -595,14 +784,22 @@ export class Stripe extends HTMLElementCtor {
       // `_sanitizeStripeJsError` only checks `decline_code` because its
       // input is known to be a Stripe.js shape; this function handles the
       // union of both origins and therefore must check both names.
-      const declineCode = typeof rec.declineCode === "string"
+      // Allowlist code / declineCode / type so a non-Stripe-shaped error
+      // (Stripe.js error caught at a non-confirm site, transport-level
+      // rejection that has been hand-decorated by middleware, key-change
+      // cmd-throw whose message was stitched together client-side) cannot
+      // smuggle non-taxonomy strings — including `"<script>…"` markers —
+      // into the `stripe-checkout:error` event detail. The Core's wire
+      // emissions are already taxonomy-gated; this closes the same gate
+      // for the Shell's purely-local emissions.
+      const rawDeclineCode = typeof rec.declineCode === "string"
         ? rec.declineCode
         : (typeof rec.decline_code === "string" ? rec.decline_code : undefined);
       const rawMessage = typeof rec.message === "string" ? rec.message : "Unknown error.";
       this._setErrorState({
-        code: typeof rec.code === "string" ? rec.code : undefined,
-        declineCode,
-        type: typeof rec.type === "string" ? rec.type : undefined,
+        code: Stripe._safeToken(rec.code, Stripe._STRIPE_ERROR_CODE_RE),
+        declineCode: Stripe._safeToken(rawDeclineCode, Stripe._STRIPE_ERROR_CODE_RE),
+        type: Stripe._safeType(rec.type),
         // Length-cap the message here too so a proxy-serialized error that
         // bypasses `_sanitizeStripeJsError` / Core's `_sanitizeError` still
         // hits the DOM under the same bound. Mirrors the policy in both
@@ -634,6 +831,28 @@ export class Stripe extends HTMLElementCtor {
         "attachLocalCore called with a different core instance; reset() the prior core and detach before re-attaching.",
       );
     }
+    // Guard against attaching a local Core while a remote proxy is live.
+    // The two paths cannot coexist: remote-mode getters read from
+    // `_remoteValues`, while local-mode getters delegate to `_core`. Letting
+    // both fields hold a value at the same time would leave the surface
+    // inconsistent — `prepare()` would route through the proxy while
+    // observable reads / late property events would mix sources.
+    if (this._isRemote) {
+      raiseError(
+        "attachLocalCore called while a remote Core proxy is attached; disconnect remote first.",
+      );
+    }
+    // Inject the Shell as the Core's event target so `_setStatus` /
+    // `_setLoading` / `_setAmount` / `_setPaymentMethod` / `_setIntentId` /
+    // `_setError` dispatch on `this` and the events bubble up the DOM. The
+    // Core's constructor defaults `_target` to the Core itself when no
+    // target is provided — that is the right default for tests that
+    // instantiate the Core standalone, but once the Shell takes ownership
+    // of the Core the target must be the Shell so listeners attached via
+    // `el.addEventListener("stripe-checkout:status-changed", ...)` actually
+    // fire. Remote mode does not need this hop because `_connectRemote`'s
+    // `bind()` callback re-dispatches every property update on `this`.
+    (core as unknown as { _target: EventTarget })._target = this;
     this._core = core;
     if (this.hasAttribute("mode")) core.mode = this.mode;
     if (this.hasAttribute("amount-value")) core.amountValue = this.amountValue;
@@ -663,8 +882,24 @@ export class Stripe extends HTMLElementCtor {
     return Number.isFinite(n) ? n : null;
   }
   set amountValue(value: number | null) {
-    if (value == null) this.removeAttribute("amount-value");
-    else this.setAttribute("amount-value", String(value));
+    if (value == null) {
+      this.removeAttribute("amount-value");
+      return;
+    }
+    // Pre-validate at the Shell boundary so a bad value never lands on
+    // the DOM as `amount-value="-100"` / `"NaN"` / `"Infinity"`. The
+    // Core's setter already enforces "non-negative finite number", but
+    // it only sees the value AFTER `attributeChangedCallback` parses
+    // the attribute back to a Number — and in the meantime the rejected
+    // value is observable via `el.getAttribute("amount-value")`,
+    // mutation observers, and serialized DOM. Mirror the Core's check
+    // here (`Number.isFinite && >= 0`) and raise synchronously, so the
+    // setter and the Core stay aligned and the DOM never displays a
+    // value that the Core would later reject.
+    if (!Number.isFinite(value) || value < 0) {
+      raiseError(`amountValue must be a non-negative finite number, got ${value}.`);
+    }
+    this.setAttribute("amount-value", String(value));
   }
 
   get amountCurrency(): string | null { return this.getAttribute("amount-currency"); }
@@ -685,8 +920,28 @@ export class Stripe extends HTMLElementCtor {
   get returnUrl(): string { return this.getAttribute("return-url") || ""; }
   set returnUrl(value: string) { this.setAttribute("return-url", value); }
 
-  /** Stripe Elements Appearance API payload. JS-only — not attribute-reflected. */
-  get appearance(): Record<string, unknown> | undefined { return this._appearance; }
+  /**
+   * Stripe Elements Appearance API payload. JS-only — not attribute-reflected.
+   *
+   * Caller responsibility for shape: this Shell forwards `_appearance`
+   * verbatim to `stripe.elements({ appearance })` without local narrowing.
+   * The defense in depth is Stripe Elements' own iframe sandbox — it
+   * applies the appearance inside a Stripe-controlled origin and ignores
+   * keys / values it does not recognize. The Shell-side validation surface
+   * is intentionally minimal so that newly added Stripe Appearance keys
+   * (themes, variables, rules) work without a package update. If your app
+   * passes user-controlled strings into `appearance`, sanitize them at the
+   * app boundary before assignment — do not rely on the Shell.
+   */
+  get appearance(): Record<string, unknown> | undefined {
+    // Symmetric with the setter's shallow defensive copy. Returning the
+    // stored snapshot directly would let a caller mutate the internal
+    // `_appearance` object in place (`el.appearance.theme = "night"`),
+    // bypassing the setter's `elements.update({ appearance })` hot-swap
+    // path and silently desyncing observable / mounted state. A shallow
+    // copy mirrors what the setter accepted on the way in.
+    return this._appearance ? { ...this._appearance } : undefined;
+  }
   set appearance(value: Record<string, unknown> | undefined) {
     // Hot-swap if Elements is already mounted. `elements.update({ appearance })`
     // is the documented path — but it only exists on the Elements group, not
@@ -700,6 +955,15 @@ export class Stripe extends HTMLElementCtor {
       this._appearance = value;
       return;
     }
+    // Shallow defensive copy. Stripe Elements processes `appearance` inside
+    // its iframe sandbox — but app code can keep a reference to the same
+    // object and mutate it AFTER assignment (e.g. theme switch via
+    // `appearance.theme = "night"`). Without a copy, those mutations
+    // silently take effect on the next `_mountElements` call without
+    // re-running this setter's update / latch path, producing a hidden
+    // dependency on object identity that is hard to debug. A shallow
+    // copy decouples the stored snapshot from the caller's reference.
+    const snapshot = { ...value };
     const el = this._elements as unknown as { update?: (opts: Record<string, unknown>) => void } | null;
     if (el && typeof el.update === "function") {
       // Assign AFTER update succeeds so a throwing appearance is not
@@ -707,8 +971,8 @@ export class Stripe extends HTMLElementCtor {
       // (which would repeat the same error in a loop until the caller
       // happens to overwrite with a valid value).
       try {
-        el.update({ appearance: value });
-        this._appearance = value;
+        el.update({ appearance: snapshot });
+        this._appearance = snapshot;
       } catch (error: unknown) {
         this.dispatchEvent(new CustomEvent("stripe-checkout:appearance-warning", {
           detail: {
@@ -721,7 +985,7 @@ export class Stripe extends HTMLElementCtor {
     } else {
       // No mounted Elements yet — store for next mount. No update call
       // to fail, so no risk of latching a broken value.
-      this._appearance = value;
+      this._appearance = snapshot;
     }
   }
 
@@ -781,7 +1045,7 @@ export class Stripe extends HTMLElementCtor {
   get trigger(): boolean { return this._trigger; }
   set trigger(value: boolean) {
     const v = !!value;
-    // Edge-triggered on the false→true transition only. Controlled-prop
+    // Edge-triggered on the false→ true transition only. Controlled-prop
     // frameworks (React, Vue) re-run assignments on every render, and a
     // non-edge-guarded setter would re-dispatch `trigger-changed` on
     // every pass — noisy for listeners and harder to reason about.
@@ -795,14 +1059,29 @@ export class Stripe extends HTMLElementCtor {
       // Fire-and-forget by design: trigger is a declarative pulse, not an
       // imperative API surface. Rejections are surfaced through `error`
       // state / `stripe-checkout:error`; this setter only toggles the pulse.
-      this.submit().catch(() => {}).finally(() => {
-        this._trigger = false;
-        this.dispatchEvent(new CustomEvent("stripe-checkout:trigger-changed", { detail: false, bubbles: true }));
+      // Route the swallowed rejection through `Stripe._logger` so an
+      // operator-installed logger sink can still observe submission
+      // failures during debugging — the silent `catch(() => {})` made
+      // these invisible to anything but a manual `error` subscriber.
+      this.submit().catch((e: unknown) => {
+        try { Stripe._logger("trigger-submit", e); } catch { /* logger sink must never break the pulse */ }
+      }).finally(() => {
+        // The user may have manually written `trigger = false` while the
+        // submit was in flight (the `else if` branch below already flipped
+        // `_trigger` and dispatched). Re-issuing the false dispatch here
+        // would emit a redundant `trigger-changed: false` event — noisy
+        // for listeners and worse than the dedup we maintain on the
+        // false→ true edge. Only finalize when we still hold the latched
+        // `true` from the start of this submit cycle.
+        if (this._trigger) {
+          this._trigger = false;
+          this.dispatchEvent(new CustomEvent("stripe-checkout:trigger-changed", { detail: false, bubbles: true }));
+        }
       });
     } else if (!v && this._trigger) {
       // Keep read-back aligned with the written value so frameworks that
       // assign `el.trigger = false` observe the update. Does NOT cancel
-      // a pending submit() 窶・reset()/abort() are the cancellation APIs.
+      // a pending submit() — reset()/abort() are the cancellation APIs.
       this._trigger = false;
       this.dispatchEvent(new CustomEvent("stripe-checkout:trigger-changed", { detail: false, bubbles: true }));
     }
@@ -874,8 +1153,22 @@ export class Stripe extends HTMLElementCtor {
     // soon as resume has had its one shot.
     if (this._resumed) return false;
     const params = new URLSearchParams(globalThis.location?.search ?? "");
-    const hasPayment = !!params.get("payment_intent") && !!params.get("payment_intent_client_secret");
-    const hasSetup = !!params.get("setup_intent") && !!params.get("setup_intent_client_secret");
+    // `URLSearchParams.get` returns the raw value, including whitespace-only
+    // strings. A hand-crafted URL like `?payment_intent= &payment_intent_client_secret= `
+    // would otherwise pass the `!!` truthiness gate and force this Shell
+    // through `_resumeFromRedirect`, where the Core's constant-time
+    // compare denies the resume and surfaces a perpetual
+    // `resume_client_secret_mismatch` toast — blocking auto-prepare on
+    // every connect. Trimming first treats whitespace-only values as
+    // absent so the auto-prepare path stays open for legitimate users
+    // who landed on this page via a tampered or stripped-then-restored
+    // URL. (Note: `URLSearchParams.get` already URL-decodes, so this
+    // also handles `%20`-encoded whitespace correctly.) `decodeURIComponent`
+    // is not called explicitly because `URLSearchParams.get` already
+    // applies it.
+    const get = (k: string): string => (params.get(k) ?? "").trim();
+    const hasPayment = !!get("payment_intent") && !!get("payment_intent_client_secret");
+    const hasSetup = !!get("setup_intent") && !!get("setup_intent_client_secret");
     // Malformed URLs that carry both tuples are treated as post-redirect;
     // `_resumeFromRedirect()` applies deterministic payment-first precedence.
     return hasPayment || hasSetup;
@@ -989,7 +1282,16 @@ export class Stripe extends HTMLElementCtor {
 
   private _ensureMountHost(): HTMLDivElement {
     if (this._mountHost && this._mountHost.isConnected) return this._mountHost;
-    const host = this.ownerDocument.createElement("div");
+    // `HTMLElement.ownerDocument` is `Document | null` per the WebIDL —
+    // typically non-null once the element exists (connected or not), but
+    // pre-render / detached / SSR-shim environments can leave it null.
+    // Fall back to the global `document` so a `_ensureMountHost` call
+    // outside a normal DOM tree fails with a clear "no document" message
+    // rather than a `null.createElement` TypeError that obscures the
+    // root cause.
+    const doc = this.ownerDocument ?? (typeof document !== "undefined" ? document : null);
+    if (!doc) raiseError("ownerDocument is unavailable; cannot mount Stripe Elements outside a document.");
+    const host = doc.createElement("div") as HTMLDivElement;
     host.dataset.stripeCheckoutMount = "";
     this.appendChild(host);
     this._mountHost = host;
@@ -1123,7 +1425,12 @@ export class Stripe extends HTMLElementCtor {
         this._cancelIntent(creation.intentId).catch(() => {});
         raiseError("prepare() superseded.");
       }
-      this._clientSecret = creation.clientSecret;
+      // Defer field-assignment of `_clientSecret` until AFTER `_mountElements`
+      // succeeds (SPEC §5.2 — secrets MUST NOT be retained for longer than
+      // strictly necessary). Mounting only needs the value as an argument,
+      // so on the failure path the secret never lands on `this`. Pre-mount
+      // assignment widened the lifetime of the secret across the entire
+      // `_mountElements` await for no benefit.
       try {
         await this._mountElements(creation.clientSecret);
       } catch (e: unknown) {
@@ -1131,7 +1438,6 @@ export class Stripe extends HTMLElementCtor {
         // does not sit in requires_payment_method forever billing nothing
         // but leaking a row. cancelIntent is a no-op for SetupIntents.
         this._cancelIntent(creation.intentId).catch(() => {});
-        this._clientSecret = "";
         // Do not record the supersede-abort as an observable error: it is
         // a normal consequence of user action (key swap / reset / abort /
         // disconnect), not a failure mode.
@@ -1147,6 +1453,7 @@ export class Stripe extends HTMLElementCtor {
         this._cancelIntent(creation.intentId).catch(() => {});
         raiseError("prepare() superseded.");
       }
+      this._clientSecret = creation.clientSecret;
       this._preparedMode = preparedMode;
       this._preparedIntentId = creation.intentId;
     })();
@@ -1201,6 +1508,25 @@ export class Stripe extends HTMLElementCtor {
   private async _submitImpl(): Promise<void> {
     this._clearErrorState();
 
+    // Snapshot the prepare-generation BEFORE awaiting any in-flight
+    // prepare. If a user-abort path (reset / abort / disconnect) bumps
+    // the generation while we are parked on `_preparePromise`, we MUST
+    // NOT silently fall through to the auto-prepare branch below — that
+    // would create a SECOND PaymentIntent under the same submit() call,
+    // exposing the app to a duplicate charge.
+    //
+    // The Core also drops superseded reportConfirmation calls, but the
+    // double-intent has already happened at Stripe by the time the
+    // confirm fires. The fix has to land at the Shell, before another
+    // `_requestIntent` is allowed.
+    //
+    // Distinguish user-abort (reset/abort/disconnect) from config-change
+    // supersede (key-change `_invalidateForKeyChange`): the latter's
+    // cleanup auto-retries prepare itself, so submit should wait for that
+    // and proceed via the auto-prepare branch. Only user-abort must fail
+    // loud.
+    const preEnterGen = this._prepareGeneration;
+
     if (this._preparePromise) {
       // Propagate the prior prepare's rejection instead of swallowing it.
       // The old behavior — swallow + fall through to a second `prepare()`
@@ -1209,6 +1535,20 @@ export class Stripe extends HTMLElementCtor {
       // in flight, leaving the app with one canceled + one live intent
       // and the original failure hidden from the caller.
       await this._preparePromise;
+    }
+    if (preEnterGen !== this._prepareGeneration && this._supersedeIsUserAbort) {
+      // The user fired reset() / abort() / disconnect during the prepare
+      // wait. Auto-prepare here would silently undo the user's abort and
+      // create a brand new intent for the same `submit()` call. Fail
+      // loud so the caller observes the supersede, can re-arm prepare
+      // deliberately, and is not surprised by a charge that bypassed the
+      // abort. (Config-change supersedes — `_supersedeIsUserAbort=false`,
+      // set by `_invalidateForKeyChange` — fall through; their cleanup
+      // already scheduled a fresh auto-prepare and the auto-prepare
+      // branch below will pick it up.)
+      const err = new Error("[@csbc-dev/stripe] submit() superseded by reset() / abort() / disconnect during prepare wait — call prepare() explicitly to retry.");
+      this._setErrorState({ code: "submit_superseded", message: err.message });
+      throw err;
     }
     if (!this._paymentElement || !this._elements || !this._clientSecret) {
       // Auto-prepare as an ergonomic fallback. Only reachable when no
@@ -1352,7 +1692,7 @@ export class Stripe extends HTMLElementCtor {
       }).catch(() => {});
       return;
     }
-    await this._applyIntentOutcome(intent, intentIdForReport);
+    await this._applyIntentOutcome(intent, intentIdForReport, submitGen);
   }
 
   /**
@@ -1412,8 +1752,30 @@ export class Stripe extends HTMLElementCtor {
       // `this.error` via prepare's own `_setErrorState`.
       await preparePromise.catch(() => { /* supersede / prior failure */ });
     }
-    const id = this.intentId;
-    this._teardownElements();
+    // Prefer the locally-captured `_preparedIntentId` over `this.intentId`.
+    // In remote mode, `this.intentId` reads from `_remoteValues.intentId`
+    // which is updated by inbound `update` frames — that frame may not
+    // have arrived yet even after prepare resolved (the resolve is on
+    // the cmd return, not on the property publish). The locally-set
+    // `_preparedIntentId` is captured at the prepare success site and
+    // therefore tracks the actual intent we just created. `submit()`
+    // already uses this same fallback (`_preparedIntentId ?? this.intentId`).
+    const id = this._preparedIntentId ?? this.intentId;
+    // Defense-in-depth: `_teardownElements` is internally try/catch-wrapped
+    // on every Stripe.js call, so reaching here with a throw should be
+    // impossible today — but a future refactor that adds a non-wrapped
+    // step would, without this outer guard, skip the `_cancelIntent`
+    // below and leak an open intent at Stripe. Wrap so the cancel is
+    // unconditionally reached.
+    // Best-effort teardown: do not block the cancel below on a Stripe.js
+    // throw, but pipe the error to the static `Stripe._logger` sink so
+    // production observability (`Stripe.setLogger`) can still see it.
+    // Mirrors the `reportFailure` shape used in `_disposeRemoteWithBestEffortReset`.
+    try { this._teardownElements(); }
+    catch (err) {
+      try { Stripe._logger("teardown", err); }
+      catch { /* a misbehaving logger must not break abort() */ }
+    }
     if (id) {
       try {
         await this._cancelIntent(id);
@@ -1470,12 +1832,26 @@ export class Stripe extends HTMLElementCtor {
    * out. Subscribe to `stripe-checkout:unknown-status` and apply an app-level
    * timeout/escalation policy.
    */
-  private async _applyIntentOutcome(intent: Record<string, unknown>, intentId: string): Promise<void> {
+  private async _applyIntentOutcome(intent: Record<string, unknown>, intentId: string, submitGen?: number): Promise<void> {
     const status = typeof intent.status === "string" ? intent.status : "";
     const pm = extractCardPaymentMethod(intent);
 
+    // The caller (`_submitImpl`) already gen-checked at the top after the
+    // confirm await. But the synchronous `_setErrorState(err)` in the
+    // `requires_payment_method` / `canceled` branch below dispatches a
+    // `stripe-checkout:error` event BEFORE the `_reportConfirmation` await,
+    // which means a listener could observe a transient `card_declined`
+    // shape between the user's reset/abort/disconnect and the subsequent
+    // `_clearErrorState`. Re-check here so the synchronous dispatch is
+    // also gated on the generation snapshot. `submitGen` is undefined
+    // when `_applyIntentOutcome` is called from a future non-submit site;
+    // in that case we skip the gate (legacy behavior).
+    const stillCurrent = (): boolean =>
+      submitGen === undefined || submitGen === this._prepareGeneration;
+
     switch (status) {
       case "succeeded":
+        if (!stillCurrent()) return;
         await this._reportConfirmation({
           intentId,
           outcome: "succeeded",
@@ -1484,12 +1860,14 @@ export class Stripe extends HTMLElementCtor {
         break;
       case "requires_action":
       case "requires_confirmation":
+        if (!stillCurrent()) return;
         await this._reportConfirmation({
           intentId,
           outcome: "requires_action",
         }).catch(() => {});
         break;
       case "processing":
+        if (!stillCurrent()) return;
         await this._reportConfirmation({
           intentId,
           outcome: "processing",
@@ -1497,6 +1875,7 @@ export class Stripe extends HTMLElementCtor {
         break;
       case "requires_payment_method":
       case "canceled": {
+        if (!stillCurrent()) return;
         const lastErr = intent.last_payment_error ?? intent.last_setup_error;
         const err = lastErr && typeof lastErr === "object"
           ? this._sanitizeStripeJsError(lastErr as Record<string, unknown>)
@@ -1510,6 +1889,7 @@ export class Stripe extends HTMLElementCtor {
         break;
       }
       default: {
+        if (!stillCurrent()) return;
         this.dispatchEvent(new CustomEvent<UnknownStatusDetail>("stripe-checkout:unknown-status", {
           detail: {
             source: "shell-confirm",
@@ -1556,10 +1936,19 @@ export class Stripe extends HTMLElementCtor {
     if (!this._core && !this._isRemote) return;
 
     const params = new URLSearchParams(globalThis.location?.search ?? "");
-    const paymentIntentId = params.get("payment_intent");
-    const paymentSecret = params.get("payment_intent_client_secret");
-    const setupIntentId = params.get("setup_intent");
-    const setupSecret = params.get("setup_intent_client_secret");
+    // Trim before consuming — same rationale as `_isPostRedirect`. A
+    // whitespace-only value is treated as absent so a tampered URL does
+    // not force the Core's constant-time compare to deny a perpetual
+    // resume.
+    const trimOrNull = (v: string | null): string | null => {
+      if (v === null) return null;
+      const t = v.trim();
+      return t === "" ? null : t;
+    };
+    const paymentIntentId = trimOrNull(params.get("payment_intent"));
+    const paymentSecret = trimOrNull(params.get("payment_intent_client_secret"));
+    const setupIntentId = trimOrNull(params.get("setup_intent"));
+    const setupSecret = trimOrNull(params.get("setup_intent_client_secret"));
 
     // Require BOTH the intent id and the Stripe-issued client_secret.
     // Stripe's redirect always includes both; a URL with only one (id or
@@ -1619,9 +2008,31 @@ export class Stripe extends HTMLElementCtor {
         // cmd that never reached the Core advances nothing.
         coreSpoke = this._remoteErrorSeq > remoteSeqBefore;
       } else {
-        // Local mode has no transport boundary — a throw out of
-        // `_coreResume` is the Core's own throw. Treat as definitive.
-        coreSpoke = true;
+        // Local mode: distinguish Core-decisive denials from transient
+        // provider failures.
+        //
+        // - "Decisive" = the Core has authoritatively decided this resume
+        //   cannot proceed (clientSecret mismatch, registered authorizer
+        //   said no). Stripping the URL is correct: retrying with the
+        //   same params would just hit the same denial.
+        //
+        // - "Transient" = the Core never reached a decision because a
+        //   downstream call (provider.retrieveIntent network error,
+        //   future provider hooks) threw. Stripping the URL here would
+        //   leave the user with a 3DS-completed charge at Stripe and no
+        //   way to fold its terminal state back into observable state on
+        //   reload — same duplicate-charge exposure as the remote
+        //   transport-failure branch above.
+        //
+        // The Core annotates its decisive throws with the canonical
+        // `code` ("resume_client_secret_mismatch" /
+        // "resume_not_authorized"); see `StripeCore.resumeIntent`.
+        // Anything without one of those codes is treated as transient
+        // and the URL is preserved for retry.
+        const code = (e && typeof e === "object" && typeof (e as { code?: unknown }).code === "string")
+          ? (e as { code: string }).code
+          : "";
+        coreSpoke = code === "resume_client_secret_mismatch" || code === "resume_not_authorized";
       }
     } finally {
       this._resuming = false;
@@ -1658,6 +2069,25 @@ export class Stripe extends HTMLElementCtor {
 
   attributeChangedCallback(name: string, oldValue: string | null, newValue: string | null): void {
     if (name === "mode") {
+      // Surface unrecognized values explicitly. The getter collapses anything
+      // that is not "setup" to "payment", so a typo (`mode="setpu"`) or a
+      // non-empty unrecognized value would silently route an app intending
+      // "setup" through the "payment" path. Symmetric with the
+      // `amount-value` parse-failure warning below — both keep the
+      // attribute / observable divergence loud rather than silent. The
+      // empty string is treated as "unset" (default to payment) without a
+      // warning to keep parity with the historical default-payment
+      // behavior controlled-prop frameworks rely on when clearing.
+      if (newValue != null && newValue !== "" && newValue !== "payment" && newValue !== "setup") {
+        this.dispatchEvent(new CustomEvent("stripe-checkout:input-warning", {
+          detail: {
+            field: "mode",
+            value: newValue,
+            message: 'mode attribute must be "payment" or "setup"; treating as "payment". Set mode="payment" or mode="setup" explicitly.',
+          },
+          bubbles: true,
+        }));
+      }
       this._syncInput("mode", newValue === "setup" ? "setup" : "payment");
       // After prepare, mode is locked to whatever was captured at prepare
       // time (see _preparedMode). Warn so app code doesn't silently assume
@@ -1665,7 +2095,25 @@ export class Stripe extends HTMLElementCtor {
       this._warnIfConfigChangedAfterPrepare("mode");
     } else if (name === "amount-value") {
       const v = newValue != null && newValue !== "" ? Number(newValue) : null;
-      this._syncInput("amountValue", Number.isFinite(v as number) ? (v as number) : null);
+      const parsed = Number.isFinite(v as number) ? (v as number) : null;
+      // Surface unparseable values explicitly. The DOM attribute keeps the
+      // raw string, but the getter and the synced Core value collapse to
+      // `null`, which would otherwise hide a typo (`amount-value="abc"`)
+      // behind silent "not set" semantics — apps that subscribed to the
+      // attribute would see a string while the Core observed `null`. The
+      // warning event is the same shape as `stripe-checkout:stale-config`
+      // so app-level observability sinks treat it uniformly.
+      if (newValue != null && newValue !== "" && parsed === null) {
+        this.dispatchEvent(new CustomEvent("stripe-checkout:input-warning", {
+          detail: {
+            field: "amountValue",
+            value: newValue,
+            message: 'amount-value attribute is not a finite number; treating as null. Use a numeric value (e.g. amount-value="1000") or remove the attribute.',
+          },
+          bubbles: true,
+        }));
+      }
+      this._syncInput("amountValue", parsed);
       this._warnIfConfigChangedAfterPrepare("amountValue");
     } else if (name === "amount-currency") {
       this._syncInput("amountCurrency", newValue || null);
@@ -1698,6 +2146,26 @@ export class Stripe extends HTMLElementCtor {
       // that direction.
       if (oldValue != null && oldValue !== "" && newValue !== oldValue) {
         this._invalidateForKeyChange();
+      }
+      // Early format-warning. Mirrors the `mode` / `amount-value` warnings
+      // above so a mispasted secret key (`sk_live_...`) — by far the most
+      // common publishable-key mistake — is surfaced through the standard
+      // `stripe-checkout:input-warning` channel BEFORE prepare's hard error.
+      // Prepare still rejects (the Shell never trusts an attribute alone),
+      // so a misconfigured value cannot reach Stripe.js — this just
+      // shortens the diagnostic loop for app-level observability sinks.
+      if (newValue != null && newValue !== "" && !newValue.startsWith("pk_")) {
+        this.dispatchEvent(new CustomEvent("stripe-checkout:input-warning", {
+          detail: {
+            field: "publishableKey",
+            // Do NOT echo the value — even an evidently-malformed one may
+            // be a real `sk_live_...` mispaste, and crossing the wire on
+            // the warning frame would re-propagate the secret into
+            // arbitrary observability sinks.
+            message: 'publishable-key must be a Stripe publishable key (starts with "pk_"). prepare() will reject.',
+          },
+          bubbles: true,
+        }));
       }
       this._maybeAutoPrepare();
     }
@@ -1818,7 +2286,31 @@ export class Stripe extends HTMLElementCtor {
       // The Core's own registrations (webhook handlers, intent builder)
       // survive — the caller is responsible for reusing the same Core
       // or explicitly disposing the old one before passing a new one.
-      this._core?.reset();
+      //
+      // Wrap reset() in try/catch: a Core that has been `dispose()`d
+      // before the element is removed will throw from the `_disposed`
+      // guard inside `reset()`, which would otherwise propagate out of
+      // the Custom Element's detach lifecycle and corrupt the parent
+      // DOM mutation. Mirror the best-effort discipline used in the
+      // remote path's `_disposeRemoteWithBestEffortReset`.
+      try { this._core?.reset(); }
+      catch (e) {
+        try { Stripe._logger("local-reset", e); }
+        catch { /* a misbehaving logger must not break disconnect */ }
+      }
+      // Restore `_target` to the Core itself before dropping our
+      // reference. `attachLocalCore` rewired `_target` to `this` so
+      // observable events would dispatch on the Shell DOM node; if we
+      // leave that pointer in place after detach, every subsequent
+      // event the Core dispatches (a delayed webhook, an authorizer
+      // callback, etc.) keeps a strong reference to the now-detached
+      // Shell and prevents it from being garbage collected. Reverting
+      // to the Core-self default — what the constructor would have
+      // installed when no `target` was supplied — is the symmetric
+      // tear-down for the assignment in `attachLocalCore`.
+      if (this._core) {
+        (this._core as unknown as { _target: EventTarget })._target = this._core;
+      }
       this._core = null;
     }
   }

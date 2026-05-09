@@ -8,9 +8,9 @@ import { IWcBindable } from "../types.js";
  * Why this matters: `StripeCore.ts` imports `node:crypto` (for the
  * constant-time clientSecret compare in `resumeIntent`). When the Shell
  * (`components/Stripe.ts`, evaluated in the browser) needs
- * `StripeCore.wcBindable` at module scope 窶・for the
+ * `StripeCore.wcBindable` at module scope — for the
  * `Stripe.wcBindable.properties` spread, the remote proxy factory, and the
- * `attachLocalCore` type slot 窶・a direct `import { StripeCore }` pulls the
+ * `attachLocalCore` type slot — a direct `import { StripeCore }` pulls the
  * whole file into the browser graph, and `node:crypto` fails to resolve
  * (observed as `TypeError: Failed to fetch dynamically imported module`).
  *

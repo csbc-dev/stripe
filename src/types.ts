@@ -117,11 +117,33 @@ export interface StripeError {
  * the server-side IntentBuilder is the source of truth for amount/currency/
  * customer, because anything Shell-supplied can be tampered with in the
  * browser.
+ *
+ * The `[key: string]: unknown` index signature is a typing-only escape hatch
+ * for future SPEC extensions; the current Core implementation
+ * (`StripeCore.requestIntent`) explicitly normalizes every incoming hint
+ * down to the three named fields above and DROPS any extra keys before
+ * passing the object to the registered `IntentBuilder`. This is deliberate:
+ * a tampered wire payload could include keys like `__proto__` /
+ * `constructor` / `toString` that some builder implementations would
+ * inadvertently spread into Stripe options, polluting the create-intent
+ * payload.
+ *
+ * Apps that need to feed additional cart / pricing context (line items,
+ * coupon codes, currency override hints) into the IntentBuilder should NOT
+ * try to ride them on this hint surface. Instead, plumb them through the
+ * `UserContext` parameter — that argument originates server-side from
+ * authenticated session state and is by construction not Shell-tamperable,
+ * which is the whole point of the IntentBuilder seam.
  */
 export interface IntentRequestHint {
   amountValue?: number;
   amountCurrency?: string;
   customerId?: string;
+  /**
+   * Reserved. See the interface JSDoc — the Core normalization currently
+   * drops any non-named keys before invoking the IntentBuilder.
+   */
+  [key: string]: unknown;
 }
 
 /**
