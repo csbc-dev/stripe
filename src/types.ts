@@ -118,15 +118,24 @@ export interface StripeError {
  * customer, because anything Shell-supplied can be tampered with in the
  * browser.
  *
- * The `[key: string]: unknown` index signature is a typing-only escape hatch
- * for future SPEC extensions; the current Core implementation
- * (`StripeCore.requestIntent`) explicitly normalizes every incoming hint
- * down to the three named fields above and DROPS any extra keys before
- * passing the object to the registered `IntentBuilder`. This is deliberate:
- * a tampered wire payload could include keys like `__proto__` /
+ * Closed shape: only the three named optional fields are forwarded to the
+ * registered `IntentBuilder`. The Core (`StripeCore.requestIntent`)
+ * explicitly normalizes every incoming hint down to these three keys and
+ * DROPS anything else at the wire boundary. This is deliberate — a
+ * tampered wire payload could include keys like `__proto__` /
  * `constructor` / `toString` that some builder implementations would
- * inadvertently spread into Stripe options, polluting the create-intent
- * payload.
+ * inadvertently spread into Stripe options (`{ ...hint, currency: "usd" }`),
+ * polluting the create-intent payload.
+ *
+ * The earlier shape of this type carried a `[key: string]: unknown` index
+ * signature "for future SPEC extensions," but the index signature was
+ * actively misleading: TypeScript users were free to write
+ * `hint.lineItems = [...]` and have the field type-check, yet at runtime
+ * the Core silently dropped every non-named key before the IntentBuilder
+ * ever saw the payload. Removing the index signature makes the type's
+ * compile-time shape match the runtime shape — adding an unknown key now
+ * surfaces as a TypeScript error at the call site instead of as silent
+ * data loss at the boundary.
  *
  * Apps that need to feed additional cart / pricing context (line items,
  * coupon codes, currency override hints) into the IntentBuilder should NOT
@@ -139,11 +148,6 @@ export interface IntentRequestHint {
   amountValue?: number;
   amountCurrency?: string;
   customerId?: string;
-  /**
-   * Reserved. See the interface JSDoc — the Core normalization currently
-   * drops any non-named keys before invoking the IntentBuilder.
-   */
-  [key: string]: unknown;
 }
 
 /**
@@ -268,6 +272,23 @@ export interface StripeIntentView {
   amount?: StripeAmount;
   paymentMethod?: StripePaymentMethod;
   lastPaymentError?: StripeError;
+  /**
+   * Stripe `metadata` field on the retrieved intent. String→string map per
+   * the Stripe API contract. Used as the canonical input for `ResumeAuthorizer`
+   * implementations that gate resume by app-level keys (`userId`,
+   * `tenantId`, …) — the authorizer's JSDoc points at
+   * `intentView.metadata.userId === ctx.sub` as the canonical layered ACL.
+   * Without this slot the authorizer hook had no public, typed way to
+   * read those keys, even though the underlying Stripe response always
+   * carries them.
+   *
+   * `StripeSdkProvider.retrieveIntent` populates this from
+   * `result.metadata`; custom providers SHOULD do the same. The Core does
+   * not read this directly — it only passes the populated view through
+   * to `ResumeAuthorizer` (with `clientSecret` stripped beforehand,
+   * mirroring how the rest of the view crosses that boundary).
+   */
+  metadata?: Record<string, string>;
   /**
    * @internal
    * Stripe-issued `client_secret` for the intent. Populated by the

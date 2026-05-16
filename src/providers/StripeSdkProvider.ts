@@ -61,6 +61,36 @@ export interface StripeSdkProviderOptions {
   buildIdempotencyKey?: (ctx: StripeSdkProviderIdempotencyContext) => string | undefined;
 }
 
+/**
+ * @internal — Symbol-keyed escape hatch for test-only reset of the
+ * one-shot "missing buildIdempotencyKey" warning. Exported as a Symbol
+ * (rather than a public-named method) so the seam is not reachable
+ * via simple string indexing like
+ * `(StripeSdkProvider as any)._resetWarnings()` — the previous shape.
+ *
+ * Privacy boundary — what this Symbol IS and IS NOT:
+ *
+ *   - IS: indirection. Production code that has not imported
+ *     `_internalResetWarnings` cannot index into the class by a
+ *     guessable / autocomplete-able name. The previous string-keyed
+ *     form was discoverable from any IDE that lists class members.
+ *
+ *   - IS NOT: hard isolation. The Symbol is still reflected on the
+ *     class. `Object.getOwnPropertySymbols(StripeSdkProvider)` lists
+ *     it; a sufficiently determined caller can grab it without an
+ *     import. This is not an attack vector — the worst that can
+ *     happen is the latch resets and the warning fires once more —
+ *     but consumers MUST NOT treat this seam as a privacy primitive.
+ *
+ * Test-only usage (the contract this seam exists to serve):
+ *   import { StripeSdkProvider, _internalResetWarnings } from "...";
+ *   (StripeSdkProvider as any)[_internalResetWarnings]();
+ *
+ * Public API stability is not guaranteed; the Symbol's identity may
+ * change between minor versions.
+ */
+export const _internalResetWarnings: unique symbol = Symbol("@csbc-dev/stripe/internal/resetWarnings");
+
 function extractAmount(obj: Record<string, unknown>): StripeAmount | undefined {
   const value = obj.amount;
   const currency = obj.currency;
@@ -91,11 +121,24 @@ function extractLastPaymentError(obj: Record<string, unknown>): StripeError | un
   const err = obj.last_payment_error ?? obj.last_setup_error;
   if (err && typeof err === "object") {
     const e = err as Record<string, unknown>;
+    // If `message` is not a string, return `undefined` instead of
+    // synthesizing a generic "Payment failed." here. The Core's
+    // `_reconcileFromIntentView` re-runs `_sanitizeError` over this
+    // result before letting it touch observable state — if we fill in
+    // a generic message at this layer, the Core sanitizer sees an
+    // object with a real `type: "card_error"` AND our synthesized
+    // `message: "Payment failed."` and forwards both, producing the
+    // misleading "real Stripe error type but generic message"
+    // half-state the reviewer flagged. Returning `undefined` here
+    // lets the Core fall back to "no error reported", and the
+    // subsequent webhook path can fill it in with the real Stripe
+    // payload when it arrives.
+    if (typeof e.message !== "string") return undefined;
     return {
       code: typeof e.code === "string" ? e.code : undefined,
       declineCode: typeof e.decline_code === "string" ? e.decline_code : undefined,
       type: typeof e.type === "string" ? e.type : undefined,
-      message: typeof e.message === "string" ? e.message : "Payment failed.",
+      message: e.message,
     };
   }
   return undefined;
@@ -116,6 +159,39 @@ export class StripeSdkProvider implements IStripeProvider {
   private _client: StripeNodeLike;
   private _buildIdempotencyKey?: StripeSdkProviderOptions["buildIdempotencyKey"];
 
+  /**
+   * Module-scoped latch so the "no buildIdempotencyKey" warning fires at
+   * most once per process. The Core-level invariant in CLAUDE.md
+   * ("Idempotent intent creation — without buildIdempotencyKey, network
+   * flake creates duplicate intents") makes the omission worth flagging,
+   * but a per-instance warning would flood logs in multi-tenant servers
+   * that build a Provider per tenant. One warning per process is enough
+   * to nudge the operator to a deliberate decision; repeated noise just
+   * trains the operator to filter it out.
+   *
+   * Test reachability: import the Symbol `_internalResetWarnings` from
+   * this module and invoke
+   * `(StripeSdkProvider as any)[_internalResetWarnings]()` in
+   * test setup. Symbol-keyed seam keeps the latch from being
+   * reachable via simple `(StripeSdkProvider as any)._resetWarnings()`
+   * indexing from code that did not deliberately import the Symbol —
+   * which was the reviewer's concern about the previous public-named
+   * static method. The warning is a one-shot diagnostic, not a
+   * programmable lifecycle event.
+   */
+  private static _warnedAboutMissingIdempotencyKey: boolean = false;
+
+  /**
+   * Symbol-keyed reset accessor. Indexed by the module-exported
+   * `_internalResetWarnings` Symbol; production code that does not
+   * import the Symbol cannot reach this method. Public API stability
+   * is not guaranteed; the Symbol's identity may change between
+   * minor versions.
+   */
+  static [_internalResetWarnings](): void {
+    StripeSdkProvider._warnedAboutMissingIdempotencyKey = false;
+  }
+
   constructor(client: StripeNodeLike, options: StripeSdkProviderOptions = {}) {
     if (!client) raiseError("stripe client is required.");
     if (
@@ -126,6 +202,33 @@ export class StripeSdkProvider implements IStripeProvider {
     }
     this._client = client;
     this._buildIdempotencyKey = options.buildIdempotencyKey;
+    // Fail-loud nudge for the no-idempotency-key default. The seam is
+    // optional by design (apps that genuinely want a different dedup
+    // story plug their own), but the silent default — no key at all —
+    // means a network flake during `paymentIntents.create` lets Stripe
+    // create duplicate intents on retry. That is a real money-side
+    // exposure, not a soft-best-practice nit, so surface it once.
+    if (
+      options.buildIdempotencyKey === undefined
+      && !StripeSdkProvider._warnedAboutMissingIdempotencyKey
+    ) {
+      StripeSdkProvider._warnedAboutMissingIdempotencyKey = true;
+      // `globalThis.console` rather than a bare `console` reference so
+      // a server runtime with a stubbed console (workers, custom shim)
+      // never crashes here.
+      const c = (globalThis as { console?: { warn?: (...args: unknown[]) => void } }).console;
+      if (c && typeof c.warn === "function") {
+        c.warn(
+          "[@csbc-dev/stripe] StripeSdkProvider constructed without "
+          + "`buildIdempotencyKey`. Without an idempotency key, a network "
+          + "retry during paymentIntents.create can result in duplicate "
+          + "PaymentIntents (and a duplicate authorization hold on the "
+          + "customer's card). Provide `new StripeSdkProvider(client, { "
+          + "buildIdempotencyKey: (ctx) => crypto.randomUUID() })` (or a "
+          + "request-correlated key) for production deployments.",
+        );
+      }
+    }
   }
 
   async createPaymentIntent(opts: PaymentIntentOptions): Promise<IntentCreationResult> {
@@ -133,10 +236,54 @@ export class StripeSdkProvider implements IStripeProvider {
     // minor-unit integer). A fractional value would be rejected by the
     // Stripe API with an opaque server-side error; reject locally for
     // faster feedback and a clearer diagnostic.
+    //
+    // Upper bound: deliberately NOT enforced here. Stripe's per-currency
+    // limits are well-published but vary (e.g. USD ~999,999,999 cents,
+    // JPY higher in absolute units) and shift over time as Stripe adjusts
+    // its risk thresholds. Hardcoding a ceiling at this layer would
+    // either be wrong-for-some-currency or quickly become stale. The
+    // IntentBuilder is the documented seam for amount validation
+    // (CLAUDE.md "The server decides the amount.") — apps with a real
+    // upper bound concern (cart caps, fraud thresholds, tier-based
+    // limits) MUST validate amount inside their IntentBuilder against
+    // their authenticated UserContext / cart store before this method
+    // is reached. The Stripe API rejection on overage remains the
+    // backstop for misconfigured builders.
     if (!Number.isInteger(opts.amount) || opts.amount <= 0) {
       raiseError(`amount must be a positive integer in the smallest currency unit, got ${opts.amount}.`);
     }
-    if (!opts.currency) raiseError("currency is required.");
+    // Currency shape: required, three lowercase ASCII letters per
+    // Stripe's published contract (`"usd"`, `"jpy"`, `"eur"`, …).
+    // Stripe accepts uppercase / mixed-case variants too, but
+    // normalizes them server-side; rejecting non-lowercase here keeps
+    // app code aligned with the documented shape and avoids a class of
+    // subtle bugs (`"USD" !== "usd"` string compare in app-side cart
+    // logic). A 3-letter ISO-4217 check is the minimum cost
+    // self-defense; deeper currency validation (the actual ISO list,
+    // currency-vs-amount unit alignment) is the IntentBuilder's
+    // responsibility — that boundary already owns "the server decides
+    // the amount" per CLAUDE.md, and it has access to the per-tenant
+    // cart store / pricing service that knows which currencies are
+    // legitimate.
+    if (typeof opts.currency !== "string" || !/^[a-z]{3}$/.test(opts.currency)) {
+      raiseError(`currency must be a 3-letter lowercase ISO 4217 code (e.g. "usd"), got ${JSON.stringify(opts.currency)}.`);
+    }
+    // Symmetric checks with `createSetupIntent` — optional fields whose
+    // shape is well-defined enough to fail loud at this layer rather
+    // than wait for an opaque Stripe API rejection.
+    if (opts.customer !== undefined && typeof opts.customer !== "string") {
+      raiseError(`customer must be a string when provided, got ${JSON.stringify(opts.customer)}.`);
+    }
+    if (opts.payment_method_types !== undefined) {
+      if (!Array.isArray(opts.payment_method_types)) {
+        raiseError(`payment_method_types must be an array when provided, got ${typeof opts.payment_method_types}.`);
+      }
+      for (const t of opts.payment_method_types) {
+        if (typeof t !== "string") {
+          raiseError(`payment_method_types entries must be strings, got ${typeof t}.`);
+        }
+      }
+    }
     // Default to automatic_payment_methods when the caller did not opt out —
     // it is Stripe's recommended path and it supports the widest range of
     // Elements-based confirmation flows without the app having to enumerate
@@ -183,9 +330,45 @@ export class StripeSdkProvider implements IStripeProvider {
   }
 
   async createSetupIntent(opts: SetupIntentOptions): Promise<IntentCreationResult> {
-    // Symmetric with `createPaymentIntent`: treat an empty
-    // `payment_method_types` array as unset so the automatic-payment-methods
-    // default applies cleanly.
+    // Symmetric input validation with `createPaymentIntent`. Each of
+    // these checks rejects locally for faster, clearer feedback than
+    // a remote Stripe API rejection — and protects against tampered
+    // wire payloads reaching here through a custom IntentBuilder that
+    // forgot to validate its own output:
+    //
+    // - `customer`: optional, but if present must be a string. Stripe
+    //   uses it as the `cus_...` foreign key; a non-string would
+    //   produce an opaque server-side rejection.
+    // - `usage`: enum (`"on_session"` / `"off_session"`) per Stripe's
+    //   SetupIntent API. A typo'd literal here defaults Stripe to
+    //   `"off_session"` silently in some response shapes.
+    // - `payment_method_types`: optional array of strings.
+    //
+    // `createPaymentIntent`'s `amount` / `currency` checks have no
+    // counterpart on this surface (SetupIntents do not carry an
+    // amount), so the symmetric check is by-field rather than
+    // by-field-list. Other optional Stripe SetupIntent params (e.g.
+    // `description`, `metadata`, `payment_method_options`) pass
+    // through untouched — the Stripe API is the ultimate gate for
+    // their shape.
+    if (opts.customer !== undefined && typeof opts.customer !== "string") {
+      raiseError(`customer must be a string when provided, got ${JSON.stringify(opts.customer)}.`);
+    }
+    if (opts.usage !== undefined && opts.usage !== "on_session" && opts.usage !== "off_session") {
+      raiseError(`usage must be "on_session" or "off_session", got ${JSON.stringify(opts.usage)}.`);
+    }
+    if (opts.payment_method_types !== undefined) {
+      if (!Array.isArray(opts.payment_method_types)) {
+        raiseError(`payment_method_types must be an array when provided, got ${typeof opts.payment_method_types}.`);
+      }
+      for (const t of opts.payment_method_types) {
+        if (typeof t !== "string") {
+          raiseError(`payment_method_types entries must be strings, got ${typeof t}.`);
+        }
+      }
+    }
+    // Treat an empty `payment_method_types` array as unset so the
+    // automatic-payment-methods default applies cleanly.
     const params: Record<string, unknown> = { ...opts };
     if (Array.isArray(params.payment_method_types) && params.payment_method_types.length === 0) {
       delete params.payment_method_types;
@@ -230,6 +413,27 @@ export class StripeSdkProvider implements IStripeProvider {
     const result = mode === "payment"
       ? await this._client.paymentIntents.retrieve(id, opts)
       : await this._client.setupIntents.retrieve(id, opts);
+    // Narrow `metadata` to the documented `Record<string, string>` shape.
+    // Stripe's API contract pins string→string, but a future client-side
+    // change (or a custom-tweaked stripe-node) could surface non-string
+    // values; copying field-by-field guards against silent ABI drift
+    // landing in `ResumeAuthorizer` callbacks. Drop non-string values
+    // rather than coerce — an authorizer doing `intentView.metadata.userId
+    //  === ctx.sub` must observe absence over a coerced `String(...)` slot.
+    let metadata: Record<string, string> | undefined;
+    if (result.metadata && typeof result.metadata === "object") {
+      const raw = result.metadata as Record<string, unknown>;
+      const narrowed: Record<string, string> = {};
+      let any = false;
+      for (const k of Object.keys(raw)) {
+        const v = raw[k];
+        if (typeof v === "string") {
+          narrowed[k] = v;
+          any = true;
+        }
+      }
+      if (any) metadata = narrowed;
+    }
     return {
       id: typeof result.id === "string" ? result.id : id,
       status: typeof result.status === "string" ? result.status : "unknown",
@@ -237,6 +441,7 @@ export class StripeSdkProvider implements IStripeProvider {
       amount: extractAmount(result),
       paymentMethod: extractCardPaymentMethod(result),
       lastPaymentError: extractLastPaymentError(result),
+      metadata,
       // Stripe's PaymentIntent/SetupIntent retrieve returns `client_secret`
       // on every call. The Core uses it exclusively to validate that a
       // resume call (from a post-3DS URL) actually knows the secret —

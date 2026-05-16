@@ -39,6 +39,17 @@ const _PM_FIELD_MAX_LENGTH = { id: 128, brand: 64, last4: 8 } as const;
  * report that omitted `paymentMethod` — fall back to the server-side
  * retrieve / webhook fold path, which is sourced from Stripe directly
  * and trustworthy.
+ *
+ * Rejection policy (deliberately strict): a malformed shape — wrong
+ * field type, missing field, oversize string — is rejected WHOLESALE.
+ * We do NOT pass partial shapes (e.g. id-only) through to the
+ * observable surface, because a half-populated `paymentMethod` renders
+ * "Visa •• " in UIs that template `${brand} •• ${last4}` and a wrong-
+ * type id can't be used as a `pm_...` reference for off-session
+ * charges anyway. The Core's succeeded-branch fallback (`provider.
+ * retrieveIntent` with `expand: ["payment_method"]`) is the
+ * authoritative source for these fields; relying on it consistently is
+ * safer than letting Shell-supplied partial data sneak in.
  */
 export function validateReportedPaymentMethod(value: unknown): StripePaymentMethod | undefined {
   if (!value || typeof value !== "object") return undefined;

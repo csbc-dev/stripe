@@ -138,6 +138,19 @@ describe("<stripe-checkout> Shell", () => {
 
   afterEach(() => {
     setUrlSearch("");
+    // SPEC §7.6 — test teardown discipline. `Stripe._loader` and
+    // `Stripe._logger` are module-realm static state shared by every
+    // `<stripe-checkout>` element in the same process. Without an
+    // explicit reset, a loader / logger installed by one test leaks
+    // into subsequent tests' setup phases (the `beforeEach` overwrite
+    // of `setLoader` is unconditional, but any subsequent describe-
+    // level test that builds its OWN loader-installer pattern would
+    // miss the override, and the leaked logger is observed by any
+    // cleanup path that touches `Stripe._logger`). Restoring the
+    // defaults here makes the static-state invariant the doc demands
+    // a property of the test suite itself, not a per-test contract.
+    WcsStripe.resetLoader();
+    WcsStripe.resetLogger();
   });
 
   it("declares a minimal public command surface (prepare/submit/reset/abort)", () => {
@@ -177,6 +190,94 @@ describe("<stripe-checkout> Shell", () => {
       expect(statusEvents).toContain("collecting");
       // `intentId-changed` should also have arrived on the element.
       expect(intentIdEvents).toContain("pi_shell");
+    });
+
+    it("disconnectedCallback restores the Core's original target (constructor-supplied, regression)", async () => {
+      // Regression: `disconnectedCallback` used to always restore the
+      // target to the Core itself, which was wrong for Cores built
+      // with `new StripeCore(provider, { target: customSink })`. The
+      // custom sink would be silently lost on detach. The fix
+      // snapshots `core._getEventTarget()` at attachLocalCore time
+      // and restores it on disconnect. Probe the routing by reading
+      // `core._getEventTarget()` directly at each lifecycle point.
+      const customSink = new EventTarget();
+      const coreWithCustomSink = new StripeCore(provider, { target: customSink });
+      coreWithCustomSink.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+
+      // Pre-attach: target is the custom sink.
+      expect(coreWithCustomSink._getEventTarget()).toBe(customSink);
+
+      // Attach to a Shell. Target becomes the Shell.
+      const localEl = createEl({ mode: "payment", "publishable-key": "pk_test_target_restore" });
+      localEl.attachLocalCore(coreWithCustomSink);
+      expect(coreWithCustomSink._getEventTarget()).toBe(localEl);
+
+      // Detach. The custom sink MUST be restored. Without the fix,
+      // target would have been restored to the Core itself.
+      localEl.remove();
+      expect(coreWithCustomSink._getEventTarget()).toBe(customSink);
+    });
+
+    it("disconnectedCallback restores to Core itself for default-target Cores (preserves prior behavior)", () => {
+      // Cores built WITHOUT an explicit `target` option default to
+      // `this` (the Core itself). Detach must restore to that
+      // default — not silently switch to some other sink — so the
+      // pre-attach default semantics are preserved for the
+      // overwhelming majority of Cores constructed standalone.
+      const standaloneCore = new StripeCore(provider);
+      standaloneCore.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      // Pre-attach: target defaults to the Core itself.
+      expect(standaloneCore._getEventTarget()).toBe(standaloneCore);
+
+      const localEl = createEl({ mode: "payment", "publishable-key": "pk_test_default_target" });
+      localEl.attachLocalCore(standaloneCore);
+      expect(standaloneCore._getEventTarget()).toBe(localEl);
+
+      localEl.remove();
+      // Restored to the Core itself, matching the constructor default.
+      expect(standaloneCore._getEventTarget()).toBe(standaloneCore);
+    });
+
+    it("attachLocalCore does NOT leave partial state when a Core setter throws (regression: bind ordering)", () => {
+      // Regression: `attachLocalCore` previously bound the Shell as
+      // the Core's `_target` AND assigned `this._core = core` BEFORE
+      // pushing attributes into the Core's setters. If a Core input
+      // setter (`core.mode = ...`, `core.amountValue = ...`, etc.)
+      // threw synchronously, the Shell was left in a half-attached
+      // state: `_target` rewired, `_core` assigned,
+      // `_coreOriginalTarget` captured — but the input push aborted
+      // mid-loop. Subsequent `disconnectedCallback` would then try
+      // to clean up an attach that the caller observed as having
+      // failed.
+      //
+      // The fix reorders: input push happens BEFORE the bind, so a
+      // throw at the setter leaves the Core completely untouched
+      // (`_target` not rewired, `_core` not assigned) — the caller
+      // observes a clean rejection and the Shell stays free to
+      // attach to a different Core.
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_attach_throw" });
+      const standaloneCore = new StripeCore(provider);
+      // Stub Core's `mode` setter to throw so we can drive the
+      // partial-init path deterministically. The Shell pushes `mode`
+      // first among the attrs, so this guarantees the throw fires
+      // before any other setter touches the Core.
+      Object.defineProperty(standaloneCore, "mode", {
+        set: () => { throw new Error("synthetic mode setter throw"); },
+        get: () => "payment",
+        configurable: true,
+      });
+
+      expect(() => el.attachLocalCore(standaloneCore)).toThrow(/synthetic mode setter throw/);
+      // Critical: NO partial state.
+      //   - Core's target is still its constructor default (itself),
+      //     NOT the Shell.
+      //   - `this._core` is null, so `disconnectedCallback` has
+      //     nothing to clean up.
+      //   - `_coreOriginalTarget` is null (the snapshot only
+      //     happens AFTER the input push completes).
+      expect(standaloneCore._getEventTarget()).toBe(standaloneCore);
+      expect((el as unknown as { _core: unknown })._core).toBeNull();
+      expect((el as unknown as { _coreOriginalTarget: unknown })._coreOriginalTarget).toBeNull();
     });
 
     it("attachLocalCore rejects when a remote proxy is already attached", () => {
@@ -659,6 +760,91 @@ describe("<stripe-checkout> Shell", () => {
       expect(el.error?.code).toBe("card_declined");
     });
 
+    it("returnUrl setter accepts null/empty to clear the attribute (regression: input setter symmetry)", () => {
+      // Symmetric with `amountValue` / `amountCurrency` / `customerId` /
+      // `publishableKey`: `el.returnUrl = null` MUST remove the
+      // attribute, not coerce to the string `"null"` (the prior shape
+      // accepted `string` only and routed null through
+      // `setAttribute("return-url", "null")`, leaving a value on the
+      // DOM that fails Stripe.js's confirm-time scheme check with an
+      // opaque diagnostic).
+      el.setAttribute("return-url", "https://example.com/return");
+      expect(el.getAttribute("return-url")).toBe("https://example.com/return");
+
+      el.returnUrl = null as unknown as string; // Force the null path
+      expect(el.hasAttribute("return-url")).toBe(false);
+      expect(el.returnUrl).toBe("");
+
+      el.returnUrl = "https://example.com/again";
+      expect(el.getAttribute("return-url")).toBe("https://example.com/again");
+
+      el.returnUrl = ""; // Empty string also clears
+      expect(el.hasAttribute("return-url")).toBe(false);
+    });
+
+    it("_sanitizeStripeJsError drops non-taxonomy code / declineCode / type tokens (regression: Shell-side allowlist)", async () => {
+      // Regression: `_sanitizeStripeJsError` previously forwarded `code`
+      // / `decline_code` / `type` verbatim, on the assumption that
+      // Stripe.js's confirm path produces a trustworthy shape. Browser
+      // extensions / custom loaders / proxies can decorate the result
+      // before it reaches the Shell, however — a forged
+      // `code: "<script>"` / `type: "Card_Error"` could otherwise slip
+      // into the `stripe-checkout:error` event detail. The fix gates
+      // these fields through the same `_safeToken` / `_safeType`
+      // allowlists used by `_setErrorStateFromUnknown`.
+      //
+      // Once `type` is dropped to undefined, the Core's downstream
+      // `_sanitizeError` ALSO collapses `message` to "Payment failed."
+      // because the error no longer looks Stripe-shaped — this is the
+      // correct cascade behavior. The observable `el.error` (read via
+      // `_core.error ?? this._errorState` in local mode) reflects the
+      // Core's sanitized shape.
+      await el.prepare();
+      fakes.setConfirmResult({
+        error: {
+          code: "<script>alert(1)</script>",
+          decline_code: "NOT-A-TAXONOMY-TOKEN!",
+          type: "Card_Error",  // PascalCase variant that the regex deliberately rejects
+          message: "Declined.",
+        },
+      });
+      await el.submit();
+      expect(el.status).toBe("failed");
+      // Non-taxonomy `code` / `declineCode` / `type` dropped to undefined.
+      expect(el.error?.code).toBeUndefined();
+      expect(el.error?.declineCode).toBeUndefined();
+      expect(el.error?.type).toBeUndefined();
+      // `message` collapses to the generic Core-side fallback because
+      // there is no Stripe-shaped `type` to vouch for the message
+      // forwarding policy. This is the desired cascade — the forged
+      // diagnostic text never makes it to the wire.
+      expect(el.error?.message).toBe("Payment failed.");
+    });
+
+    it("_sanitizeStripeJsError preserves the original error when fields ARE valid taxonomy tokens", async () => {
+      // Counterpart to the drop test above: a legitimate Stripe.js
+      // error with all-lowercase `type: "card_error"` and a taxonomy-
+      // compliant `code: "card_declined"` must flow through both
+      // layers untouched. The previous test pins the negative path;
+      // this one pins the positive path so the allowlist tightening
+      // doesn't regress legitimate Stripe.js errors.
+      await el.prepare();
+      fakes.setConfirmResult({
+        error: {
+          code: "card_declined",
+          decline_code: "insufficient_funds",
+          type: "card_error",
+          message: "Your card was declined.",
+        },
+      });
+      await el.submit();
+      expect(el.status).toBe("failed");
+      expect(el.error?.code).toBe("card_declined");
+      expect(el.error?.declineCode).toBe("insufficient_funds");
+      expect(el.error?.type).toBe("card_error");
+      expect(el.error?.message).toBe("Your card was declined.");
+    });
+
     it("mode change after prepare does NOT redirect submit to the wrong confirm API (regression: finding #2)", async () => {
       await el.prepare(); // prepared mode = "payment"
       el.setAttribute("mode", "setup");
@@ -997,6 +1183,174 @@ describe("<stripe-checkout> Shell", () => {
       } finally {
         history.replaceState = originalReplaceState;
       }
+    });
+
+    it("disconnect during in-flight resume does NOT let the resume's finally re-latch _resumed=true (regression)", async () => {
+      // Regression: `_resumeFromRedirect`'s finally block re-latched
+      // `_resumed = true` even after `disconnectedCallback` had
+      // explicitly cleared it via `_markSupersede(true)`. A
+      // portal/teleport that does `el.remove()` mid-resume would
+      // therefore see `_resumed = true` re-stamped, silently wedging
+      // the next mount's `_isPostRedirect()` check and dropping any
+      // fresh 3DS URL on the floor. The fix snapshots `_prepareGeneration`
+      // before the await and only writes back if the snapshot is still
+      // current at finally time.
+      setUrlSearch("?payment_intent=pi_race&payment_intent_client_secret=pi_race_secret_ok");
+      // Park the provider retrieve in a manual-release promise so we
+      // can interleave a disconnect before it resolves.
+      let releaseRetrieve!: () => void;
+      const retrievePromise = new Promise<void>(r => { releaseRetrieve = r; });
+      const origRetrieve = provider.retrieveIntent.bind(provider);
+      provider.retrieveIntent = async (mode, id) => {
+        await retrievePromise;
+        return origRetrieve(mode, id);
+      };
+      provider.retrieveResult = {
+        id: "pi_race",
+        status: "succeeded",
+        mode: "payment",
+        clientSecret: "pi_race_secret_ok",
+      };
+
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_123" });
+      el.attachLocalCore(core);
+      // Give microtask queue a tick so `_resumeFromRedirect` reaches its
+      // `await _coreResume` (which awaits `await provider.retrieveIntent`).
+      await new Promise(r => setTimeout(r, 0));
+      expect((el as unknown as { _resuming: boolean })._resuming).toBe(true);
+
+      // Detach the element mid-resume. `_markSupersede(true)` bumps
+      // `_prepareGeneration` and `disconnectedCallback` clears `_resumed`
+      // to false.
+      el.remove();
+      expect((el as unknown as { _resumed: boolean })._resumed).toBe(false);
+
+      // Now let the parked retrieve resolve — `_resumeFromRedirect`'s
+      // finally will fire. Without the generation guard, it would
+      // re-latch `_resumed = true`. With the fix, the generation
+      // mismatch suppresses the write.
+      releaseRetrieve();
+      await new Promise(r => setTimeout(r, 0));
+      await new Promise(r => setTimeout(r, 0));
+
+      // Critical assertion: `_resumed` STAYS false. Even though the
+      // resume's coroutine ran to completion server-side (the
+      // retrieve resolved), the Shell's local lifecycle was superseded
+      // by the disconnect, so the URL-strip + `_resumed = true` latch
+      // MUST be skipped.
+      expect((el as unknown as { _resumed: boolean })._resumed).toBe(false);
+
+      provider.retrieveIntent = origRetrieve;
+    });
+
+    it("Stripe-taxonomy code (e.g. resource_missing) is classified as decisive, strips URL, prevents infinite retry (regression)", async () => {
+      // Regression: the local-mode "decisive vs transient" classifier
+      // previously only accepted the two Core-internal codes
+      // ("resume_client_secret_mismatch" / "resume_not_authorized")
+      // as decisive. A Stripe-API-side failure like 404
+      // "resource_missing" (tampered intent id, intent already
+      // cancelled at Stripe, …) carries `code: "resource_missing"`
+      // which fell into the transient bucket — the URL was NOT
+      // stripped, `_resumed` stayed false, the next connect re-fired
+      // resume against the same broken id, ad infinitum. The fix
+      // classifies any error whose `code` matches the Stripe
+      // taxonomy regex (`STRIPE_ERROR_CODE_RE`) as decisive too.
+      setUrlSearch("?payment_intent=pi_404&payment_intent_client_secret=pi_404_secret_xx");
+      // Provider throws a Stripe-shaped 404 (the sanitizer forwards
+      // `code: "resource_missing"` because the error has a valid
+      // Stripe type).
+      provider.retrieveIntent = async () => {
+        throw Object.assign(new Error("No such payment_intent: pi_404"), {
+          code: "resource_missing",
+          type: "invalid_request_error",
+        });
+      };
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_resource_missing" });
+      el.addEventListener("error", () => {}); // swallow
+      el.attachLocalCore(core);
+      // Let resume run.
+      await new Promise(r => setTimeout(r, 0));
+      await new Promise(r => setTimeout(r, 0));
+
+      // Critical: `_resumed` MUST flip to true (decisive denial), and
+      // the URL params MUST be stripped — otherwise the next connect
+      // would loop forever on the same dead id.
+      expect((el as unknown as { _resumed: boolean })._resumed).toBe(true);
+      expect(globalThis.location.search).not.toContain("payment_intent=pi_404");
+    });
+
+    it("non-Stripe-shape transport failure stays transient, URL preserved for retry", async () => {
+      // Counterpart to the regression above: a plain non-Stripe-shaped
+      // throw (no `code`, no Stripe `type`) is still treated as
+      // transient. This pins the boundary between "definitive
+      // application-level denial" (decisive) and "the network
+      // couldn't be reached" (transient).
+      setUrlSearch("?payment_intent=pi_transient&payment_intent_client_secret=pi_transient_secret_xx");
+      provider.retrieveIntent = async () => {
+        throw new Error("ECONNREFUSED"); // plain Error, no code / type
+      };
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_transient" });
+      el.addEventListener("error", () => {});
+      el.attachLocalCore(core);
+      await new Promise(r => setTimeout(r, 0));
+      await new Promise(r => setTimeout(r, 0));
+
+      // `_resumed` must STAY false so a later trigger (reconnect /
+      // reload) retries with the URL intact.
+      expect((el as unknown as { _resumed: boolean })._resumed).toBe(false);
+      expect(globalThis.location.search).toContain("payment_intent=pi_transient");
+    });
+
+    it("disconnect → reconnect clears _resumed so a same-instance remount can resume a fresh redirect URL", async () => {
+      // Regression: the class JSDoc on `_resumed` promised that
+      // `disconnectedCallback → connectedCallback` is a session reset
+      // boundary, but the flag was previously only cleared on
+      // _instance_ replacement, not on detach. A framework portal /
+      // teleport that moves the SAME element between containers would
+      // therefore keep `_resumed = true` from a prior page load and
+      // refuse to fire `_resumeFromRedirect` on the second mount —
+      // silently dropping a fresh 3DS redirect into auto-prepare-blocked
+      // limbo.
+      //
+      // First resume: succeeds, latches `_resumed = true`.
+      setUrlSearch("?payment_intent=pi_first&payment_intent_client_secret=pi_first_secret_ok&redirect_status=succeeded");
+      provider.retrieveResult = {
+        id: "pi_first",
+        status: "succeeded",
+        mode: "payment",
+        clientSecret: "pi_first_secret_ok",
+      };
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_123" });
+      el.attachLocalCore(core);
+      await new Promise(r => setTimeout(r, 0));
+      await new Promise(r => setTimeout(r, 0));
+      expect(el.status).toBe("succeeded");
+      expect(provider.retrieveCalls).toHaveLength(1);
+
+      // Detach the SAME element instance.
+      el.remove();
+
+      // A different 3DS redirect arrives between mounts.
+      setUrlSearch("?payment_intent=pi_second&payment_intent_client_secret=pi_second_secret_ok&redirect_status=succeeded");
+      provider.retrieveResult = {
+        id: "pi_second",
+        status: "succeeded",
+        mode: "payment",
+        clientSecret: "pi_second_secret_ok",
+      };
+      // Re-attach a fresh Core (the prior Core was reset+detached).
+      const { core: core2 } = await import("../src/core/StripeCore").then(m => ({ core: new m.StripeCore(provider) }));
+      core2.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+
+      document.body.appendChild(el);
+      el.attachLocalCore(core2);
+      await new Promise(r => setTimeout(r, 0));
+      await new Promise(r => setTimeout(r, 0));
+      // Second resume MUST have fired — the provider retrieve was called
+      // for pi_second (not just pi_first from the prior mount).
+      expect(provider.retrieveCalls).toHaveLength(2);
+      expect(provider.retrieveCalls[1]).toEqual({ mode: "payment", id: "pi_second" });
+      expect(el.intentId).toBe("pi_second");
     });
 
     it("resume detects setup_intent and uses setup mode", async () => {
@@ -2061,6 +2415,30 @@ describe("<stripe-checkout> Shell", () => {
       expect(core.amountValue).toBe(1000);
     });
 
+    it("amount-value attribute with a negative number dispatches stripe-checkout:input-warning and does NOT throw out of attributeChangedCallback", () => {
+      // Regression: the attribute path used to forward negative values to
+      // the Core's setter, which raises synchronously via `raiseError`.
+      // That throw escapes `attributeChangedCallback` and corrupts the
+      // browser's microtask queue in local mode (remote mode silently
+      // swallowed it via `setWithAck`'s promise catch — asymmetric).
+      // Mirror the unparseable-value contract: emit a warning, collapse
+      // the synced Core value to null, leave the raw DOM attribute as-is.
+      const warnings: CustomEvent[] = [];
+      el.addEventListener("stripe-checkout:input-warning", (e) => warnings.push(e as CustomEvent));
+
+      // Must NOT throw — the previous code did when the negative value
+      // hit `core.amountValue = -100`.
+      expect(() => el.setAttribute("amount-value", "-100")).not.toThrow();
+
+      expect(warnings).toHaveLength(1);
+      const detail = warnings[0].detail as { field: string; value: string };
+      expect(detail.field).toBe("amountValue");
+      expect(detail.value).toBe("-100");
+      expect(core.amountValue).toBeNull();
+      // Raw attribute is preserved (matches the unparseable-value contract).
+      expect(el.getAttribute("amount-value")).toBe("-100");
+    });
+
     it('mode attribute that is not "payment" or "setup" dispatches stripe-checkout:input-warning', () => {
       // Pin the symmetric contract for `mode`: the getter collapses every
       // unrecognized value to "payment", so a typo (`mode="setpu"`) would
@@ -2100,6 +2478,62 @@ describe("<stripe-checkout> Shell", () => {
       el.trigger = true;
       await new Promise(r => setTimeout(r, 0));
       expect(submitSpy).toHaveBeenCalled();
+    });
+
+    it("rapid false→true→false→true does NOT lose the trailing true state (regression: trigger race)", async () => {
+      // Regression: the trigger setter's `.finally()` chain attached a
+      // new handler on every false→true write, so two rapid cycles
+      // against the same in-flight `submit()` produced TWO `.finally`
+      // handlers. When submit resolved, the FIRST `.finally` saw
+      // `_trigger = true` and flipped it to `false` (dispatching a
+      // spurious `trigger-changed: false`), and the second `.finally`
+      // saw the now-`false` and did nothing — even though the user's
+      // last write was `true`. The fix introduces `_triggerGeneration`
+      // so only the most-recent setter's `.finally` is authoritative.
+      //
+      // Park `submit()` in a manual-release promise so we can drive
+      // the trigger toggles entirely within the in-flight window.
+      let releaseSubmit!: () => void;
+      const submitPromise = new Promise<void>(r => { releaseSubmit = r; });
+      vi.spyOn(el, "submit").mockImplementation(() => submitPromise);
+
+      const events: boolean[] = [];
+      el.addEventListener("stripe-checkout:trigger-changed", (e) => {
+        events.push((e as CustomEvent).detail as boolean);
+      });
+
+      el.trigger = true;   // cycle 1 start, fires submit. events: [true]
+      el.trigger = false;  // edge to false. events: [true, false]
+      el.trigger = true;   // cycle 2 start. NOT a new submit (dedup
+                           // via `_submitPromise`), but a new
+                           // `.finally` chain attaches. events:
+                           // [true, false, true]
+
+      // Now release the in-flight submit. Both `.finally` chains run.
+      // Without the generation guard, the first one flips `_trigger`
+      // back to false and dispatches a spurious `false`. With the
+      // guard, only the most-recent (`triggerGen === current`) chain
+      // sets `_trigger = false`.
+      releaseSubmit();
+      await new Promise(r => setTimeout(r, 0));
+      await new Promise(r => setTimeout(r, 0));
+
+      // After both `.finally`s run, the most-recent cycle's finally
+      // flipped `_trigger` to false — the user's last manual write was
+      // `true`, but the natural finally-after-submit-resolved is the
+      // authoritative source. Critical assertion: there is exactly ONE
+      // trailing `false` event, not the spurious double-false from the
+      // race (without the generation guard, the first `.finally` would
+      // also have dispatched a `false`, then the second `.finally`'s
+      // `if (this._trigger)` check would see it was already false and
+      // suppress — but the spurious first false has already been
+      // observed by listeners). After this fix, the first `.finally`
+      // is a no-op due to generation mismatch and only the latest
+      // cycle's `.finally` writes back.
+      const trailingFalses = events.filter((_, i) => i >= 3);
+      expect(trailingFalses).toEqual([false]);
+      // The first three are the user-driven sequence.
+      expect(events.slice(0, 3)).toEqual([true, false, true]);
     });
   });
 
@@ -2177,6 +2611,57 @@ describe("<stripe-checkout> Shell", () => {
       expect(warnings).toHaveLength(1);
       expect((warnings[0].detail as any).message).toContain("Failed to apply appearance");
       expect((warnings[0].detail as any).error).toBeInstanceOf(Error);
+    });
+
+    it("_mountElements retries with appearance: undefined when stripe.elements() throws (regression: prepare wedge on bad appearance)", async () => {
+      // Regression: setter-side validation cannot catch every shape
+      // Stripe.js will reject at `elements()` time, and a malformed
+      // appearance assigned BEFORE prepare wedged the entire prepare
+      // flow with no recovery path. The mount-time retry isolates the
+      // appearance contribution: if the second `elements(...)` call
+      // (with `appearance: undefined`) succeeds, prepare completes
+      // with default styling.
+      const warnings: CustomEvent[] = [];
+      const paymentElement: StripePaymentElementLike = {
+        mount() {}, unmount() {}, destroy() {}, on() {},
+      };
+      const elements = {
+        create() { return paymentElement; },
+        getElement() { return paymentElement; },
+      } as StripeElementsLike;
+      let callCount = 0;
+      const stripeJs: StripeJsLike = {
+        elements: (opts: { clientSecret: string; appearance?: Record<string, unknown> }) => {
+          callCount++;
+          // First call (appearance present) throws; retry path with
+          // `appearance: undefined` succeeds.
+          if (callCount === 1 && opts.appearance !== undefined) {
+            throw new Error("malformed appearance");
+          }
+          return elements;
+        },
+        async confirmPayment() { return { paymentIntent: { id: "pi_shell", status: "succeeded" } }; },
+        async confirmSetup() { return { setupIntent: { id: "seti_shell", status: "succeeded" } }; },
+      };
+      WcsStripe.setLoader(async () => stripeJs);
+
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_123" });
+      el.addEventListener("stripe-checkout:appearance-warning", (e) => warnings.push(e as CustomEvent));
+      el.attachLocalCore(core);
+      // Pre-prepare: assign appearance directly to the field (the
+      // public setter has its own try/catch around update(), which
+      // doesn't fire here since Elements isn't mounted yet).
+      el.appearance = { variables: { colorPrimary: "#bad" } };
+
+      // prepare() MUST succeed — the retry recovers.
+      await expect(el.prepare()).resolves.toBeUndefined();
+      expect(callCount).toBe(2); // initial throw + retry without appearance
+      // The retry path emits a warning so apps can see why default
+      // styling was used.
+      expect(warnings.length).toBeGreaterThanOrEqual(1);
+      const mountWarning = warnings.find(w =>
+        ((w.detail as any).message as string).includes("retrying with default appearance"));
+      expect(mountWarning).toBeDefined();
     });
   });
 

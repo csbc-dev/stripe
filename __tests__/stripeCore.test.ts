@@ -141,6 +141,52 @@ describe("StripeCore", () => {
       });
     });
 
+    it("empty hint object still picks up instance-level amount/currency/customer (regression: fallback merge)", async () => {
+      // Regression: `requestIntent({ hint: {} })` used to completely
+      // drop every instance-level input set via `core.amountValue =
+      // ...`, because the merge logic was object-replacement
+      // ("hint present → use hint, hint absent → use instance"). API
+      // users who set inputs directly on the Core surface and then
+      // called `requestIntent` with a Shell-style `hint: {}` argument
+      // observed silently-dropped configuration. The fix is a
+      // per-field merge so each missing hint key falls back to the
+      // matching instance default.
+      const builderInvocations: Array<{ amountValue?: number; amountCurrency?: string; customerId?: string }> = [];
+      core.registerIntentBuilder((request) => {
+        builderInvocations.push({
+          amountValue: request.hint.amountValue,
+          amountCurrency: request.hint.amountCurrency,
+          customerId: request.hint.customerId,
+        });
+        return { mode: "payment", amount: 1000, currency: "usd" };
+      });
+
+      // Set instance-level inputs.
+      core.amountValue = 12345;
+      core.amountCurrency = "jpy";
+      core.customerId = "cus_instance";
+
+      // Empty hint — instance defaults MUST flow through.
+      await core.requestIntent({ mode: "payment", hint: {} });
+      expect(builderInvocations[0]).toEqual({
+        amountValue: 12345,
+        amountCurrency: "jpy",
+        customerId: "cus_instance",
+      });
+
+      // Per-field merge: hint overrides one field, instance defaults
+      // supply the rest.
+      await core.requestIntent({
+        mode: "payment",
+        hint: { customerId: "cus_override" },
+      });
+      expect(builderInvocations[1]).toEqual({
+        amountValue: 12345,
+        amountCurrency: "jpy",
+        customerId: "cus_override",
+      });
+    });
+
     it("clears stale payment amount when switching to setup mode on the same Core", async () => {
       // First request: payment mode — amount lands on observable state.
       core.registerIntentBuilder(() => ({ mode: "payment", amount: 1980, currency: "jpy" }));
@@ -605,6 +651,127 @@ describe("StripeCore", () => {
       // the terminal idle state on successful retry.
       expect(core.error).toBeNull();
     });
+
+    it("input-validation rejection messages are bounded against megabyte payloads (DoS-resistant diagnostic)", async () => {
+      // Regression: `requestIntent` / `resumeIntent` / `cancelIntent`
+      // raise messages used to embed `JSON.stringify(badPayload)`
+      // verbatim. A wire-untrusted client could ship a megabyte-sized
+      // object in `request.hint` and produce a megabyte-sized error
+      // string that flooded the WebSocket frame echoing the throw, log
+      // sinks, and any UI subscriber. The shared
+      // `summarizeUntrustedValue` helper collapses every non-primitive
+      // to `"[object]"` and trims strings to 32 chars + ellipsis.
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      // Bypass the TS signature with an `as any` cast — exactly the
+      // shape RemoteCoreProxy would forward verbatim from a tampered
+      // browser.
+      const huge = { evil: "X".repeat(1_000_000) };
+      try {
+        await core.requestIntent({ mode: huge as any, hint: {} });
+        throw new Error("expected requestIntent to reject");
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        // Diagnostic must mention the failure but NOT inline the huge
+        // payload — the `[object]` summary is intentionally shapeless.
+        expect(msg).toMatch(/mode must be/);
+        expect(msg).toMatch(/\[object\]/);
+        // Bound the message under a comfortable cap — far below the
+        // megabyte input size.
+        expect(msg.length).toBeLessThan(256);
+      }
+      // String inputs are clipped to 32 chars + "...".
+      try {
+        await core.requestIntent({ mode: "Z".repeat(10_000) as any, hint: {} });
+        throw new Error("expected requestIntent to reject");
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        expect(msg).toMatch(/mode must be/);
+        // The summary should contain a 32-char prefix + ellipsis, NOT the
+        // full 10k-char string.
+        expect(msg.length).toBeLessThan(256);
+        expect(msg).toContain("...");
+      }
+    });
+
+    it("_setError takes a defensive copy on storage and dispatch (regression: caller mutation poison)", async () => {
+      // Regression: `_setError` previously stored the caller-supplied
+      // `err` reference verbatim. A caller that retained the original
+      // reference (sanitized object from `_sanitizeError`, or a custom
+      // provider's struct) and mutated it AFTER `_setError(err)` could
+      // retroactively change observable state — and worse, the dedup
+      // baseline used by the next `_setError` call. The fix copies on
+      // the way in and out, symmetric with `_setAmount` /
+      // `_setPaymentMethod`. Pin both ends here.
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await core.requestIntent({ mode: "payment", hint: {} });
+      // Trigger an error fold via webhook so `_setError` lands.
+      provider.webhookEvent = {
+        id: "evt_pin",
+        type: "payment_intent.payment_failed",
+        data: {
+          object: {
+            id: "pi_123",
+            // Include `type: "card_error"` so the Core's `_sanitizeError`
+            // allowlist forwards `message` verbatim rather than collapsing
+            // to "Payment failed." — see SPEC §9.3.
+            last_payment_error: { code: "card_declined", message: "Declined.", type: "card_error" },
+          },
+        },
+        created: 0,
+      };
+      await core.handleWebhook("{}", "sig");
+      const errSnapshot = core.error;
+      expect(errSnapshot?.message).toBe("Declined.");
+      // Mutate the GETTER's return value. Without the defensive
+      // read-side copy, this would poison `_error.message` directly.
+      (errSnapshot as any).message = "POISONED";
+      // Read again — the stored slot must still report the original.
+      expect(core.error?.message).toBe("Declined.");
+    });
+
+    it("cancel error during a supersede does NOT taint the newer session's state", async () => {
+      // Regression for the supersede-during-cancel-failure race
+      // ([src/core/StripeCore.ts:1087-1090]): `cancelIntent` rejects after a
+      // newer `requestIntent` has bumped `_generation` and rebuilt
+      // `_activeIntent`. The cancel's catch must NOT call `_setError` on
+      // the new session — the user-visible truth is the active new
+      // session, not the dead pi_OLD's cancel failure.
+      await core.requestIntent({ mode: "payment", hint: {} }); // pi_123 active
+      let releaseCancel!: (e: Error) => void;
+      provider.cancelPaymentIntent = (id: string) => {
+        provider.cancelCalls.push(id);
+        return new Promise<void>((_resolve, reject) => {
+          releaseCancel = (err: Error) => reject(err);
+        });
+      };
+
+      // Kick off cancel for pi_123 — it parks.
+      const cancelPromise = core.cancelIntent("pi_123");
+      // Start a replacement session BEFORE the cancel fails.
+      provider.nextPaymentIntentId = "pi_NEW";
+      // Restore the default no-throw cancel implementation for any future
+      // supersede cleanup (Core's superseded-mid-flight code path may
+      // call cancelPaymentIntent again on the orphan).
+      provider.cancelPaymentIntent = async (id: string) => { provider.cancelCalls.push(id); };
+      await core.requestIntent({ mode: "payment", hint: {} });
+      expect(core.intentId).toBe("pi_NEW");
+      expect(core.error).toBeNull();
+
+      // Let the stalled cancel REJECT.
+      const cancelErr = Object.assign(new Error("Connection to api.stripe.com lost."), {
+        type: "StripeConnectionError",
+      });
+      releaseCancel(cancelErr);
+      // The cancel call itself still rejects (and the rejection is
+      // sanitized to a wire-safe shape).
+      await expect(cancelPromise).rejects.toThrow();
+
+      // Critical assertion: the new session's state is NOT clobbered by
+      // the failed cancel's error path.
+      expect(core.intentId).toBe("pi_NEW");
+      expect(core.status).toBe("collecting");
+      expect(core.error).toBeNull();
+    });
   });
 
   describe("handleWebhook", () => {
@@ -615,6 +782,21 @@ describe("StripeCore", () => {
     it("requires webhookSecret to be configured", async () => {
       const c = new StripeCore(provider);
       await expect(c.handleWebhook("{}", "sig")).rejects.toThrow(/webhookSecret/);
+    });
+
+    it("constructor rejects empty-string webhookSecret loudly (regression: misleading diagnostic)", () => {
+      // Regression: `webhookSecret: ""` used to be silently stored as
+      // `_webhookSecret = ""`, then `handleWebhook` would surface a
+      // misleading "constructed without webhookSecret" diagnostic even
+      // though the constructor DID receive a value (just an empty
+      // string). Reject loudly at construction so the diagnostic points
+      // at the misconfiguration's source. Also covers the `0 as any` /
+      // non-string-typed false-y leakage from JS callers.
+      expect(() => new StripeCore(provider, { webhookSecret: "" })).toThrow(/non-empty/);
+      expect(() => new StripeCore(provider, { webhookSecret: 0 as any })).toThrow(/must be a string/);
+      expect(() => new StripeCore(provider, { webhookSecret: null as any })).toThrow(/must be a string/);
+      // Omitting the option entirely remains valid.
+      expect(() => new StripeCore(provider)).not.toThrow();
     });
 
     it("propagates signature verification errors", async () => {
@@ -677,6 +859,76 @@ describe("StripeCore", () => {
       provider.webhookEvent = {
         id: "evt_1",
         type: "payment_intent.succeeded",
+        data: { object: { id: "pi_123" } },
+        created: 0,
+      };
+      await core.handleWebhook("{}", "sig");
+      expect(core.status).toBe("succeeded");
+    });
+
+    it("late requires_action / payment_failed / processing does NOT demote a succeeded session (regression: terminal-state guard)", async () => {
+      // Regression: webhook ordering / serialization per-intent is the
+      // app's responsibility per SPEC §6.2, but parallel HTTP route
+      // workers and Stripe's at-least-once delivery can cause
+      // out-of-order arrival. Once observable status reaches
+      // "succeeded", a delayed `requires_action` / `payment_failed` /
+      // `processing` / `canceled` for the SAME intent would otherwise
+      // silently demote the surface — flipping a confirmed payment
+      // back to a non-terminal state and (worse) re-showing 3DS
+      // challenges or "card declined" messages on a successful flow.
+      // The fix locks succeeded as terminal-authoritative against
+      // these four event types in `_foldWebhookIntoState`.
+      await core.requestIntent({ mode: "payment", hint: {} });
+      // Land succeeded first.
+      provider.webhookEvent = {
+        id: "evt_terminal_1",
+        type: "payment_intent.succeeded",
+        data: { object: { id: "pi_123" } },
+        created: 0,
+      };
+      await core.handleWebhook("{}", "sig");
+      expect(core.status).toBe("succeeded");
+
+      // Now deliver an OUT-OF-ORDER `requires_action` for the same
+      // intent. The fold MUST refuse to demote.
+      provider.webhookEvent = {
+        id: "evt_terminal_2",
+        type: "payment_intent.requires_action",
+        data: { object: { id: "pi_123" } },
+        created: 0,
+      };
+      await core.handleWebhook("{}", "sig");
+      expect(core.status).toBe("succeeded");
+
+      // Same for `payment_failed`.
+      provider.webhookEvent = {
+        id: "evt_terminal_3",
+        type: "payment_intent.payment_failed",
+        data: { object: { id: "pi_123", last_payment_error: { code: "card_declined", message: "Declined.", type: "card_error" } } },
+        created: 0,
+      };
+      await core.handleWebhook("{}", "sig");
+      expect(core.status).toBe("succeeded");
+      // The succeeded branch cleared error to null; the demotion-
+      // guarded payment_failed must NOT have stamped a "declined"
+      // error onto observable state.
+      expect(core.error).toBeNull();
+
+      // Same for `processing`.
+      provider.webhookEvent = {
+        id: "evt_terminal_4",
+        type: "payment_intent.processing",
+        data: { object: { id: "pi_123" } },
+        created: 0,
+      };
+      await core.handleWebhook("{}", "sig");
+      expect(core.status).toBe("succeeded");
+      expect(core.loading).toBe(false);
+
+      // Same for `canceled`.
+      provider.webhookEvent = {
+        id: "evt_terminal_5",
+        type: "payment_intent.canceled",
         data: { object: { id: "pi_123" } },
         created: 0,
       };
@@ -854,6 +1106,36 @@ describe("StripeCore", () => {
       };
       await core.handleWebhook("{}", "sig");
       expect(order).toEqual(["a", "b"]);
+    });
+
+    it("handler that unregisters itself mid-dispatch does NOT skip the next handler (regression: iteration snapshot)", async () => {
+      // Regression: handlers were dispatched via `for-of` over the live
+      // backing array. A handler that called its own returned
+      // `unregister()` splice'd the entry out, shifting every
+      // subsequent entry down by one index — the iterator then
+      // advanced past the next entry, skipping it. The fix snapshots
+      // the array with `[...rawHandlers]` before iteration so
+      // registration mutations apply only to the NEXT event.
+      const order: string[] = [];
+      let unregisterA!: () => void;
+      unregisterA = core.registerWebhookHandler("payment_intent.succeeded", () => {
+        order.push("a");
+        unregisterA();
+      });
+      core.registerWebhookHandler("payment_intent.succeeded", () => { order.push("b"); });
+      core.registerWebhookHandler("payment_intent.succeeded", () => { order.push("c"); });
+      provider.webhookEvent = {
+        id: "evt_unreg_mid",
+        type: "payment_intent.succeeded",
+        data: { object: { id: "pi_xx" } },
+        created: 0,
+      };
+      await core.handleWebhook("{}", "sig");
+      // All three must run on THIS event. Without the snapshot,
+      // unregistering "a" would shift "b" down to the index "a"
+      // occupied, the iterator would skip past it, and only ["a",
+      // "c"] would fire.
+      expect(order).toEqual(["a", "b", "c"]);
     });
 
     it("fatal handler aborts the chain", async () => {
@@ -1207,6 +1489,64 @@ describe("StripeCore", () => {
       await expect(core.handleWebhook("{}", "sig")).rejects.toThrow(/disposed/);
     });
 
+    it("dispose during _foldWebhookIntoState's retrieve await drops the fold (regression: post-dispose dispatch race)", async () => {
+      // Regression for the webhook-fold dispose race
+      // ([src/core/StripeCore.ts:_foldWebhookIntoState]):
+      // `handleWebhook` calls `_foldWebhookIntoState` which awaits
+      // `provider.retrieveIntent`. If `dispose()` fires DURING that
+      // await — e.g. a sibling handler in the same chain disposed
+      // the Core — the post-await dispatch path would try to call
+      // `_setStatus` / `_setPaymentMethod` on the now-released
+      // target AND reach into a nulled `_provider`. The fix re-checks
+      // `this._disposed` after the await and bails.
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await core.requestIntent({ mode: "payment", hint: {} });
+
+      // Park provider.retrieveIntent.
+      let releaseRetrieve!: (v: StripeIntentView) => void;
+      provider.retrieveIntent = () => new Promise<StripeIntentView>((resolve) => {
+        releaseRetrieve = resolve;
+      });
+
+      // Webhook event that triggers the succeeded-branch retrieve
+      // fallback (paymentMethod absent, so the fold calls retrieve).
+      provider.webhookEvent = {
+        id: "evt_dispose_race",
+        type: "payment_intent.succeeded",
+        created: 1,
+        data: { object: { id: "pi_123", status: "succeeded" } },
+      };
+
+      const handlePromise = core.handleWebhook("raw", "sig");
+      // Let the synchronous prefix run until the fold's await blocks.
+      await new Promise(r => setTimeout(r, 0));
+
+      // Dispose mid-flight.
+      core.dispose();
+
+      // Resolve the retrieve. Without the dispose guard, the fold's
+      // continuation would call `_setPaymentMethod(view.paymentMethod)`
+      // on the released target. With the guard it short-circuits.
+      releaseRetrieve({
+        id: "pi_123",
+        status: "succeeded",
+        mode: "payment",
+        paymentMethod: { id: "pm_late", brand: "visa", last4: "0001" },
+      });
+      // handleWebhook awaits the fold but its own _disposed guard at
+      // entry already ran before dispose, so the await must complete.
+      await handlePromise;
+
+      // Critical: dispose drops _activeIntent, so the late paymentMethod
+      // must NOT land on observable state. Reading post-dispose `error` /
+      // `paymentMethod` / `status` goes through the standard getters
+      // which still read the slot — the slot itself must remain null /
+      // unaffected by the late retrieve.
+      // (Direct slot probe — public getters keep returning the
+      // disposed-state values.)
+      expect(core.paymentMethod).toBeNull();
+    });
+
     it("supersedes in-flight reportConfirmation via the _generation bump", async () => {
       // Start a reportConfirmation with `outcome: "processing"` that parks
       // on the provider's retrieveIntent await, then dispose mid-flight.
@@ -1377,6 +1717,52 @@ describe("StripeCore", () => {
   });
 
   describe("resumeIntent (regression: finding #1 + clientSecret authorization)", () => {
+    it("status flips to processing during the retrieve await (regression: stale terminal status observable window)", async () => {
+      // Regression: `resumeIntent` previously called `_setLoading(true)`
+      // without touching status. A session that was previously
+      // `succeeded` / `failed` / `collecting` would show the stale
+      // terminal status with `loading=true` on top during the
+      // provider's retrieve await — UIs rendering `${status}` /
+      // `${loading}` simultaneously displayed a confused half-state.
+      // The fix establishes the same `_setStatus("processing")` +
+      // `_setLoading(true)` ordering `requestIntent` uses.
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      // Seed a prior terminal status by running a full request+confirm.
+      await core.requestIntent({ mode: "payment", hint: {} });
+      await core.reportConfirmation({
+        intentId: "pi_123",
+        outcome: "failed",
+        error: { message: "Declined.", type: "card_error" },
+      });
+      expect(core.status).toBe("failed");
+
+      // Park the retrieve so we can probe status during the await.
+      let releaseRetrieve!: (v: StripeIntentView) => void;
+      provider.retrieveIntent = () => new Promise<StripeIntentView>((resolve) => {
+        releaseRetrieve = resolve;
+      });
+
+      const resumePromise = core.resumeIntent(
+        "pi_resume_status",
+        "payment",
+        "pi_resume_status_secret_zz",
+      );
+      // Synchronous prefix has run: status MUST be "processing", NOT
+      // the stale "failed" from the prior session.
+      expect(core.status).toBe("processing");
+      expect(core.loading).toBe(true);
+
+      // Resolve and complete.
+      releaseRetrieve({
+        id: "pi_resume_status",
+        status: "succeeded",
+        mode: "payment",
+        clientSecret: "pi_resume_status_secret_zz",
+      });
+      await resumePromise;
+      expect(core.status).toBe("succeeded");
+    });
+
     it("rebuilds _activeIntent when clientSecret matches the retrieved intent", async () => {
       provider.retrieveResult = {
         id: "pi_resume_1",

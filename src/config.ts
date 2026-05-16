@@ -192,6 +192,73 @@ function validatePartialConfig(partialConfig: IWritableConfig): void {
     if ("remoteCoreUrl" in r && r.remoteCoreUrl !== undefined && typeof r.remoteCoreUrl !== "string") {
       raiseError("config.remote.remoteCoreUrl must be a string.");
     }
+    // Transport-security validation. The wire between Shell and Core
+    // carries the Stripe-issued `clientSecret` (returned from
+    // `requestIntent` RPC), which is a bearer credential for the
+    // PaymentIntent (Stripe.js's own `confirmPayment` is authorized
+    // solely by knowing it). A non-TLS WebSocket frame on the public
+    // internet is a MITM target — anyone on the wire can read the
+    // clientSecret and complete the payment from a different browser.
+    //
+    // Reject `ws://` for non-loopback hosts and outside development.
+    // The escape hatches are deliberately narrow:
+    //
+    //   - loopback hosts (`localhost`, `127.0.0.1`, `[::1]`) for the
+    //     ergonomic local-dev case where there is no usable TLS cert,
+    //   - `process.env.NODE_ENV === "test"` so test harnesses keep
+    //     working without ws/wss toggle plumbing.
+    //
+    // For anything else (`ws://api.example.com/...`), fail-loud at
+    // setConfig time so the misconfiguration cannot ship to prod.
+    // Apps that genuinely need non-TLS in their test/dev tier set
+    // NODE_ENV; apps that need it elsewhere have a wire-level threat
+    // they should solve at the deployment layer (TLS-terminating proxy)
+    // rather than by hiding the warning here.
+    if ("remoteCoreUrl" in r && typeof r.remoteCoreUrl === "string" && r.remoteCoreUrl !== "") {
+      const url = r.remoteCoreUrl;
+      if (url.startsWith("ws://")) {
+        let host: string | null = null;
+        try {
+          host = new URL(url).hostname;
+        } catch {
+          // `host = null` flags "unparseable" so the security gate below
+          // can reject it explicitly. The earlier shape returned `host =
+          // ""` and short-circuited the `if (host && ...)` check, which
+          // silently waved through a `ws://[malformed]` string — exactly
+          // the kind of input this validator is supposed to be the
+          // first / loudest defense against.
+        }
+        const g = globalThis as unknown as EnvGlobals;
+        const isTestEnv = g.process?.env?.NODE_ENV === "test";
+        if (host === null) {
+          // Unparseable ws:// URL. The WebSocket constructor would also
+          // throw later, but the rejection message there is opaque to
+          // the operator (it surfaces deep inside `_initRemote`'s
+          // network-error path, not at the misconfiguration's source).
+          // Failing here keeps the diagnostic anchored to the call site
+          // that introduced the bad value. NODE_ENV=test still escapes
+          // — happy-dom's `new WebSocket("ws://broken-but-stored/")`
+          // test depends on this surface accepting structurally-invalid
+          // strings for the synchronous-constructor-throw exercise.
+          if (!isTestEnv) {
+            raiseError(
+              `config.remote.remoteCoreUrl is not a parseable URL: ${JSON.stringify(url.slice(0, 64))}. `
+              + "Use a valid ws://localhost:... (loopback dev) or wss://... (TLS) URL.",
+            );
+          }
+        } else {
+          const isLoopback = host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host === "::1";
+          if (!isLoopback && !isTestEnv) {
+            raiseError(
+              "config.remote.remoteCoreUrl uses ws:// against a non-loopback host. "
+              + "The Stripe clientSecret crosses this wire and must not be plaintext over the public internet — "
+              + "use wss:// (TLS), or terminate TLS at a proxy in front of the Core. "
+              + "(Loopback hosts and NODE_ENV=test are exempt for local development.)",
+            );
+          }
+        }
+      }
+    }
   }
 }
 

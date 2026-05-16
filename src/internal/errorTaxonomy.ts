@@ -64,3 +64,51 @@ export const STRIPE_KNOWN_TYPES: ReadonlySet<string> = new Set([
  * from this package's own internal errors.
  */
 export const MAX_ERROR_MESSAGE_LENGTH: number = 512;
+
+/**
+ * Bounded, shape-preserving summary of an arbitrary wire-untrusted value
+ * for inclusion in `raiseError` / log diagnostic messages.
+ *
+ * Used at every Core input-validation site (`requestIntent`,
+ * `resumeIntent`, `reportConfirmation`, …) that needs to mention the
+ * offending value in its rejection. A naive `JSON.stringify(value)` on a
+ * megabyte-sized tampered payload would otherwise produce a
+ * megabyte-sized error message that floods the WebSocket frame echoing
+ * the throw and any log sink. `set mode` already uses this exact shape
+ * for the same reason; extracting it here keeps every command's
+ * diagnostic under the same DoS-resistant bound.
+ *
+ * Output bounds:
+ *   - `typeof` `"object"`  → `"null"` / `"[object]"` (no JSON expansion).
+ *   - `typeof` `"string"`  → quoted, truncated to 32 chars + ellipsis.
+ *   - everything else      → `String(value)` (typeof "number" / "boolean"
+ *                            / "undefined" / "function" / "symbol" /
+ *                            "bigint" all produce short literal strings).
+ *
+ * The output is purely diagnostic — never used in security decisions.
+ */
+export function summarizeUntrustedValue(value: unknown): string {
+  if (typeof value === "object") {
+    return value === null ? "null" : "[object]";
+  }
+  if (typeof value === "string") {
+    // Two-stage cap. The first slice trims the raw char count to a
+    // reasonable preview window; the second cap is applied AFTER
+    // `JSON.stringify` because escaping can multiply the output size
+    // by ~6× — every emoji / supplementary-plane code point
+    // serializes as a 12-character `"\uHHHH\uHHHH"` surrogate-pair
+    // escape, and a 32-char emoji string can balloon to almost 200
+    // characters of JSON. The post-stringify cap (64) keeps the
+    // rendered diagnostic bounded regardless of the input's escape
+    // expansion. Truncated output ends with the same `..."` shape
+    // as the pre-stringify path so the abbreviation is visible.
+    const POST_JSON_CAP = 64;
+    const clipped = value.length > 32 ? value.slice(0, 32) + "..." : value;
+    const json = JSON.stringify(clipped);
+    if (json.length <= POST_JSON_CAP) return json;
+    // Reserve 4 chars for `..."` terminator so the final string is a
+    // syntactically-recognizable truncated quoted-string.
+    return json.slice(0, POST_JSON_CAP - 4) + '..."';
+  }
+  return String(value);
+}
