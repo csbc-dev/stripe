@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>@csbc-dev/stripe · Vanilla</title>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>@csbc-dev/stripe × Vanilla</h1>
+        <p>
+          <code>&lt;stripe-checkout&gt;</code> bound with <code>@wc-bindable/core</code>'s
+          <code>bind()</code> · <span class="mode-tag" id="mode-tag">mock</span> mode
+        </p>
+      </header>
+
+      <div class="row" id="mode-row">
+        <label><input type="radio" name="mode" value="payment" checked /> payment</label>
+        <label><input type="radio" name="mode" value="setup" /> setup</label>
+      </div>
+
+      <!-- publishable-key and return-url are set from JS (env-derived) in main.ts. -->
+      <stripe-checkout id="checkout" mode="payment" amount-value="1980" amount-currency="jpy"></stripe-checkout>
+
+      <dl class="state">
+        <div><dt>status</dt><dd><span class="badge" id="status">idle</span></dd></div>
+        <div><dt>loading</dt><dd id="loading">false</dd></div>
+        <div><dt>amount (server total)</dt><dd id="amount">—</dd></div>
+        <div><dt>paymentMethod</dt><dd id="pm">—</dd></div>
+        <div><dt>intentId</dt><dd><code id="intentId">—</code></dd></div>
+      </dl>
+
+      <p class="error" id="error" hidden></p>
+
+      <div class="row">
+        <button id="pay" disabled>Pay</button>
+        <button id="reset" class="ghost">Reset</button>
+      </div>
+
+      <p class="hint">
+        The <strong>amount</strong> shown comes from the server's IntentBuilder, not the
+        <code>amount-value</code> attribute — the Core owns the decision.
+      </p>
+    </main>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

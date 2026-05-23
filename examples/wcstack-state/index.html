@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>@csbc-dev/stripe · @wcstack/state</title>
+    <link rel="stylesheet" href="/style.css" />
+
+    <!-- Resolve bare specifiers for the buildless runtime. @csbc-dev/stripe and
+         its @wc-bindable deps are served from the local repo build (/vendor/*);
+         @wcstack/state comes from the CDN. -->
+    <script type="importmap">
+      {
+        "imports": {
+          "@csbc-dev/stripe": "/vendor/csbc/index.js",
+          "@wc-bindable/core": "/vendor/wcb-core/index.js",
+          "@wc-bindable/remote": "/vendor/wcb-remote/index.js",
+          "@stripe/stripe-js": "https://esm.run/@stripe/stripe-js@5"
+        }
+      }
+    </script>
+
+    <!-- 1. Configure Stripe + register <stripe-checkout> (defines the element
+            before @wcstack/state scans data-wcs). -->
+    <script type="module" src="/setup.js"></script>
+    <!-- 2. @wcstack/state auto-runtime: processes <wcs-state> + data-wcs.
+            Pinned to a major version so a future breaking release can't silently
+            break this buildless example (same pinning policy as the README). -->
+    <script type="module" src="https://esm.run/@wcstack/state@1/auto"></script>
+  </head>
+
+  <body>
+    <!-- Reactive store. Outputs are synced FROM <stripe-checkout>; inputs are
+         pushed TO it. -->
+    <wcs-state>
+      <script type="module">
+        export default {
+          // inputs pushed to <stripe-checkout> (amount-value is only a HINT).
+          mode: "payment",
+          amountValue: 1980,
+          amountCurrency: "jpy",
+
+          // outputs synced from <stripe-checkout>.
+          status: "idle",
+          loading: false,
+          amount: null,
+          paymentMethod: null,
+          intentId: null,
+          error: null,
+
+          get isCollecting() { return this.status === "collecting"; },
+          get isProcessing() { return this.status === "processing"; },
+          get isRequiresAction() { return this.status === "requires_action"; },
+          get isSucceeded() { return this.status === "succeeded"; },
+          get isFailed() { return this.status === "failed"; },
+          get canPay() { return this.status === "collecting" && !this.loading; },
+          get payLabel() { return this.mode === "setup" ? "Save card" : "Pay"; },
+
+          get amountLabel() {
+            const a = this.amount;
+            if (!a) return "—";
+            const zeroDecimal = String(a.currency).toLowerCase() === "jpy";
+            try {
+              return new Intl.NumberFormat(undefined, { style: "currency", currency: a.currency })
+                .format(zeroDecimal ? a.value : a.value / 100);
+            } catch {
+              return a.value + " " + a.currency;
+            }
+          },
+          get pmLabel() {
+            return this.paymentMethod
+              ? this.paymentMethod.brand + " •• " + this.paymentMethod.last4
+              : "—";
+          },
+          get intentLabel() { return this.intentId || "—"; },
+          get errorMessage() {
+            if (!this.error) return "";
+            return this.error.message + (this.error.code ? " (" + this.error.code + ")" : "");
+          },
+
+          // commands are plain methods — call the element imperatively.
+          pay() {
+            if (this.canPay) document.querySelector("stripe-checkout").submit();
+          },
+          resetCheckout() {
+            document.querySelector("stripe-checkout").reset();
+          },
+          setMode(e) {
+            // Switching mode needs a clean slate; the element re-prepares.
+            document.querySelector("stripe-checkout").reset();
+            this.mode = e.target.value;
+          },
+        };
+      </script>
+    </wcs-state>
+
+    <main>
+      <header>
+        <h1>@csbc-dev/stripe × @wcstack/state</h1>
+        <p>
+          <code>&lt;stripe-checkout&gt;</code> bound declaratively with
+          <code>data-wcs</code> · <span class="mode-tag">mock</span> mode
+        </p>
+      </header>
+
+      <div class="row">
+        <label>mode</label>
+        <select data-wcs="onchange: setMode">
+          <option value="payment">payment</option>
+          <option value="setup">setup</option>
+        </select>
+      </div>
+
+      <!-- Inputs (mode/amountValue/amountCurrency) flow store -> element;
+           outputs (status/loading/amount/paymentMethod/intentId/error) flow
+           element -> store. publishable-key/return-url are set in setup.js.
+
+           NOTE: the static mode/amount-value/amount-currency attributes look
+           redundant with the data-wcs input bindings below (both carry the same
+           initial values), but they are KEPT ON PURPOSE. setup.js sets
+           `publishable-key` last, which triggers the element's auto-prepare as
+           soon as it connects — that can happen before @wcstack/state's first
+           store->element push lands. The static attributes seed the element's
+           initial config so auto-prepare sees the right amount/mode/currency
+           (not null) and never emits a stale-config warning. After connect, the
+           data-wcs bindings take over and keep them in sync with the store. -->
+      <stripe-checkout
+        id="checkout"
+        mode="payment"
+        amount-value="1980"
+        amount-currency="jpy"
+        data-wcs="
+          mode: mode;
+          amountValue: amountValue;
+          amountCurrency: amountCurrency;
+          status: status;
+          loading: loading;
+          amount: amount;
+          paymentMethod: paymentMethod;
+          intentId: intentId;
+          error: error
+        "
+      ></stripe-checkout>
+
+      <dl class="state">
+        <div>
+          <dt>status</dt>
+          <dd>
+            <span
+              class="badge"
+              data-wcs="
+                textContent: status;
+                class.collecting: isCollecting;
+                class.processing: isProcessing;
+                class.requires_action: isRequiresAction;
+                class.succeeded: isSucceeded;
+                class.failed: isFailed
+              "
+            ></span>
+          </dd>
+        </div>
+        <div><dt>loading</dt><dd data-wcs="textContent: loading"></dd></div>
+        <div><dt>amount (server total)</dt><dd data-wcs="textContent: amountLabel"></dd></div>
+        <div><dt>paymentMethod</dt><dd data-wcs="textContent: pmLabel"></dd></div>
+        <div><dt>intentId</dt><dd><code data-wcs="textContent: intentLabel"></code></dd></div>
+      </dl>
+
+      <template data-wcs="if: error">
+        <p class="error" data-wcs="textContent: errorMessage"></p>
+      </template>
+
+      <div class="row">
+        <button data-wcs="onclick: pay; disabled: canPay|not; textContent: payLabel"></button>
+        <button class="ghost" data-wcs="onclick: resetCheckout">Reset</button>
+      </div>
+
+      <p class="hint">
+        The <strong>amount</strong> shown comes from the server's IntentBuilder, not the
+        <code>amount-value</code> attribute — the Core owns the decision.
+      </p>
+    </main>
+  </body>
+</html>

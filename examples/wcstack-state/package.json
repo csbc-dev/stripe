@@ -1,0 +1,11 @@
+{
+  "name": "csbc-stripe-example-wcstack-state",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Buildless @wcstack/state example. Static server + import map; no bundler.",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js"
+  }
+}
