@@ -1,6 +1,6 @@
 {
   "name": "@csbc-dev/stripe",
-  "version": "0.4.0",
+  "version": "0.1.0",
   "description": "Declarative Stripe payments component for Web Components. Server-side intent creation, browser-direct card entry via Stripe Elements, no PCI scope expansion, via wc-bindable-protocol.",
   "type": "module",
   "sideEffects": false,
@@ -75,8 +75,7 @@
   "author": "mogera551",
   "repository": {
     "type": "git",
-    "url": "https://github.com/wc-bindable-protocol/wc-bindable-protocol.git",
-    "directory": "packages/stripe"
+    "url": "https://github.com/csbc-dev/stripe.git"
   },
   "license": "MIT"
 }

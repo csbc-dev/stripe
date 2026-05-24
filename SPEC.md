@@ -641,7 +641,7 @@ packages/stripe/
     config.ts
     types.ts
     index.ts                    (browser barrel)
-  src/server/index.ts           (server barrel, no HTMLElement)
+  src/server.ts                 (server barrel, no HTMLElement)
   src/auto/                     (auto-register)
   __tests__/                    (vitest)
   tests/                        (playwright e2e, Elements mount 検証)
