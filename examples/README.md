@@ -7,12 +7,13 @@ Runnable examples that bind `<stripe-checkout>` into four front-end stacks:
 | [`react/`](./react) | React 19 + Vite | [`@wc-bindable/react`](https://www.npmjs.com/package/@wc-bindable/react) — `useWcBindable()` hook |
 | [`vue/`](./vue) | Vue 3 + Vite | [`@wc-bindable/vue`](https://www.npmjs.com/package/@wc-bindable/vue) — `useWcBindable()` composable |
 | [`vanilla/`](./vanilla) | Plain TS + Vite | [`@wc-bindable/core`](https://www.npmjs.com/package/@wc-bindable/core) — `bind()` (the ~20-line primitive every adapter is built on) |
-| [`wcstack-state/`](./wcstack-state) | [`@wcstack/state`](https://www.npmjs.com/package/@wcstack/state) + Vite | `data-wcs` declarative attribute binding |
+| [`wcstack-state/`](./wcstack-state) | [`@wcstack/state`](https://www.npmjs.com/package/@wcstack/state), buildless single file | `data-wcs` declarative attribute binding |
 
-All four talk to **one** [`server/`](./server) — a Node process that hosts the server-side `StripeCore` and bridges it to each browser `<stripe-checkout>` over a WebSocket (`@wc-bindable/remote`). This is the **CSBC Case C** shape: every payment decision lives in the Core on the server; the browser Shell only runs the Stripe Elements data plane that cannot leave the browser.
+All four talk to **one** [`server/`](./server) — a Node process that hosts the server-side `StripeCore` and bridges it to each browser `<stripe-checkout>` over a WebSocket (`@wc-bindable/remote`) — and are **served** by **one** [`delivery/`](./delivery) static server (the built clients + the buildless `wcstack-state`). This is the **CSBC Case C** shape: every payment decision lives in the Core on the server; the browser Shell only runs the Stripe Elements data plane that cannot leave the browser. The two-server split (Core host + static delivery) is documented in [`CONVENTIONS.md`](./CONVENTIONS.md).
 
 ```
-┌──────────────────────────────┐         ws://localhost:8787/stripe        ┌────────────────────────────┐
+   served by delivery/ (static)            ws://localhost:8787/stripe
+┌──────────────────────────────┐                                            ┌────────────────────────────┐
 │  Browser (any of the 4 apps) │  ◄──────────────────────────────────────► │  server/  (Node)           │
 │                              │      @wc-bindable/remote wire protocol      │                            │
 │  <stripe-checkout>  (Shell)  │                                            │  RemoteShellProxy          │
@@ -35,6 +36,11 @@ See each example's `.env.example`.
 
 ## Run it
 
+The canonical run is **build the clients, then serve them statically** through
+the shared `delivery/` server (per [`CONVENTIONS.md`](./CONVENTIONS.md) §4). The
+per-example `npm run dev` (Vite hot-reload) is an authoring convenience, not the
+documented path — see [Dev mode](#dev-mode-hot-reload) below.
+
 ### 1. Build the package once (from the repo root)
 
 The examples consume `@csbc-dev/stripe` via a local `file:../..` dependency, which resolves to the built `dist/`:
@@ -47,7 +53,7 @@ npm run build
 
 > Re-run `npm run build` (or `npm run dev` for watch mode) whenever you change the package source.
 
-### 2. Start the shared server
+### 2. Start the shared Core server
 
 ```bash
 cd examples/server
@@ -57,24 +63,35 @@ npm run dev          # ws://localhost:8787/stripe   ·   http://localhost:8787/w
 
 By default it logs `MOCK mode`. To run against real Stripe test keys, copy `.env.example` to `.env` and fill in `STRIPE_SECRET_KEY` first.
 
-### 3. Start any front-end (in a second terminal)
+### 3. Build the front-ends and serve them (in a second terminal)
 
 ```bash
-cd examples/react      # or vue / vanilla / wcstack-state
-npm install
-npm run dev            # open the printed URL (each app uses its own port — see below)
+# build each client you want to run (their dist/ is what delivery serves)
+cd examples/react && npm install && npm run build      # or vue / vanilla
+# wcstack-state is buildless — nothing to build
+
+# then start the one static delivery server (serves all four)
+cd ../delivery && npm start
 ```
 
-Each front-end runs on a fixed port so you can run several side by side:
+Each front-end is served on a fixed port so you can use several side by side:
 
-| Example | URL |
-|---|---|
-| `react/` | http://localhost:5173 |
-| `vue/` | http://localhost:5174 |
-| `vanilla/` | http://localhost:5175 |
-| `wcstack-state/` | http://localhost:5176 |
+| Example | URL | Served from |
+|---|---|---|
+| `react/` | http://localhost:5173 | `react/dist` |
+| `vue/` | http://localhost:5174 | `vue/dist` |
+| `vanilla/` | http://localhost:5175 | `vanilla/dist` |
+| `wcstack-state/` | http://localhost:5176 | `wcstack-state/` (verbatim) |
 
 Open the app, watch `<stripe-checkout>` auto-mount its (mock or real) Payment Element, click **Pay**, and see `status`/`amount`/`paymentMethod` flow back into the framework's reactive state.
+
+### Dev mode (hot-reload)
+
+For iterating on a client's UI, `npm run dev` in `react/` / `vue/` / `vanilla/`
+starts the Vite dev server on the same fixed port (it talks to the same Core
+server over the WebSocket). This is for authoring only; the canonical run is the
+build + `delivery/` path above. `wcstack-state` is buildless — it is always
+served by `delivery/`.
 
 ## What each example demonstrates
 

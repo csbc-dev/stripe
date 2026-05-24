@@ -1,0 +1,11 @@
+{
+  "name": "csbc-stripe-example-delivery",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Dependency-free static delivery server for the @csbc-dev/stripe examples (built clients + buildless wcstack-state).",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  }
+}
