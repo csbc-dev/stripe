@@ -1,6 +1,6 @@
 {
   "name": "@csbc-dev/stripe",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Declarative Stripe payments component for Web Components. Server-side intent creation, browser-direct card entry via Stripe Elements, no PCI scope expansion, via wc-bindable-protocol.",
   "type": "module",
   "sideEffects": false,
