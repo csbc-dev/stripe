@@ -17,6 +17,7 @@ import {
   STRIPE_ERROR_CODE_RE,
   STRIPE_CLASS_NAME_RE,
   MAX_ERROR_MESSAGE_LENGTH,
+  compactStripeError,
 } from "../internal/errorTaxonomy.js";
 import { raiseError } from "../raiseError.js";
 import {
@@ -901,9 +902,11 @@ export class Stripe extends HTMLElementCtor {
     // alongside an `error` property update the Core dispatches before
     // (re-)throwing. The update carries the full sanitized `StripeError`
     // (`code`, `declineCode`, `type`, `message`) while the cmd-throw is
-    // serialized through RemoteCoreProxy's error serializer which only
-    // preserves `name`/`message`/`stack`. Overwriting with the sparse
-    // local copy would mask the richer Core-authoritative error.
+    // serialized through the remote error envelope, which preserves
+    // `name` / `message` / `stack` and — since @wc-bindable/remote 0.10 —
+    // the producer's string `code`, but never `declineCode` / `type`.
+    // Overwriting with the sparser local copy would mask the richer
+    // Core-authoritative error.
     //
     // Defer ONLY when the truthy remote error is for *this same failure*
     // — i.e. `_remoteErrorSeq` has advanced since the last local set.
@@ -944,11 +947,22 @@ export class Stripe extends HTMLElementCtor {
       // into the `stripe-checkout:error` event detail. The Core's wire
       // emissions are already taxonomy-gated; this closes the same gate
       // for the Shell's purely-local emissions.
+      //
+      // The same `code` gate is what keeps remote-layer codes out of
+      // `el.error.code`: since @wc-bindable/remote 0.10 a rejection
+      // carries the producer's `code`, and the codes the remote layer
+      // synthesizes (`WC_BINDABLE_TIMEOUT`, `WC_BINDABLE_INVALID_JSON_VALUE`,
+      // `WC_BINDABLE_REMOTE_THROW`, …) are upper-case, which the
+      // lower-case-only `STRIPE_ERROR_CODE_RE` rejects. The Core's own
+      // codes (`resume_client_secret_mismatch`, `card_declined`, …) pass.
       const rawDeclineCode = typeof rec.declineCode === "string"
         ? rec.declineCode
         : (typeof rec.decline_code === "string" ? rec.decline_code : undefined);
       const rawMessage = typeof rec.message === "string" ? rec.message : "Unknown error.";
-      this._setErrorState({
+      // `compactStripeError` omits rejected / missing fields rather than
+      // keeping them as `undefined`, so `el.error` has the same shape here
+      // as an error the Core publishes over the wire (SPEC §8.2).
+      this._setErrorState(compactStripeError({
         code: Stripe._safeToken(rec.code, Stripe._STRIPE_ERROR_CODE_RE),
         declineCode: Stripe._safeToken(rawDeclineCode, Stripe._STRIPE_ERROR_CODE_RE),
         type: Stripe._safeType(rec.type),
@@ -959,8 +973,9 @@ export class Stripe extends HTMLElementCtor {
         //
         // Deliberately NOT collapsing non-Stripe-shaped messages to
         // "Payment failed." here: this path also receives proxy-serialized
-        // Core throws (which strip `type` over the wire, leaving only
-        // `name`/`message`/`stack`) and transport-layer diagnostics
+        // Core throws (which drop `type` / `declineCode` over the wire,
+        // leaving `name` / `message` / `stack` / `code`) and
+        // transport-layer diagnostics
         // (`synthetic transport send failure`, `WebSocket connection
         // lost: <safeUrl>`). Collapsing those would hide the operator-
         // facing diagnostic and contradict pinned behavior — see
@@ -972,7 +987,7 @@ export class Stripe extends HTMLElementCtor {
         message: rawMessage.length > Stripe._MAX_ERROR_MESSAGE_LENGTH
           ? rawMessage.slice(0, Stripe._MAX_ERROR_MESSAGE_LENGTH - 1) + "…"
           : rawMessage,
-      });
+      }));
     } else {
       const raw = String(e);
       this._setErrorState({
@@ -1469,6 +1484,32 @@ export class Stripe extends HTMLElementCtor {
 
   // --- Core RPC wrappers ---
 
+  /**
+   * Build the advisory `requestIntent` hint from the current attributes.
+   *
+   * An unset input is OMITTED from the hint, never sent as `undefined`
+   * (SPEC §8.1 `hint: { amountValue?, amountCurrency?, customerId? }`).
+   * `@wc-bindable/remote` ≥ 0.10 validates `invoke` arguments as strict
+   * JsonValue and rejects the call locally — before anything is sent —
+   * when an object member is `undefined`
+   * (`WC_BINDABLE_INVALID_JSON_VALUE`). With the earlier
+   * `{ customerId: this.customerId ?? undefined, … }` shape every remote
+   * prepare() whose element omitted `customer-id` (or `amount-*`) failed
+   * that way. Omission costs nothing on the Core side: `requestIntent`
+   * falls back per field to its instance-level input for any hint field
+   * that is absent.
+   */
+  private _buildIntentHint(): IntentRequestHint {
+    const hint: IntentRequestHint = {};
+    const amountValue = this.amountValue;
+    if (amountValue !== null) hint.amountValue = amountValue;
+    const amountCurrency = this.amountCurrency;
+    if (amountCurrency !== null) hint.amountCurrency = amountCurrency;
+    const customerId = this.customerId;
+    if (customerId !== null) hint.customerId = customerId;
+    return hint;
+  }
+
   private async _requestIntent(hint: IntentRequestHint): Promise<IntentCreationResult> {
     const request = { mode: this.mode, hint };
     if (this._isRemote) {
@@ -1810,11 +1851,7 @@ export class Stripe extends HTMLElementCtor {
       this._clearErrorState();
       let creation: IntentCreationResult;
       try {
-        creation = await this._requestIntent({
-          amountValue: this.amountValue ?? undefined,
-          amountCurrency: this.amountCurrency ?? undefined,
-          customerId: this.customerId ?? undefined,
-        });
+        creation = await this._requestIntent(this._buildIntentHint());
       } catch (e: unknown) {
         // If a supersede already ran (reset / abort / disconnect / key
         // change), the Core's own cancellation path throws a
@@ -2305,12 +2342,22 @@ export class Stripe extends HTMLElementCtor {
     // sanitizer re-runs on the wire-receiving end. Symmetric with
     // `_setErrorStateFromUnknown`'s allowlist, so every Shell-side
     // error sink converges on the same shape policy.
-    return {
+    //
+    // Omit (never `undefined`) a field Stripe.js did not supply or the
+    // allowlist rejected. This object is the `error` argument of the
+    // `outcome: "failed"` `reportConfirmation` (SPEC §8.1 `error?: { code?,
+    // declineCode?, message, type? }`), and @wc-bindable/remote ≥ 0.10
+    // rejects an `invoke` whose argument holds an `undefined` member before
+    // sending it. A decline without `decline_code` / `type` — the common
+    // case — would otherwise never reach the Core, which then never
+    // records `failed` (the `.catch(() => {})` at the call sites swallows
+    // the local rejection).
+    return compactStripeError({
       code: Stripe._safeToken(err.code, Stripe._STRIPE_ERROR_CODE_RE),
       declineCode: Stripe._safeToken(err.decline_code, Stripe._STRIPE_ERROR_CODE_RE),
       type: Stripe._safeType(err.type),
       message,
-    };
+    });
   }
 
   /**
@@ -2350,7 +2397,14 @@ export class Stripe extends HTMLElementCtor {
         await this._reportConfirmation({
           intentId,
           outcome: "succeeded",
-          paymentMethod: pm,
+          // SPEC §6.4 / §8.1: include `paymentMethod` only when Stripe.js
+          // returned `payment_method` expanded; otherwise OMIT the key.
+          // The usual Stripe.js result carries a bare `pm_…` id string, so
+          // `pm` is `undefined` here, and `paymentMethod: undefined` makes
+          // @wc-bindable/remote ≥ 0.10 reject the whole `invoke` locally
+          // (strict JsonValue arguments). The Core would then never reach
+          // `succeeded` nor run its server-side retrieve fallback.
+          ...(pm ? { paymentMethod: pm } : {}),
         }).catch(() => {});
         break;
       case "requires_action":
@@ -2563,13 +2617,36 @@ export class Stripe extends HTMLElementCtor {
       coreSpoke = true;
     } catch (e: unknown) {
       this._setErrorStateFromUnknown(e);
+      // Code-based classification, shared by both modes (rationale in
+      // the local-mode branch below). Since @wc-bindable/remote 0.10 a
+      // remote rejection carries the producer's string `code` (SPEC-
+      // extensions.md § Error envelope), so a Core denial reaches this
+      // catch with e.g. `code: "resume_client_secret_mismatch"` in remote
+      // mode too. Codes the remote layer synthesizes itself
+      // (`WC_BINDABLE_TIMEOUT` / `_DISPOSED` / `_REMOTE_THROW` /
+      // `_INVALID_JSON_VALUE`, …) are upper-case and never match the
+      // lower-case-only `STRIPE_ERROR_CODE_RE`, so a failure that never
+      // reached the Core still classifies as Transient.
+      const code = (e && typeof e === "object" && typeof (e as { code?: unknown }).code === "string")
+        ? (e as { code: string }).code
+        : "";
+      const isCoreInternalDenial = code === "resume_client_secret_mismatch" || code === "resume_not_authorized";
+      const isStripeTaxonomyCode = code !== "" && STRIPE_ERROR_CODE_RE.test(code);
+      const decisiveCode = isCoreInternalDenial || isStripeTaxonomyCode;
       if (this._isRemote) {
         // Core participated in this resume iff at least one `error`
-        // update crossed the wire since we started. A Core-origin
-        // rejection ALWAYS bumps the seq (via `_setError(null)` at the
-        // top of resumeIntent + `_setError(err)` before throwing). A
-        // cmd that never reached the Core advances nothing.
-        coreSpoke = this._remoteErrorSeq > remoteSeqBefore;
+        // update crossed the wire since we started, OR the rejection
+        // itself carries a decisive Core code. A Core-origin rejection
+        // normally bumps the seq (via `_setError(null)` at the top of
+        // resumeIntent + `_setError(err)` before throwing). The code is
+        // the backstop for a publish this Shell never observed: a
+        // superseded generation skips `_setError`, and the producer drops
+        // an `error` value that is not a JsonValue — which is how a
+        // sanitized error carrying `undefined` members made a decisive
+        // `resource_missing` denial read as transient and re-resume on
+        // every reconnect. A cmd that never reached the Core advances
+        // nothing and carries no such code.
+        coreSpoke = this._remoteErrorSeq > remoteSeqBefore || decisiveCode;
       } else {
         // Local mode: distinguish Core-decisive denials from transient
         // provider failures.
@@ -2610,12 +2687,7 @@ export class Stripe extends HTMLElementCtor {
         // and looped forever on reload. Routing through the taxonomy
         // regex closes that loop AND auto-classifies every future
         // Stripe-side decisive code without needing a new explicit entry.
-        const code = (e && typeof e === "object" && typeof (e as { code?: unknown }).code === "string")
-          ? (e as { code: string }).code
-          : "";
-        const isCoreInternalDenial = code === "resume_client_secret_mismatch" || code === "resume_not_authorized";
-        const isStripeTaxonomyCode = code !== "" && STRIPE_ERROR_CODE_RE.test(code);
-        coreSpoke = isCoreInternalDenial || isStripeTaxonomyCode;
+        coreSpoke = decisiveCode;
       }
     } finally {
       this._resuming = false;

@@ -12,8 +12,8 @@
   "dependencies": {
     "@csbc-dev/stripe": "file:../..",
     "@stripe/stripe-js": "^5.0.0",
-    "@wc-bindable/core": "^0.4.0",
-    "@wc-bindable/react": "^0.4.0",
+    "@wc-bindable/core": "^0.10.0",
+    "@wc-bindable/react": "^0.10.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },

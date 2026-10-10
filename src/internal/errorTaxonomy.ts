@@ -14,6 +14,8 @@
  * for the browser graph and the server graph alike.
  */
 
+import type { StripeError } from "../types.js";
+
 /**
  * Stripe API object tokens (`card_error`, `invalid_request_error`, …) are
  * always lowercase snake. No `/i` flag — forged capitalized variants like
@@ -64,6 +66,39 @@ export const STRIPE_KNOWN_TYPES: ReadonlySet<string> = new Set([
  * from this package's own internal errors.
  */
 export const MAX_ERROR_MESSAGE_LENGTH: number = 512;
+
+/**
+ * Assemble a `StripeError` that carries ONLY the optional fields holding a
+ * value — an absent `code` / `declineCode` / `type` is omitted, never
+ * present-as-`undefined`.
+ *
+ * Why omission is load-bearing: the `StripeError` shapes built by the Core
+ * sanitizer and the Shell's local paths cross the wire — as the Core's
+ * `error` property (`update` / `sync`, SPEC §8.2) and as the `error`
+ * argument of `reportConfirmation` (SPEC §8.1). `@wc-bindable/remote`
+ * ≥ 0.10 validates every value it sends as a strict JsonValue
+ * (SPEC-extensions.md § Design invariants, invariant 3), and an own
+ * property whose value is `undefined` rejects the WHOLE value instead of
+ * being silently dropped the way `JSON.stringify` drops it. A
+ * `{ code: undefined, … }` shape therefore made the producer discard the
+ * `error` update (and list `error` in `getterFailures` on sync) and made
+ * the consumer reject a `reportConfirmation` before it was sent. SPEC
+ * §8.1 / §8.2 already define these fields as "omitted when absent"; this
+ * helper is the one place that enforces it for both Core and Shell.
+ *
+ * Only `undefined` is dropped and the field order of the earlier literal
+ * (`code` / `declineCode` / `type` / `message`) is kept. This helper does
+ * NOT sanitize — callers still apply the taxonomy allowlist and the
+ * message length cap before handing the fields over.
+ */
+export function compactStripeError(fields: StripeError): StripeError {
+  const out: Partial<StripeError> = {};
+  if (fields.code !== undefined) out.code = fields.code;
+  if (fields.declineCode !== undefined) out.declineCode = fields.declineCode;
+  if (fields.type !== undefined) out.type = fields.type;
+  out.message = fields.message;
+  return out as StripeError;
+}
 
 /**
  * Bounded, shape-preserving summary of an arbitrary wire-untrusted value

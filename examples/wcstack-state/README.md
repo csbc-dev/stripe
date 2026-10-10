@@ -52,6 +52,6 @@ This example defaults to mock mode. To use real **test** keys:
 
 Swap the `<importmap>` `/vendor/*` entries for pinned CDN URLs, e.g.
 `"@csbc-dev/stripe": "https://esm.run/@csbc-dev/stripe@<version>"`, keeping
-`@wc-bindable/*` at the version the package depends on (`0.4.0`) so the
+`@wc-bindable/*` at the version the package depends on (`0.10.0`) so the
 wire/protocol version stays stable. Once that swap is done the page no longer
 needs the `/vendor/*` mounts and could be hosted on any static host.

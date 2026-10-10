@@ -30,7 +30,7 @@ Before touching anything, run these in parallel and report the results to the us
 5. `npm run build` — `tsc` must succeed and produce `dist/`
 6. **Verify no local-path dependencies in `package.json` `dependencies`** — see "Local-path dependency check" below.
 
-`npm run test:integration` (Playwright, in `tests/integration/`) is **not** part of the standard preflight — it requires a browser stack and is slower. Run it only if the user explicitly asks, or if the release touches the Shell's confirmation / 3DS-redirect paths.
+`npm run test:integration` (Playwright, in `tests/integration/`) is **not** part of the standard preflight — it requires a browser stack and is slower. Run it only if the user explicitly asks, if the release touches the Shell's confirmation / 3DS-redirect paths, or if it bumps `@wc-bindable/*` (the suite is the only one that crosses a real WebSocket + JSON boundary).
 
 If any check fails, stop and report. Do not attempt fixes unless the user asks.
 
@@ -68,7 +68,7 @@ Confirm the next version with the user before bumping. Follow semver:
   - any change to exported types in [src/types.ts](src/types.ts) (`IStripeProvider`, `IntentBuilder`, `WcsStripeCoreValues`, the `StripeStatus` union, …)
   - any change to the `<stripe-checkout>` attribute contract (`mode`, `amount-value`, `amount-currency`, `customer-id`, `publishable-key`, `return-url`)
   - any change to the sanitized error contract (`StripeError` shape, the wire-side allowlist of `type` tokens)
-  - any change to the remote wire protocol used by `@wc-bindable/remote`
+  - any change to the remote wire protocol used by `@wc-bindable/remote` — including a `@wc-bindable/core` / `@wc-bindable/remote` dependency-range bump that crosses a breaking upstream release (pre-1.0 minors can change the wire contract: 0.10 made the wire enforce strict JsonValue, rejecting `undefined` object members, and started forwarding a rejection's `code`)
   - any change to the 3DS resume authorization model (`registerResumeAuthorizer`, the `clientSecret` constant-time compare contract)
 
 Once the user approves the bump level, update `version` in [package.json](package.json). Prefer editing the field directly rather than running `npm version`, so the user keeps control over commit/tag creation.

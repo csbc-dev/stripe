@@ -2204,7 +2204,9 @@ describe("<stripe-checkout> Shell", () => {
         // The denial's `code` must survive the wire. The Core dispatches
         // an `error` update before throwing, and `_setErrorStateFromUnknown`
         // must defer to that richer publish instead of overwriting with
-        // the serialized throw's sparse {name,message} copy.
+        // the serialized throw's sparser copy (since @wc-bindable/remote
+        // 0.10 the throw carries `name` / `message` / `stack` / `code`,
+        // but never `declineCode` / `type`).
         expect(el.error?.code).toBe("resume_client_secret_mismatch");
       } finally {
         shellProxy.dispose();
@@ -2305,6 +2307,385 @@ describe("<stripe-checkout> Shell", () => {
       } finally {
         shellProxy.dispose();
       }
+    });
+
+    describe("strict JsonValue wire (@wc-bindable/remote >= 0.10, regression)", () => {
+      // @wc-bindable/remote 0.10 validates every value it sends as a strict
+      // JsonValue: an object member whose value is `undefined` rejects the
+      // WHOLE value (consumer: `invoke` rejects locally before sending;
+      // producer: the `update` is dropped / `sync` lists `getterFailures`,
+      // and a command return becomes WC_BINDABLE_INVALID_RETURN_VALUE).
+      // Under 0.4, `JSON.stringify` silently dropped such members, so the
+      // Shell / Core shapes below used to work. These tests run the real
+      // 0.10 RemoteCoreProxy (built by `_connectRemote`) against a real
+      // RemoteShellProxy, record the client→server frames, and spy on the
+      // producer's logger so a dropped value fails the test loudly.
+
+      function createRecordingTransportPair(): {
+        client: ClientTransport;
+        server: ServerTransport;
+        sent: ClientMessage[];
+      } {
+        const pair = createMockTransportPair();
+        const sent: ClientMessage[] = [];
+        const client: ClientTransport = {
+          send: (msg) => { sent.push(msg); pair.client.send(msg); },
+          onMessage: (handler) => pair.client.onMessage(handler),
+        };
+        return { client, server: pair.server, sent };
+      }
+
+      function createWireLogger(): { logger: { warn: (m: string) => void; error: (m: string) => void }; messages: string[] } {
+        const messages: string[] = [];
+        return {
+          logger: {
+            warn: (m: string) => { messages.push(m); },
+            error: (m: string) => { messages.push(m); },
+          },
+          messages,
+        };
+      }
+
+      function cmdArgs(sent: ClientMessage[], name: string): unknown[] {
+        const cmd = sent.find((m) => m.type === "cmd" && m.name === name);
+        if (!cmd || cmd.type !== "cmd") throw new Error(`no ${name} cmd was sent`);
+        return cmd.args;
+      }
+
+      it("prepare() without customer-id / amount-* omits those hint keys and succeeds (S1)", async () => {
+        // Every example omits `customer-id`; the old `?? undefined` hint
+        // made `invoke("requestIntent")` reject locally with
+        // "args[0].hint.customerId is undefined", so no remote prepare
+        // could ever succeed.
+        const builderHints: unknown[] = [];
+        core.registerIntentBuilder((request) => {
+          builderHints.push(request.hint);
+          return { mode: "payment", amount: 1980, currency: "jpy" };
+        });
+        // Core-side instance input: the per-field fallback must still fill
+        // an omitted hint field.
+        core.customerId = "cus_core_default";
+
+        el = createEl({ mode: "payment" }); // no key yet → no auto-prepare
+        const { client, server, sent } = createRecordingTransportPair();
+        const { logger, messages } = createWireLogger();
+        const shellProxy = new RemoteShellProxy(core, server, { logger });
+        try {
+          el._connectRemote(client);
+          await flushTransport(2);
+
+          el.setAttribute("publishable-key", "pk_test_hint_omit");
+          await el.prepare();
+          await flushTransport(2);
+
+          expect(fakes.mountCalls).toHaveLength(1);
+          expect(el.status).toBe("collecting");
+          expect(el.intentId).toBe("pi_shell");
+          expect(el.error).toBeNull();
+
+          const [request] = cmdArgs(sent, "requestIntent") as [{ mode: string; hint: Record<string, unknown> }];
+          expect(request.mode).toBe("payment");
+          expect(Object.keys(request.hint)).toEqual([]);
+          expect(builderHints[0]).toEqual({ customerId: "cus_core_default" });
+          expect(messages).toEqual([]);
+        } finally {
+          shellProxy.dispose();
+        }
+      });
+
+      it("prepare() forwards only the hint fields whose attributes are set (S1)", async () => {
+        el = createEl({ mode: "payment", "amount-value": "1500" });
+        const { client, server, sent } = createRecordingTransportPair();
+        const shellProxy = new RemoteShellProxy(core, server);
+        try {
+          el._connectRemote(client);
+          await flushTransport(2);
+          el.setAttribute("publishable-key", "pk_test_hint_partial");
+          await el.prepare();
+
+          const [request] = cmdArgs(sent, "requestIntent") as [{ hint: Record<string, unknown> }];
+          expect(request.hint).toEqual({ amountValue: 1500 });
+          expect(Object.keys(request.hint)).toEqual(["amountValue"]);
+        } finally {
+          shellProxy.dispose();
+        }
+      });
+
+      it("success report with a bare payment_method id omits paymentMethod; Core reaches succeeded via retrieve (S2)", async () => {
+        // Stripe.js normally returns `payment_method` as an id string, so
+        // `extractCardPaymentMethod` yields undefined. `paymentMethod:
+        // undefined` used to reject the report locally (swallowed by
+        // `.catch(() => {})`), leaving the Core on `collecting` and never
+        // running the server-side retrieve fallback (SPEC §6.4).
+        fakes.setConfirmResult({
+          paymentIntent: { id: "pi_shell", status: "succeeded", payment_method: "pm_bare_id" },
+        });
+        el = createEl({ mode: "payment" });
+        const { client, server, sent } = createRecordingTransportPair();
+        const { logger, messages } = createWireLogger();
+        const shellProxy = new RemoteShellProxy(core, server, { logger });
+        try {
+          el._connectRemote(client);
+          await flushTransport(2);
+          el.setAttribute("publishable-key", "pk_test_bare_pm");
+          await el.prepare();
+          await el.submit();
+          await flushTransport(4);
+
+          const [report] = cmdArgs(sent, "reportConfirmation") as [Record<string, unknown>];
+          expect(report).toEqual({ intentId: "pi_shell", outcome: "succeeded" });
+          expect("paymentMethod" in report).toBe(false);
+
+          expect(core.status).toBe("succeeded");
+          expect(provider.retrieveCalls).toEqual([{ mode: "payment", id: "pi_shell" }]);
+          expect(el.status).toBe("succeeded");
+          expect(el.paymentMethod).toEqual({ id: "pm_retrieved", brand: "visa", last4: "4242" });
+          expect(messages).toEqual([]);
+        } finally {
+          shellProxy.dispose();
+        }
+      });
+
+      it("failed report (result.error without decline_code) omits missing fields; Core records failed (S2)", async () => {
+        fakes.setConfirmResult({
+          error: { type: "card_error", code: "card_declined", message: "Your card was declined." },
+        });
+        el = createEl({ mode: "payment" });
+        const { client, server, sent } = createRecordingTransportPair();
+        const { logger, messages } = createWireLogger();
+        const shellProxy = new RemoteShellProxy(core, server, { logger });
+        try {
+          el._connectRemote(client);
+          await flushTransport(2);
+          el.setAttribute("publishable-key", "pk_test_fail_report");
+          await el.prepare();
+          await el.submit();
+          await flushTransport(4);
+
+          const [report] = cmdArgs(sent, "reportConfirmation") as [{ outcome: string; error: Record<string, unknown> }];
+          expect(report.outcome).toBe("failed");
+          expect(Object.keys(report.error)).toEqual(["code", "type", "message"]);
+
+          const expected = { code: "card_declined", type: "card_error", message: "Your card was declined." };
+          expect(core.status).toBe("failed");
+          expect(core.error).toEqual(expected);
+          expect(el.status).toBe("failed");
+          expect(el.error).toEqual(expected);
+          expect(messages).toEqual([]);
+        } finally {
+          shellProxy.dispose();
+        }
+      });
+
+      it("failed report from requires_payment_method without decline_code reaches the Core (S2)", async () => {
+        fakes.setConfirmResult({
+          paymentIntent: {
+            id: "pi_shell",
+            status: "requires_payment_method",
+            last_payment_error: { type: "card_error", code: "card_declined", message: "Declined." },
+          },
+        });
+        el = createEl({ mode: "payment" });
+        const { client, server, sent } = createRecordingTransportPair();
+        const shellProxy = new RemoteShellProxy(core, server);
+        try {
+          el._connectRemote(client);
+          await flushTransport(2);
+          el.setAttribute("publishable-key", "pk_test_rpm_report");
+          await el.prepare();
+          await el.submit();
+          await flushTransport(4);
+
+          const [report] = cmdArgs(sent, "reportConfirmation") as [{ error: Record<string, unknown> }];
+          expect(Object.keys(report.error)).toEqual(["code", "type", "message"]);
+          expect(core.status).toBe("failed");
+          expect(core.error).toEqual({ code: "card_declined", type: "card_error", message: "Declined." });
+          expect(el.status).toBe("failed");
+        } finally {
+          shellProxy.dispose();
+        }
+      });
+
+      it("a provider failure's sanitized error reaches the browser as an `error` update, type intact (S3)", async () => {
+        // `_sanitizeError` used to return all four keys with `undefined`
+        // for the missing ones; the 0.10 producer dropped that `error`
+        // update, so the Shell fell back to the sparse cmd-throw copy and
+        // lost `type` (and `declineCode`).
+        provider.createPaymentIntent = async () => {
+          throw Object.assign(new Error("Could not connect to Stripe."), { type: "StripeConnectionError" });
+        };
+        el = createEl({ mode: "payment" });
+        const errorEvents: unknown[] = [];
+        el.addEventListener("stripe-checkout:error", (e) => errorEvents.push((e as CustomEvent).detail));
+        const { client, server } = createRecordingTransportPair();
+        const { logger, messages } = createWireLogger();
+        const shellProxy = new RemoteShellProxy(core, server, { logger });
+        try {
+          el._connectRemote(client);
+          await flushTransport(2);
+          el.setAttribute("publishable-key", "pk_test_provider_fail");
+          await expect(el.prepare()).rejects.toThrow(/Could not connect to Stripe/);
+          await flushTransport(2);
+
+          const expected = { type: "StripeConnectionError", message: "Could not connect to Stripe." };
+          expect(core.error).toEqual(expected);
+          expect(Object.keys(core.error!)).toEqual(["type", "message"]);
+          expect(el.error).toEqual(expected);
+          expect(el.status).toBe("idle");
+          // The error arrived as a Core-published update (Core-authoritative
+          // remote layer), not as the Shell's local fallback.
+          expect((el as unknown as { _hasLocalError: boolean })._hasLocalError).toBe(false);
+          expect(errorEvents).toContainEqual(expected);
+          expect(messages).toEqual([]);
+        } finally {
+          shellProxy.dispose();
+        }
+      });
+
+      it("a sanitized error with code but no declineCode keeps type over the wire (S3)", async () => {
+        provider.createPaymentIntent = async () => {
+          throw Object.assign(new Error("Your card was declined."), { type: "card_error", code: "card_declined" });
+        };
+        el = createEl({ mode: "payment" });
+        const { client, server } = createRecordingTransportPair();
+        const { logger, messages } = createWireLogger();
+        const shellProxy = new RemoteShellProxy(core, server, { logger });
+        try {
+          el._connectRemote(client);
+          await flushTransport(2);
+          el.setAttribute("publishable-key", "pk_test_provider_card_err");
+          await expect(el.prepare()).rejects.toThrow(/declined/);
+          await flushTransport(2);
+
+          expect(el.error).toEqual({ code: "card_declined", type: "card_error", message: "Your card was declined." });
+          expect(messages).toEqual([]);
+        } finally {
+          shellProxy.dispose();
+        }
+      });
+
+      it("an error already on the Core is delivered by the initial sync, not listed in getterFailures (S3)", async () => {
+        provider.createPaymentIntent = async () => {
+          throw Object.assign(new Error("Could not connect to Stripe."), { type: "StripeConnectionError" });
+        };
+        await core.requestIntent({ mode: "payment", hint: {} }).catch(() => { /* expected */ });
+        expect(core.error).toEqual({ type: "StripeConnectionError", message: "Could not connect to Stripe." });
+
+        el = createEl({ mode: "payment" }); // no key → no auto-prepare
+        const { client, server } = createRecordingTransportPair();
+        const { logger, messages } = createWireLogger();
+        const shellProxy = new RemoteShellProxy(core, server, { logger });
+        try {
+          el._connectRemote(client);
+          await flushTransport(2);
+          expect(el.error).toEqual({ type: "StripeConnectionError", message: "Could not connect to Stripe." });
+          expect(messages).toEqual([]);
+        } finally {
+          shellProxy.dispose();
+        }
+      });
+
+      it("requestIntent returns a JsonValue even when the provider reports amount: undefined (S5)", async () => {
+        // `StripeSdkProvider.createPaymentIntent` returns `amount:
+        // extractAmount(result)`, which is `undefined` when Stripe's
+        // response lacks a numeric amount / string currency. Returning
+        // the provider object verbatim made the producer answer with
+        // WC_BINDABLE_INVALID_RETURN_VALUE after the intent was created,
+        // orphaning it.
+        provider.createPaymentIntent = async () => ({
+          intentId: "pi_no_amount",
+          clientSecret: "pi_no_amount_secret",
+          mode: "payment",
+          amount: undefined,
+        });
+        el = createEl({ mode: "payment" });
+        const { client, server } = createRecordingTransportPair();
+        const { logger, messages } = createWireLogger();
+        const shellProxy = new RemoteShellProxy(core, server, { logger });
+        try {
+          el._connectRemote(client);
+          await flushTransport(2);
+          el.setAttribute("publishable-key", "pk_test_no_amount");
+          await el.prepare();
+          await flushTransport(2);
+
+          expect(fakes.mountCalls).toHaveLength(1);
+          expect(el.status).toBe("collecting");
+          expect(el.intentId).toBe("pi_no_amount");
+          expect(el.amount).toBeNull();
+          expect(el.error).toBeNull();
+          expect(provider.cancelCalls).toEqual([]);
+          expect(messages).toEqual([]);
+        } finally {
+          shellProxy.dispose();
+        }
+      });
+
+      it("a remote resume denial is classified decisive by its code even if the error update is not observed", async () => {
+        // Backstop for the seq-based `coreSpoke` check: since 0.10 the
+        // rejection carries the producer's `code`, so a Core denial is
+        // decisive on its own. Drop every `error` update at the server
+        // transport to model a publish the Shell never sees, and start the
+        // resume only AFTER the initial sync so the sync's own `error`
+        // delivery cannot advance `_remoteErrorSeq` for this resume.
+        provider.retrieveResult = {
+          id: "pi_code_denied",
+          status: "succeeded",
+          mode: "payment",
+          clientSecret: "pi_code_denied_secret_REAL",
+        };
+        const pair = createMockTransportPair();
+        const filteringServer: ServerTransport = {
+          send: (msg) => {
+            if (msg.type === "update" && msg.name === "error") return;
+            pair.server.send(msg);
+          },
+          onMessage: (handler) => pair.server.onMessage(handler),
+        };
+        // No publishable-key → no auto-prepare; the only cmd is the resume.
+        el = createEl({ mode: "payment" });
+        const shellProxy = new RemoteShellProxy(core, filteringServer);
+        try {
+          el._connectRemote(pair.client);
+          await flushTransport(4);
+          const seqAfterSync = (el as unknown as { _remoteErrorSeq: number })._remoteErrorSeq;
+
+          setUrlSearch("?payment_intent=pi_code_denied&payment_intent_client_secret=pi_code_denied_secret_GUESS");
+          await (el as unknown as { _resumeFromRedirect: () => Promise<void> })._resumeFromRedirect();
+          await flushTransport(4);
+
+          // No `error` update reached the Shell during the resume …
+          expect((el as unknown as { _remoteErrorSeq: number })._remoteErrorSeq).toBe(seqAfterSync);
+          expect(core.error?.code).toBe("resume_client_secret_mismatch");
+          // The Shell saw the code on the rejection itself (local layer).
+          expect(el.error?.code).toBe("resume_client_secret_mismatch");
+          expect((el as unknown as { _resumed: boolean })._resumed).toBe(true);
+          const params = new URLSearchParams(globalThis.location.search);
+          expect(params.has("payment_intent")).toBe(false);
+
+          const callsBefore = provider.retrieveCalls.length;
+          await (el as unknown as { _resumeFromRedirect: () => Promise<void> })._resumeFromRedirect();
+          await flushTransport(2);
+          expect(provider.retrieveCalls.length).toBe(callsBefore);
+        } finally {
+          shellProxy.dispose();
+        }
+      });
+    });
+
+    it("local fallback drops remote-layer WC_BINDABLE_* codes from el.error.code", () => {
+      // Since @wc-bindable/remote 0.10 a rejection carries `code`. The
+      // codes the remote layer synthesizes are upper-case, so the
+      // lower-case Stripe taxonomy gate keeps them off `el.error.code`.
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_local" });
+      el.attachLocalCore(core);
+
+      (el as any)._setErrorStateFromUnknown(Object.assign(
+        new Error("RemoteCoreProxy: invoke(\"requestIntent\") args is not a JsonValue"),
+        { code: "WC_BINDABLE_INVALID_JSON_VALUE" },
+      ));
+      expect(el.error?.code).toBeUndefined();
+      expect(el.error).toEqual({ message: "RemoteCoreProxy: invoke(\"requestIntent\") args is not a JsonValue" });
     });
 
     it("local unknown-object fallback preserves declineCode/type fields", () => {
