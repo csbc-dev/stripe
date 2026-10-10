@@ -116,4 +116,33 @@ test("post-redirect resume rejects a foreign client secret over the real remote 
   expect(results.loaderCalls).toEqual([]);
   expect(results.confirmCalls).toEqual([]);
   expect(server.state.retrieveCalls).toEqual([{ mode: "payment", id: "pi_resume_denied" }]);
+  // A decisive denial consumes the redirect URL.
+  expect(results.searchAfter).toBe("?scenario=resume");
+});
+
+test("post-redirect resume keeps the redirect URL when the provider fails without a Stripe code", async ({ page }) => {
+  // No fixture: the fake provider's `retrieveIntent` throws a plain Error,
+  // the shape of a network failure on the way to Stripe. The Core publishes
+  // the sanitized (code-less) error before rejecting; that is a transient
+  // failure, so the URL must survive for a retry — as it does with a local
+  // Core. The resume goes out while the WebSocket is still connecting,
+  // i.e. before the producer's `sync` snapshot is applied.
+  await page.goto(
+    `http://localhost:${server.port}/client.html?scenario=resume&payment_intent=pi_resume_unreachable&payment_intent_client_secret=pi_resume_unreachable_secret_ok&redirect_status=succeeded`,
+  );
+  await expect(page.locator("#status")).toHaveText("done", { timeout: 15000 });
+
+  const results = JSON.parse((await page.locator("#results").textContent()) ?? "{}");
+
+  expect(results.fatal).toBeUndefined();
+  expect(results.status).toBe("idle");
+  expect(results.intentId).toBeNull();
+  expect(results.error).toEqual({ message: "Payment failed." });
+  expect(results.searchAfter).toBe(
+    "?scenario=resume&payment_intent=pi_resume_unreachable&payment_intent_client_secret=pi_resume_unreachable_secret_ok&redirect_status=succeeded",
+  );
+  // Auto-prepare stays blocked while the redirect is still pending.
+  expect(results.loaderCalls).toEqual([]);
+  expect(results.confirmCalls).toEqual([]);
+  expect(server.state.retrieveCalls).toEqual([{ mode: "payment", id: "pi_resume_unreachable" }]);
 });

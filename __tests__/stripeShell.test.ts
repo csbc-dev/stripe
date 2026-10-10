@@ -1749,14 +1749,16 @@ describe("<stripe-checkout> Shell", () => {
       }
     });
 
-    it("transport-only resume failure with STALE remote error keeps URL retriable (seq-based coreSpoke regression)", async () => {
+    it("transport-only resume failure with STALE remote error keeps URL retriable (stale-remote-error regression)", async () => {
       // The coarse `!!this._remoteValues.error` check would misclassify
       // this scenario as a Core-origin rejection: the session already
       // holds a truthy `_remoteValues.error` from a prior operation, so
       // even though the resume cmd never reached the Core, the Shell
-      // would strip the URL and latch `_resumed = true`. The seq-based
-      // check must gate on whether an error update crossed the wire
-      // DURING this specific resume.
+      // would strip the URL and latch `_resumed = true`. Only an error the
+      // Core publishes AFTER this resume was sent may inform the
+      // classification (see also "3DS resume failure classification:
+      // remote matches local", which covers a resume sent before the
+      // initial sync).
       //
       // Build-up order is important: start with an empty URL and NO
       // publishable-key so the element connects idle. Prime the remote
@@ -2622,12 +2624,12 @@ describe("<stripe-checkout> Shell", () => {
       });
 
       it("a remote resume denial is classified decisive by its code even if the error update is not observed", async () => {
-        // Backstop for the seq-based `coreSpoke` check: since 0.10 the
-        // rejection carries the producer's `code`, so a Core denial is
-        // decisive on its own. Drop every `error` update at the server
-        // transport to model a publish the Shell never sees, and start the
-        // resume only AFTER the initial sync so the sync's own `error`
-        // delivery cannot advance `_remoteErrorSeq` for this resume.
+        // Since 0.10 the rejection carries the producer's `code`, so a Core
+        // denial is decisive on its own — the error the Core publishes
+        // after the resume was sent is only the backstop for a rejection
+        // without one. Drop every `error` update at the server transport to
+        // model a publish the Shell never sees (the producer drops a value
+        // that is not a JsonValue).
         provider.retrieveResult = {
           id: "pi_code_denied",
           status: "succeeded",
@@ -2728,6 +2730,397 @@ describe("<stripe-checkout> Shell", () => {
       expect(el.error?.declineCode).toBeUndefined();
       expect(el.error?.type).toBeUndefined();
       expect(el.error?.message).toBe("x");
+    });
+  });
+
+  describe("3DS resume failure classification: remote matches local (regression)", () => {
+    // A resume failure either CONSUMES the redirect URL (decisive: the Core
+    // answered with a Stripe-taxonomy `code`; `_resumed` latches and the
+    // params are stripped) or KEEPS it (transient: no code; a reconnect /
+    // reload retries). The same failure must land in the same bucket in
+    // both modes. Remote used to diverge in two ways:
+    //   1. "the Core answered" was read off ANY `error` delivery since the
+    //      resume started — null clears and the initial `sync` snapshot
+    //      included. On a post-redirect page load the resume goes out
+    //      before the snapshot arrives, so every remote resume failure,
+    //      even one that never touched the Core's state, consumed the URL.
+    //   2. A code-less provider failure (the Core publishes it before
+    //      throwing) consumed the URL in remote mode but kept it locally.
+    // The remote runs below use the real 0.10 RemoteCoreProxy (built by
+    // `_connectRemote`) against a real RemoteShellProxy.
+
+    const INTENT = "pi_parity";
+    const URL_SECRET = `${INTENT}_secret_ok`;
+    const DISPOSED_MESSAGE = "[@csbc-dev/stripe] StripeCore has been disposed.";
+
+    type ResumeOutcome = "consumed" | "kept";
+    type ResumeScenario = {
+      name: string;
+      arrange: (ctx: { provider: FakeProvider; core: StripeCore }) => void;
+      expected: ResumeOutcome;
+      error: Record<string, unknown> | null;
+    };
+
+    const stripeReject = (): Error => Object.assign(new Error(`No such payment_intent: ${INTENT}`), {
+      code: "resource_missing",
+      type: "invalid_request_error",
+    });
+
+    const scenarios: ResumeScenario[] = [
+      {
+        name: "success",
+        arrange: ({ provider }) => {
+          provider.retrieveResult = { id: INTENT, status: "succeeded", mode: "payment", clientSecret: URL_SECRET };
+        },
+        expected: "consumed",
+        error: null,
+      },
+      {
+        name: "clientSecret mismatch (Core denial)",
+        arrange: ({ provider }) => {
+          provider.retrieveResult = { id: INTENT, status: "succeeded", mode: "payment", clientSecret: `${INTENT}_secret_REAL` };
+        },
+        expected: "consumed",
+        error: { code: "resume_client_secret_mismatch", message: "clientSecret does not match the retrieved intent -- resume denied." },
+      },
+      {
+        name: "registered authorizer denies",
+        arrange: ({ provider, core }) => {
+          provider.retrieveResult = { id: INTENT, status: "succeeded", mode: "payment", clientSecret: URL_SECRET };
+          core.registerResumeAuthorizer(() => false);
+        },
+        expected: "consumed",
+        error: { code: "resume_not_authorized", message: "resume rejected by registered authorizer." },
+      },
+      {
+        name: "Stripe API reject with a taxonomy code (resource_missing)",
+        arrange: ({ provider }) => {
+          provider.retrieveIntent = async () => { throw stripeReject(); };
+        },
+        expected: "consumed",
+        error: { code: "resource_missing", type: "invalid_request_error", message: `No such payment_intent: ${INTENT}` },
+      },
+      {
+        name: "provider could not reach Stripe (StripeConnectionError, no code)",
+        arrange: ({ provider }) => {
+          provider.retrieveIntent = async () => {
+            throw Object.assign(new Error("Could not connect to Stripe."), { type: "StripeConnectionError" });
+          };
+        },
+        expected: "kept",
+        error: { type: "StripeConnectionError", message: "Could not connect to Stripe." },
+      },
+      {
+        name: "plain network error (no code, no Stripe shape)",
+        arrange: ({ provider }) => {
+          provider.retrieveIntent = async () => { throw new Error("connect ECONNREFUSED 10.0.0.5:443"); };
+        },
+        expected: "kept",
+        error: { message: "Payment failed." },
+      },
+      {
+        name: "taxonomy code, but the Core published nothing (superseded mid-retrieve)",
+        arrange: ({ provider, core }) => {
+          provider.retrieveIntent = async () => { core.reset(); throw stripeReject(); };
+        },
+        expected: "consumed",
+        // The throw carries `code` + `message` only (no `type`): the Core
+        // skipped `_setError` because its generation moved on.
+        error: { code: "resource_missing", message: `No such payment_intent: ${INTENT}` },
+      },
+      {
+        name: "no code and the Core published nothing (superseded mid-retrieve)",
+        arrange: ({ provider, core }) => {
+          provider.retrieveIntent = async () => { core.reset(); throw new Error("socket hang up"); };
+        },
+        expected: "kept",
+        error: { message: "Payment failed." },
+      },
+      {
+        name: "the Core rejects before touching state (disposed Core, no code)",
+        arrange: ({ core }) => { core.dispose(); },
+        expected: "kept",
+        error: { message: DISPOSED_MESSAGE },
+      },
+    ];
+
+    type RunKind = "local" | "remote (resume sent before sync)" | "remote (resume sent after sync)" | "remote, stale error in the initial sync";
+
+    async function primeStaleCoreError(): Promise<void> {
+      // A prior failed resume leaves a decisive-looking error on the Core;
+      // the initial sync will deliver it to a fresh Shell.
+      await core.resumeIntent("pi_prior", "payment", "pi_prior_secret_WRONG").catch(() => { /* expected */ });
+      expect(core.error?.code).toBe("resume_client_secret_mismatch");
+      provider.retrieveCalls = [];
+    }
+
+    async function runResume(kind: RunKind, scenario: ResumeScenario): Promise<{
+      outcome: ResumeOutcome;
+      resumed: boolean;
+      error: unknown;
+    }> {
+      if (kind === "remote, stale error in the initial sync") await primeStaleCoreError();
+      scenario.arrange({ provider, core });
+      const redirect = `?payment_intent=${INTENT}&payment_intent_client_secret=${URL_SECRET}&redirect_status=succeeded`;
+      // No publishable-key: auto-prepare stays out of the way, so the
+      // resume is the only Core command.
+      el = createEl({ mode: "payment" });
+      let shellProxy: RemoteShellProxy | null = null;
+      try {
+        if (kind === "local") {
+          setUrlSearch(redirect);
+          el.attachLocalCore(core);
+          await flushTransport(4);
+        } else {
+          const { client, server } = createMockTransportPair();
+          shellProxy = new RemoteShellProxy(core, server);
+          if (kind === "remote (resume sent after sync)") {
+            el._connectRemote(client);
+            await flushTransport(4);
+            setUrlSearch(redirect);
+            await (el as unknown as { _resumeFromRedirect: () => Promise<void> })._resumeFromRedirect();
+          } else {
+            // `_connectRemote` fires the resume synchronously, before the
+            // producer's `sync` response has been applied.
+            setUrlSearch(redirect);
+            el._connectRemote(client);
+          }
+          await flushTransport(8);
+        }
+        const kept = new URLSearchParams(globalThis.location.search).has("payment_intent");
+        return {
+          outcome: kept ? "kept" : "consumed",
+          resumed: (el as unknown as { _resumed: boolean })._resumed,
+          error: el.error,
+        };
+      } finally {
+        shellProxy?.dispose();
+      }
+    }
+
+    const kinds: RunKind[] = [
+      "local",
+      "remote (resume sent before sync)",
+      "remote (resume sent after sync)",
+      "remote, stale error in the initial sync",
+    ];
+
+    describe.each(kinds)("%s", (kind) => {
+      it.each(scenarios)("$name → URL $expected", async (scenario) => {
+        const result = await runResume(kind, scenario);
+        expect(result.outcome).toBe(scenario.expected);
+        expect(result.resumed).toBe(scenario.expected === "consumed");
+        // The failure the user sees is THIS resume's — never the stale
+        // error the initial sync delivered.
+        expect(result.error).toEqual(scenario.error);
+      });
+    });
+
+    it("pre-sync resume: neither the sync snapshot nor an update before it counts as the Core's answer", async () => {
+      // The Core already holds a decisive-looking error (initial sync), the
+      // producer pushes another one before answering `sync`, and the
+      // resume itself is rejected before the Core touches its state — so
+      // the Core publishes nothing for it. Nothing here is an answer to
+      // the resume: the URL must stay for a retry, and `el.error` must be
+      // the resume's own failure.
+      await primeStaleCoreError();
+      core.dispose();
+
+      const order: string[] = [];
+      const pair = createMockTransportPair();
+      const client: ClientTransport = {
+        send: (msg) => {
+          if (msg.type === "cmd") order.push(`send:${msg.name}`);
+          pair.client.send(msg);
+        },
+        onMessage: (handler) => pair.client.onMessage((msg) => {
+          order.push(msg.type === "update" ? `recv:update:${msg.name}` : `recv:${msg.type}`);
+          handler(msg);
+        }),
+      };
+      let injected = false;
+      const server: ServerTransport = {
+        send: (msg) => {
+          if (msg.type === "sync" && !injected) {
+            injected = true;
+            pair.server.send({ type: "update", name: "error", value: { code: "resource_missing", message: "published before sync" } });
+          }
+          pair.server.send(msg);
+        },
+        onMessage: (handler) => pair.server.onMessage(handler),
+      };
+
+      setUrlSearch(`?payment_intent=${INTENT}&payment_intent_client_secret=${URL_SECRET}`);
+      el = createEl({ mode: "payment" });
+      const shellProxy = new RemoteShellProxy(core, server);
+      try {
+        el._connectRemote(client);
+        await flushTransport(8);
+
+        // The resume really went out before the snapshot arrived.
+        expect(order.indexOf("send:resumeIntent")).toBeGreaterThanOrEqual(0);
+        expect(order.indexOf("send:resumeIntent")).toBeLessThan(order.indexOf("recv:sync"));
+        expect(order.indexOf("recv:update:error")).toBeLessThan(order.indexOf("recv:sync"));
+        expect(order).toContain("recv:throw");
+
+        expect((el as unknown as { _resumed: boolean })._resumed).toBe(false);
+        expect(new URLSearchParams(globalThis.location.search).has("payment_intent")).toBe(true);
+        expect(el.error).toEqual({ message: DISPOSED_MESSAGE });
+      } finally {
+        shellProxy.dispose();
+      }
+    });
+
+    it("a producer-side rejection (WC_BINDABLE_* code) after a stale sync error keeps the URL and surfaces the rejection", async () => {
+      // The producer answers the resume itself — the Core never runs it
+      // (e.g. a server deploy whose declaration lacks `resumeIntent`).
+      await primeStaleCoreError();
+      provider.retrieveResult = { id: INTENT, status: "succeeded", mode: "payment", clientSecret: URL_SECRET };
+      const pair = createMockTransportPair();
+      const server: ServerTransport = {
+        send: (msg) => pair.server.send(msg),
+        onMessage: (handler) => pair.server.onMessage((msg) => {
+          if (msg.type === "cmd" && msg.name === "resumeIntent") {
+            pair.server.send({
+              type: "throw",
+              id: msg.id,
+              error: { name: "Error", message: 'Command "resumeIntent" is not declared in wcBindable.commands', code: "WC_BINDABLE_UNDECLARED_COMMAND" },
+            });
+            return;
+          }
+          handler(msg);
+        }),
+      };
+
+      setUrlSearch(`?payment_intent=${INTENT}&payment_intent_client_secret=${URL_SECRET}`);
+      el = createEl({ mode: "payment" });
+      const shellProxy = new RemoteShellProxy(core, server);
+      try {
+        el._connectRemote(pair.client);
+        await flushTransport(8);
+
+        expect(provider.retrieveCalls).toEqual([]);
+        expect((el as unknown as { _resumed: boolean })._resumed).toBe(false);
+        expect(new URLSearchParams(globalThis.location.search).has("payment_intent")).toBe(true);
+        // The stale `resume_client_secret_mismatch` from the sync must not
+        // stand in for this failure; the upper-case remote-layer code is
+        // kept off `el.error.code`.
+        expect(el.error).toEqual({ message: 'Command "resumeIntent" is not declared in wcBindable.commands' });
+      } finally {
+        shellProxy.dispose();
+      }
+    });
+
+    it("a code-less transient failure keeps the URL, and the resume succeeds on the next connection", async () => {
+      let stripeReachable = false;
+      provider.retrieveResult = {
+        id: INTENT,
+        status: "succeeded",
+        mode: "payment",
+        amount: { value: 2500, currency: "usd" },
+        clientSecret: URL_SECRET,
+      };
+      const origRetrieve = provider.retrieveIntent.bind(provider);
+      provider.retrieveIntent = async (mode, id) => {
+        if (!stripeReachable) {
+          throw Object.assign(new Error("Could not connect to Stripe."), { type: "StripeConnectionError" });
+        }
+        return origRetrieve(mode, id);
+      };
+
+      setUrlSearch(`?payment_intent=${INTENT}&payment_intent_client_secret=${URL_SECRET}&redirect_status=succeeded`);
+      el = createEl({ mode: "payment" });
+      const first = createMockTransportPair();
+      const firstProxy = new RemoteShellProxy(core, first.server);
+      try {
+        el._connectRemote(first.client);
+        await flushTransport(8);
+        expect(el.error).toEqual({ type: "StripeConnectionError", message: "Could not connect to Stripe." });
+        expect((el as unknown as { _resumed: boolean })._resumed).toBe(false);
+        expect(new URLSearchParams(globalThis.location.search).has("payment_intent")).toBe(true);
+      } finally {
+        firstProxy.dispose();
+      }
+
+      // Stripe is reachable again; the app re-establishes the connection.
+      stripeReachable = true;
+      (el as unknown as { _disposeRemote: () => void })._disposeRemote();
+      const second = createMockTransportPair();
+      const secondProxy = new RemoteShellProxy(core, second.server);
+      try {
+        el._connectRemote(second.client);
+        await flushTransport(8);
+        expect(el.status).toBe("succeeded");
+        expect(el.intentId).toBe(INTENT);
+        expect(el.error).toBeNull();
+        expect((el as unknown as { _resumed: boolean })._resumed).toBe(true);
+        expect(new URLSearchParams(globalThis.location.search).has("payment_intent")).toBe(false);
+      } finally {
+        secondProxy.dispose();
+      }
+    });
+
+    it("a decisive code published after the RPC was sent counts even if the rejection carries none (pre-0.10 producer)", async () => {
+      // Producers older than @wc-bindable/remote 0.10 forward only
+      // `name` / `message` / `stack` on a throw. The Core still publishes
+      // its sanitized error before throwing, and that publish — made after
+      // the resume was sent — carries the decisive code.
+      provider.retrieveIntent = async () => { throw stripeReject(); };
+      const pair = createMockTransportPair();
+      const server: ServerTransport = {
+        send: (msg) => {
+          if (msg.type === "throw" && msg.error && typeof msg.error === "object") {
+            const { code: _dropped, ...legacy } = msg.error as Record<string, unknown>;
+            pair.server.send({ ...msg, error: legacy });
+            return;
+          }
+          pair.server.send(msg);
+        },
+        onMessage: (handler) => pair.server.onMessage(handler),
+      };
+      setUrlSearch(`?payment_intent=${INTENT}&payment_intent_client_secret=${URL_SECRET}`);
+      el = createEl({ mode: "payment" });
+      const shellProxy = new RemoteShellProxy(core, server);
+      try {
+        el._connectRemote(pair.client);
+        await flushTransport(8);
+        expect(el.error).toEqual({ code: "resource_missing", type: "invalid_request_error", message: `No such payment_intent: ${INTENT}` });
+        expect((el as unknown as { _resumed: boolean })._resumed).toBe(true);
+        expect(new URLSearchParams(globalThis.location.search).has("payment_intent")).toBe(false);
+      } finally {
+        shellProxy.dispose();
+      }
+    });
+
+    it("a stale decisive code from the initial sync is not borrowed by a code-less rejection from a pre-0.10 producer", async () => {
+      // Counterpart to the test above: the only decisive code around is the
+      // one the snapshot delivered; this resume's own failure has none.
+      await primeStaleCoreError();
+      provider.retrieveIntent = async () => { core.reset(); throw new Error("socket hang up"); };
+      const pair = createMockTransportPair();
+      const server: ServerTransport = {
+        send: (msg) => {
+          if (msg.type === "throw" && msg.error && typeof msg.error === "object") {
+            const { code: _dropped, ...legacy } = msg.error as Record<string, unknown>;
+            pair.server.send({ ...msg, error: legacy });
+            return;
+          }
+          pair.server.send(msg);
+        },
+        onMessage: (handler) => pair.server.onMessage(handler),
+      };
+      setUrlSearch(`?payment_intent=${INTENT}&payment_intent_client_secret=${URL_SECRET}`);
+      el = createEl({ mode: "payment" });
+      const shellProxy = new RemoteShellProxy(core, server);
+      try {
+        el._connectRemote(pair.client);
+        await flushTransport(8);
+        expect((el as unknown as { _resumed: boolean })._resumed).toBe(false);
+        expect(new URLSearchParams(globalThis.location.search).has("payment_intent")).toBe(true);
+        expect(el.error).toEqual({ message: "Payment failed." });
+      } finally {
+        shellProxy.dispose();
+      }
     });
   });
 

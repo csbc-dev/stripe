@@ -168,6 +168,10 @@
         snapshot(el, statusEvents, elementReadyCount);
       } else if (scenario === "resume") {
         await waitFor(() => el.intentId != null || el.error != null || el.status === "succeeded" || el.status === "failed");
+        // The redirect-URL decision is made when the resume RPC settles —
+        // on a failure that is the `throw` frame, which arrives after the
+        // `error` update satisfied the wait above.
+        await waitFor(() => el._resuming === false);
         snapshot(el, statusEvents, elementReadyCount);
       } else {
         throw new Error(`unknown scenario: ${scenario}`);

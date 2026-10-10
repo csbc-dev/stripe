@@ -79,6 +79,27 @@ export interface StripePaymentElementLike {
 export type StripeJsLoader = (publishableKey: string) => Promise<StripeJsLike>;
 
 /**
+ * Per-connection state the Shell needs to tell the producer's `sync`
+ * snapshot apart from live `update` frames. Written by the transport
+ * wrapper `Stripe._observeSyncFrames`; read by the `bind()` mirror.
+ */
+interface RemoteSession {
+  /** True once the first `sync` response on this connection has been applied. */
+  synced: boolean;
+  /** True only while the proxy dispatches the values of a `sync` response. */
+  applyingSync: boolean;
+}
+
+/**
+ * Where `Stripe._remoteErrorSeq` stood when an RPC was sent, and on which
+ * connection. See `Stripe._coreErrorWindow` / `_coreErrorPublishedSince`.
+ */
+interface CoreErrorWindow {
+  readonly session: RemoteSession | null;
+  readonly coreErrors: number;
+}
+
+/**
  * Node-safe `HTMLElement` base. The `<stripe-checkout>` Shell is a browser
  * component — under a browser (and under jsdom in tests) this resolves to
  * the real `HTMLElement` constructor and behavior is unchanged. In plain
@@ -391,14 +412,50 @@ export class Stripe extends HTMLElementCtor {
   private _errorState: StripeError | null = null;
   private _hasLocalError: boolean = false;
   /**
-   * Monotonic counter for `error` updates received over the remote wire.
-   * Pairs with `_localErrorSeqSync` so `_setErrorStateFromUnknown` can tell
-   * "the Core just published this same failure as a richer error update"
-   * (seq advanced) from "there is a stale remote error, but my current
-   * rejection is unrelated and proxy-side" (seq unchanged).
+   * Monotonic count of non-null `error` values the remote Core PUBLISHED —
+   * i.e. delivered by an `update` frame after the current connection's
+   * initial `sync` snapshot was applied (see `_countsAsCorePublish`).
+   *
+   * Two readers:
+   * - `_setErrorStateFromUnknown` pairs it with `_localErrorSeqSync` to tell
+   *   "the Core just published this same failure as a richer error update"
+   *   (seq advanced) from "there is a stale remote error, but my current
+   *   rejection is unrelated and proxy-side" (seq unchanged).
+   * - An RPC snapshots it when sent (`_coreErrorWindow`), so on rejection
+   *   `_coreErrorPublishedSince` can return the error the Core published
+   *   for THIS call — the 3DS resume classification reads its `code`.
+   *
+   * What is NOT counted, and why (same rule as s3-uploader's counter):
+   * - `null`. The Core clears its slot (`_setError(null)`) at the start of
+   *   a command; that is not a reported failure. Counting it made a resume
+   *   that merely reached the Core read as "the Core answered" even when
+   *   its provider call then failed transiently. (`_setErrorStateFromUnknown`
+   *   is unaffected: it also requires a truthy `_remoteValues.error`, which
+   *   implies the last delivery was non-null.)
+   * - The `sync` snapshot, and any `update` that arrives before it. Both
+   *   describe Core state from BEFORE the producer processed anything this
+   *   connection sent (the producer answers `sync` first, in order), so an
+   *   error they carry is stale for every RPC of this connection —
+   *   including one issued before the snapshot arrived (the pre-sync
+   *   window, see `_observeSyncFrames`).
+   *
+   * Never reset: a reset could make a pre-reset publish look unseen to a
+   * window taken before it. Connection teardown consumes the outstanding
+   * delta into `_localErrorSeqSync` instead, and windows are additionally
+   * scoped to their `RemoteSession`.
    */
   private _remoteErrorSeq: number = 0;
   private _localErrorSeqSync: number = 0;
+  /** The error value whose delivery last advanced `_remoteErrorSeq`. */
+  private _lastPublishedRemoteError: StripeError | null = null;
+  /**
+   * Sync bookkeeping for the current remote connection; `null` while no
+   * proxy is attached. Replaced (never reused) by every `_connectRemote`,
+   * so a late frame from a torn-down transport cannot mark the new
+   * connection synced, and a window taken on one connection never matches
+   * an error published on the next.
+   */
+  private _remoteSession: RemoteSession | null = null;
 
   /**
    * Stripe.js instance + the Elements group scoped to the active intent.
@@ -633,10 +690,7 @@ export class Stripe extends HTMLElementCtor {
       this._proxy = null;
     }
     this._remoteValues = {};
-    // Reset the remote-error seq pairing so a subsequent `_connectRemote`
-    // does not carry a stale delta from the prior session.
-    this._remoteErrorSeq = 0;
-    this._localErrorSeqSync = 0;
+    this._endRemoteSession();
     // Abort lifecycle listeners BEFORE `ws.close()` so a synthetic close
     // event the implementation may fire as a result of our close call
     // cannot re-enter `onFail` and recurse into a second `_disposeRemote`
@@ -699,8 +753,7 @@ export class Stripe extends HTMLElementCtor {
     this._unbind = null;
     this._proxy = null;
     this._remoteValues = {};
-    this._remoteErrorSeq = 0;
-    this._localErrorSeqSync = 0;
+    this._endRemoteSession();
     this._ws = null;
     this._wsListenerAbort = null;
     // Abort the WebSocket lifecycle listeners synchronously so the
@@ -838,6 +891,94 @@ export class Stripe extends HTMLElementCtor {
     this.dispatchEvent(new CustomEvent("stripe-checkout:error", { detail: this.error, bubbles: true }));
   }
 
+  /**
+   * Wrap a client transport so the Shell can see which frames are the
+   * producer's `sync` snapshot. The proxy dispatches a `sync` response's
+   * values synchronously inside the handler call, so flagging the session
+   * around that one call marks exactly those `bind()` deliveries.
+   *
+   * Why the Shell needs to know: an `error` value carried by `sync` is the
+   * Core's state from before the producer processed anything this
+   * connection sent. With the proxy's default (eager) pre-sync behavior a
+   * command issued right after `_connectRemote` — the 3DS resume is one —
+   * goes out BEFORE the snapshot arrives, yet the producer still answers
+   * `sync` first; under `preSyncBehavior: "queue"` the command is sent
+   * right after the snapshot is applied. Either way the moment a command's
+   * Core publishes can start is "after the snapshot", which is what
+   * `_countsAsCorePublish` encodes.
+   *
+   * Transparent otherwise: `send` / `onClose` / `dispose` delegate as
+   * method calls (so `this` binding inside the transport is preserved).
+   */
+  private _observeSyncFrames(transport: ClientTransport, session: RemoteSession): ClientTransport {
+    const observed: ClientTransport = {
+      send: (message) => transport.send(message),
+      onMessage: (handler) => transport.onMessage((message) => {
+        if (message.type !== "sync") {
+          handler(message);
+          return;
+        }
+        session.applyingSync = true;
+        try {
+          handler(message);
+        } finally {
+          session.applyingSync = false;
+          session.synced = true;
+        }
+      }),
+    };
+    if (typeof transport.onClose === "function") {
+      observed.onClose = (handler) => transport.onClose!(handler);
+    }
+    if (typeof transport.dispose === "function") {
+      observed.dispose = () => transport.dispose!();
+    }
+    return observed;
+  }
+
+  /**
+   * True when an `error` delivery on `session` is a Core publish that
+   * `_remoteErrorSeq` counts: a live `update` frame on the current
+   * connection, after its `sync` snapshot was applied.
+   */
+  private _countsAsCorePublish(session: RemoteSession): boolean {
+    return session === this._remoteSession && session.synced && !session.applyingSync;
+  }
+
+  /**
+   * Snapshot taken when an RPC is sent (see `_remoteErrorSeq`). In local
+   * mode there is no `bind()` mirror; the window then has no session and
+   * `_coreErrorPublishedSince` always answers `null`.
+   */
+  private _coreErrorWindow(): CoreErrorWindow {
+    return { session: this._remoteSession, coreErrors: this._remoteErrorSeq };
+  }
+
+  /**
+   * The error the remote Core published on the same connection after
+   * `since` was taken, or `null` if it published none. Neither the `sync`
+   * snapshot nor an error that was already there when the RPC was sent
+   * counts (see `_remoteErrorSeq`). If the connection was torn down or
+   * replaced in between, the answer is `null`: whatever the old Core
+   * published can no longer be paired with the call.
+   */
+  private _coreErrorPublishedSince(since: CoreErrorWindow): StripeError | null {
+    if (since.session === null || since.session !== this._remoteSession) return null;
+    return this._remoteErrorSeq !== since.coreErrors ? this._lastPublishedRemoteError : null;
+  }
+
+  /**
+   * Close the books on the current remote connection. The counter itself
+   * stays monotonic; the outstanding delta is consumed so a subsequent
+   * `_connectRemote` does not inherit "fresh" status for an error the old
+   * connection published.
+   */
+  private _endRemoteSession(): void {
+    this._remoteSession = null;
+    this._localErrorSeqSync = this._remoteErrorSeq;
+    this._lastPublishedRemoteError = null;
+  }
+
   /** @internal — visible for testing */
   _connectRemote(transport: ClientTransport): void {
     // Reject the remote-on-local race symmetric with `attachLocalCore`'s
@@ -851,23 +992,28 @@ export class Stripe extends HTMLElementCtor {
         "_connectRemote called while a local Core is attached; detach the local Core (reset / disconnectedCallback) before connecting remote.",
       );
     }
-    this._proxy = createRemoteCoreProxy(STRIPE_CORE_WC_BINDABLE, transport);
+    // Fresh per connection (see `_remoteSession`). Assigned after the proxy
+    // so a throwing `createRemoteCoreProxy` (its initial `sync` send can
+    // fail) leaves neither field set.
+    const session: RemoteSession = { synced: false, applyingSync: false };
+    this._proxy = createRemoteCoreProxy(STRIPE_CORE_WC_BINDABLE, this._observeSyncFrames(transport, session));
+    this._remoteSession = session;
     this._unbind = bind(this._proxy, (name, value) => {
       this._remoteValues[name] = value;
-      if (name === "error") {
-        // Bump on every error update (even null) so
-        // `_setErrorStateFromUnknown` can pair a subsequent cmd-throw
-        // with its Core-originated publish.
-        this._remoteErrorSeq++;
-        // A truthy remote error supersedes any stale local state — the
-        // Core has asserted authority. A null publish leaves local
-        // alone so a pre-connect transport-level error (set before the
-        // first sync arrived) is not silently cleared by an initial
-        // `error: null` sync.
-        if (value) {
-          this._hasLocalError = false;
-          this._errorState = null;
+      if (name === "error" && value) {
+        // Count a Core publish (see `_remoteErrorSeq` for what is left
+        // out: `null`, the `sync` snapshot, frames before it).
+        if (this._countsAsCorePublish(session)) {
+          this._remoteErrorSeq++;
+          this._lastPublishedRemoteError = value as StripeError;
         }
+        // A truthy remote error — published or synced — supersedes any
+        // stale local state: the Core has asserted authority. A null
+        // delivery leaves local alone so a pre-connect transport-level
+        // error (set before the first sync arrived) is not silently
+        // cleared by an initial `error: null` sync.
+        this._hasLocalError = false;
+        this._errorState = null;
       }
       const prop = Stripe.wcBindable.properties.find(p => p.name === name);
       if (prop) {
@@ -897,7 +1043,7 @@ export class Stripe extends HTMLElementCtor {
     this._maybeAutoPrepare();
   }
 
-  private _setErrorStateFromUnknown(e: unknown): void {
+  private _setErrorStateFromUnknown(e: unknown, since?: CoreErrorWindow): void {
     // In remote mode, a cmd/setWithAck rejection typically travels
     // alongside an `error` property update the Core dispatches before
     // (re-)throwing. The update carries the full sanitized `StripeError`
@@ -909,15 +1055,21 @@ export class Stripe extends HTMLElementCtor {
     // Core-authoritative error.
     //
     // Defer ONLY when the truthy remote error is for *this same failure*
-    // — i.e. `_remoteErrorSeq` has advanced since the last local set.
-    // Otherwise the rejection is a pure proxy-side failure (transport
-    // send throw, invoke timeout) whose error never reached the Core, and
-    // the existing `_remoteValues.error` is stale from an earlier
-    // unrelated Core rejection. In that case fall through to the local
-    // path so the user sees the current failure.
+    // — i.e. the Core published an error since the last local set, or,
+    // when the caller passes the RPC's `since` window, since that RPC was
+    // sent (the tighter test: an error published after the last local set
+    // but before this RPC went out is not this failure either). Otherwise
+    // the rejection is a pure proxy-side failure (transport send throw,
+    // invoke timeout) or a Core rejection that published nothing, and the
+    // existing `_remoteValues.error` is stale — from an earlier unrelated
+    // Core rejection or from the initial `sync` snapshot. In that case
+    // fall through to the local path so the user sees the current failure.
     if (this._isRemote) {
       const remote = this._remoteValues.error as StripeError | null | undefined;
-      if (remote && this._remoteErrorSeq > this._localErrorSeqSync) {
+      const fresh = since
+        ? this._coreErrorPublishedSince(since) !== null
+        : this._remoteErrorSeq > this._localErrorSeqSync;
+      if (remote && fresh) {
         // Consume the freshness so a follow-up proxy-side failure with
         // no new remote publish surfaces locally instead of deferring
         // to this now-stale value.
@@ -2610,104 +2762,48 @@ export class Stripe extends HTMLElementCtor {
     // represents the current config."
     const resumeGen = this._prepareGeneration;
     // Only mark the URL "consumed" when the Core gave a definitive answer
-    // (success or a Core-originated rejection) for THIS resume call.
-    // Transport-level failures (WebSocket close mid-invoke, proxy
-    // timeout, cmd-send throw, a transient 5xx from the server) must
-    // leave `_resumed = false` and the URL params intact so a later
-    // trigger — reconnect, component re-mount, page reload — can retry.
-    // Stripping on transport failure is the path that creates duplicate-
-    // charge exposure: the 3DS flow already cleared at Stripe's end, but
-    // the app would have no way to fold the real intent's terminal state
-    // back into observable state and would auto-prepare a NEW intent for
-    // the same cart.
+    // (success or a decisive rejection, see `_isDecisiveResumeCode`) for
+    // THIS resume call. Everything else — transport-level failures
+    // (WebSocket close mid-invoke, cmd-send throw, a producer-side
+    // rejection), and a Core failure without a taxonomy `code` (provider
+    // `retrieveIntent` could not reach `api.stripe.com`, a validation
+    // throw, a superseded generation) — must leave `_resumed = false` and
+    // the URL params intact so a later trigger — reconnect, component
+    // re-mount, page reload — can retry. Stripping on such a failure is the
+    // path that creates duplicate-charge exposure: the 3DS flow already
+    // cleared at Stripe's end, but the app would have no way to fold the
+    // real intent's terminal state back into observable state and would
+    // auto-prepare a NEW intent for the same cart.
     //
-    // Snapshot `_remoteErrorSeq` BEFORE the await so "Core spoke" is
-    // decided by whether it published any error update during THIS
-    // resume, not by whether some stale error from an earlier operation
-    // is still sitting in `_remoteValues.error`. Checking only
-    // `!!_remoteValues.error` would misclassify a pure cmd-send failure
-    // on a session that already holds an old error as a Core-origin
-    // denial and strip the URL. Mirrors the same seq-based freshness
-    // check used in `_setErrorStateFromUnknown`.
-    const remoteSeqBefore = this._isRemote ? this._remoteErrorSeq : 0;
-    let coreSpoke = false;
+    // Snapshot the Core-error window (remote mode only) right before the
+    // RPC goes out, so the only Core publishes this resume consults are
+    // the ones made AFTER it was sent on this connection. The initial
+    // `sync` snapshot — even when this resume was issued before it
+    // arrived, which is the normal case on a post-redirect page load —
+    // and an error that was already on the session never count (see
+    // `_remoteErrorSeq`). Counting them made a resume that started right
+    // after connect read as "the Core answered" whenever the snapshot
+    // carried an old error.
+    const sent = this._isRemote ? this._coreErrorWindow() : null;
+    let decisive = false;
     try {
       await this._coreResume(intentId, mode, clientSecret);
-      coreSpoke = true;
+      decisive = true;
     } catch (e: unknown) {
-      this._setErrorStateFromUnknown(e);
-      // Code-based classification, shared by both modes (rationale in
-      // the local-mode branch below). Since @wc-bindable/remote 0.10 a
-      // remote rejection carries the producer's string `code` (SPEC-
-      // extensions.md § Error envelope), so a Core denial reaches this
-      // catch with e.g. `code: "resume_client_secret_mismatch"` in remote
-      // mode too. Codes the remote layer synthesizes itself
-      // (`WC_BINDABLE_TIMEOUT` / `_DISPOSED` / `_REMOTE_THROW` /
-      // `_INVALID_JSON_VALUE`, …) are upper-case and never match the
-      // lower-case-only `STRIPE_ERROR_CODE_RE`, so a failure that never
-      // reached the Core still classifies as Transient.
-      const code = (e && typeof e === "object" && typeof (e as { code?: unknown }).code === "string")
-        ? (e as { code: string }).code
-        : "";
-      const isCoreInternalDenial = code === "resume_client_secret_mismatch" || code === "resume_not_authorized";
-      const isStripeTaxonomyCode = code !== "" && STRIPE_ERROR_CODE_RE.test(code);
-      const decisiveCode = isCoreInternalDenial || isStripeTaxonomyCode;
-      if (this._isRemote) {
-        // Core participated in this resume iff at least one `error`
-        // update crossed the wire since we started, OR the rejection
-        // itself carries a decisive Core code. A Core-origin rejection
-        // normally bumps the seq (via `_setError(null)` at the top of
-        // resumeIntent + `_setError(err)` before throwing). The code is
-        // the backstop for a publish this Shell never observed: a
-        // superseded generation skips `_setError`, and the producer drops
-        // an `error` value that is not a JsonValue — which is how a
-        // sanitized error carrying `undefined` members made a decisive
-        // `resource_missing` denial read as transient and re-resume on
-        // every reconnect. A cmd that never reached the Core advances
-        // nothing and carries no such code.
-        coreSpoke = this._remoteErrorSeq > remoteSeqBefore || decisiveCode;
-      } else {
-        // Local mode: distinguish Core-decisive denials from transient
-        // provider failures.
-        //
-        // - "Decisive" = the Core has authoritatively decided this resume
-        //   cannot proceed (clientSecret mismatch, registered authorizer
-        //   said no, Stripe API said the intent does not exist, the
-        //   request was malformed, the API key was rejected, …).
-        //   Stripping the URL is correct: retrying with the same params
-        //   would just hit the same denial. This is also the only path
-        //   that prevents an infinite-retry loop on reload.
-        //
-        // - "Transient" = the Core never reached a decision because a
-        //   downstream call hit a recoverable network failure (provider
-        //   `retrieveIntent` couldn't reach `api.stripe.com`, DNS
-        //   flake, etc.). The URL must be preserved so a later trigger
-        //   — reconnect, page reload — can retry the resume and the
-        //   3DS-completed charge can still be folded back into
-        //   observable state.
-        //
-        // Classification rule:
-        //   - `code` matches the Stripe error-code taxonomy regex
-        //     (`STRIPE_ERROR_CODE_RE`, lowercase + dots, ≤96 chars):
-        //     Stripe-shaped failure — the API responded definitively
-        //     (the request was processed; the answer was an
-        //     application-level reject). Decisive.
-        //   - `code` is one of the Core's own internal denial codes
-        //     (`resume_client_secret_mismatch` / `resume_not_authorized`,
-        //     allowlisted explicitly): Decisive.
-        //   - Otherwise (`code` absent, or a non-taxonomy shape like
-        //     a `StripeConnectionError` whose `code` is undefined):
-        //     network / transport / unknown — Transient.
-        //
-        // Previously this branch only allowlisted the two Core-internal
-        // codes, so a Stripe-API-side `resource_missing` (404 for a
-        // tampered intent id, the Core's `_sanitizeError` forwarded
-        // `code: "resource_missing"`) ended up classified as Transient
-        // and looped forever on reload. Routing through the taxonomy
-        // regex closes that loop AND auto-classifies every future
-        // Stripe-side decisive code without needing a new explicit entry.
-        coreSpoke = decisiveCode;
-      }
+      this._setErrorStateFromUnknown(e, sent ?? undefined);
+      // One rule for both modes: the failure is decisive iff the Core's
+      // answer carries a Stripe-taxonomy `code`. Local mode reads it off
+      // the thrown error. Remote mode reads the same code off the
+      // rejection — since @wc-bindable/remote 0.10 the throw envelope
+      // carries the producer's string `code` — or, as a backstop, off the
+      // error the Core published for this call (its `error` update
+      // precedes the `throw` on the FIFO channel, and an older producer
+      // forwards no `code` on the throw). Remote-layer codes
+      // (`WC_BINDABLE_*`) are upper-case and never match, so a failure
+      // that never reached the Core classifies as transient; so does a
+      // Core failure whose sanitized error has no `code`, in both modes.
+      decisive = Stripe._isDecisiveResumeCode(Stripe._errorCodeOf(e))
+        || (sent !== null && Stripe._isDecisiveResumeCode(this._coreErrorPublishedSince(sent)?.code));
     } finally {
       this._resuming = false;
       // Apply the terminal latch only if THIS resume call still owns the
@@ -2717,14 +2813,48 @@ export class Stripe extends HTMLElementCtor {
       // cleared `_resumed = false` if it was the disconnect path), and
       // re-stamping `_resumed = true` here would silently undo it.
       // Leave the URL intact too — the next connect handles it.
-      if (coreSpoke && resumeGen === this._prepareGeneration) {
+      if (decisive && resumeGen === this._prepareGeneration) {
         this._resumed = true;
         this._stripRedirectParamsFromUrl();
       }
-      // Transport-only failure path: leave `_resumed = false` so the
-      // next trigger (`_connectRemote` after a reconnect, a fresh
+      // Transient failure path: leave `_resumed = false` so the next
+      // trigger (`_connectRemote` after a reconnect, a fresh
       // `connectedCallback` on page reload) picks the URL up again.
     }
+  }
+
+  /** The string `code` a rejection carries, or `undefined`. */
+  private static _errorCodeOf(e: unknown): string | undefined {
+    if (!e || typeof e !== "object") return undefined;
+    const code = (e as { code?: unknown }).code;
+    return typeof code === "string" ? code : undefined;
+  }
+
+  /**
+   * Resume failure classification: is `code` the Core's decisive answer?
+   *
+   * - Decisive = the Core authoritatively decided this resume cannot
+   *   proceed: clientSecret mismatch (`resume_client_secret_mismatch`), the
+   *   registered authorizer said no (`resume_not_authorized`), the Stripe
+   *   API answered with an application-level reject (`resource_missing`
+   *   for a tampered / cancelled intent id, an invalid request, a rejected
+   *   API key, …). Retrying with the same URL params would hit the same
+   *   denial, so the URL is consumed — the only thing that prevents an
+   *   infinite resume loop on reload.
+   * - Anything else is transient: the Core never reached a decision (the
+   *   provider could not reach Stripe — a `StripeConnectionError` has no
+   *   `code` — the cmd never reached the Core, a remote-layer failure).
+   *
+   * The test is the Stripe error-code taxonomy regex (`STRIPE_ERROR_CODE_RE`,
+   * lower-case + `_` / `.`, ≤ 96 chars), which every code the Core's
+   * sanitizer lets through matches — the two Core-internal denial codes
+   * included — so a future Stripe-side decisive code needs no new entry.
+   * Remote-layer codes (`WC_BINDABLE_TIMEOUT`, `_DISPOSED`,
+   * `_REMOTE_THROW`, `_INVALID_JSON_VALUE`, …) are upper-case and never
+   * match.
+   */
+  private static _isDecisiveResumeCode(code: unknown): boolean {
+    return typeof code === "string" && Stripe._STRIPE_ERROR_CODE_RE.test(code);
   }
 
   // --- Lifecycle ---
