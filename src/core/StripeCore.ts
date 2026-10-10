@@ -277,6 +277,26 @@ export class StripeCore extends EventTarget {
    * for ordered eviction, reintroducing the O(n) path we are replacing.
    */
   private _seenWebhookIds: Map<string, true> = new Map();
+  /**
+   * Deliveries whose fold and handlers are still running, keyed by dedup key
+   * (`webhookDedupKey`). A delivery of the same id that arrives meanwhile (a
+   * Stripe retry after a timeout, a resend from the dashboard) waits for this
+   * promise and settles with its outcome (`_joinInflightWebhook`). It does
+   * not run the fold or the handlers again, and it is not answered before the
+   * outcome is known: an early 200 would end Stripe's retries even when the
+   * first delivery then fails.
+   *
+   * The entry is removed when the processing settles, before the promise
+   * itself settles, so a delivery that arrives after a failure is processed
+   * again instead of joining the failed attempt. `dispose()` clears the map.
+   */
+  private _inflightWebhooks: Map<string, Promise<void>> = new Map();
+  /**
+   * One callback per delivery waiting in `_joinInflightWebhook`. `dispose()`
+   * calls them so the waiters reject with the disposed error at once instead
+   * of waiting for a handler of the first delivery that is still running.
+   */
+  private _inflightWebhookWaiters: Set<() => void> = new Set();
 
   /**
    * Tracks the id, mode, and generation of the currently-active intent.
@@ -1702,7 +1722,9 @@ export class StripeCore extends EventTarget {
    * calls (requestIntent / reportConfirmation / cancelIntent / resumeIntent
    * / reset / handleWebhook) `raiseError`, and all in-memory registrations
    * (intent builder, resume authorizer, webhook handlers, webhook dedup
-   * window, active intent) are cleared.
+   * window, in-flight webhook entries, active intent) are cleared. A webhook
+   * delivery that was waiting for an in-flight delivery of the same event
+   * rejects with the disposed error.
    *
    * Secret clearing (SPEC §9.2): dispose also nulls out `_webhookSecret`,
    * `_userContext`, and the `_provider` reference. In a multi-tenant
@@ -1736,6 +1758,12 @@ export class StripeCore extends EventTarget {
     this._resumeAuthorizer = null;
     this._webhookHandlers.clear();
     this._seenWebhookIds.clear();
+    // Deliveries waiting for an in-flight first delivery reject with the
+    // disposed error now (`_joinInflightWebhook`). The first delivery itself
+    // keeps running until its current handler returns, as before.
+    this._inflightWebhooks.clear();
+    for (const release of this._inflightWebhookWaiters) release();
+    this._inflightWebhookWaiters.clear();
     // Drop secrets and the provider reference. The `_disposed` flag checked
     // at the top of every public command ensures none of these fields are
     // dereferenced after this point; the null assertion on `_provider` is
@@ -1772,6 +1800,17 @@ export class StripeCore extends EventTarget {
    * deduped`). Any other `id` (empty, whitespace-only, missing, or not a
    * string, such as a number or an object) bypasses dedup: the event is
    * processed on every delivery and is never recorded.
+   *
+   * In-flight duplicates (SPEC §6.2): a delivery of an id whose first
+   * delivery is still running is signature- and shape-checked as usual,
+   * then waits for the first delivery and settles the same way. It runs
+   * neither the fold nor the handlers. If the first resolves, so does the
+   * duplicate (and `webhook-deduped` fires for it); if the first rejects,
+   * the duplicate rejects with the same error, so the route answers 500 to
+   * both and Stripe retries. If the Core is disposed while it waits, the
+   * duplicate rejects with the disposed error at once. Consequence: a
+   * handler must not await `handleWebhook` for its own event; that call
+   * would wait for the handler itself.
    *
    * HTTP status for the route (SPEC §6.2): Stripe retries every non-2xx
    * response, 4xx included, so the code is a diagnostic, not a retry
@@ -1875,9 +1914,11 @@ export class StripeCore extends EventTarget {
     // Dedup-bypass contract: only an `id` that is a non-blank string is a
     // dedup key (`webhookDedupKey`). An empty, whitespace-only, missing or
     // non-string `id` (a number, an object, …) bypasses dedup entirely:
-    // the membership check, the insertion and the fatal-throw eviction
-    // below all use the same key, so such an event runs handlers on every
-    // retry and never takes a slot in the window. The default
+    // the in-flight lookup, the membership check, the insertion and the
+    // fatal-throw eviction (`_processWebhookEvent`) all use the same key, so
+    // such an event runs handlers on every retry, never takes a slot in the
+    // window, and is never in flight: concurrent deliveries of it run in
+    // parallel. The default
     // `StripeSdkProvider.verifyWebhook` raises on a non-string, empty or
     // whitespace-only id (the same rule; see provider for the `event.id`
     // check), but CUSTOM
@@ -1889,37 +1930,113 @@ export class StripeCore extends EventTarget {
     // replaying historical events from a backup queue); for now the
     // JSDoc is the contract.
     const dedupKey = webhookDedupKey(event.id);
-    if (dedupKey !== null && this._seenWebhookIds.has(dedupKey)) {
-      this._target.dispatchEvent(new CustomEvent("stripe-checkout:webhook-deduped", {
-        detail: { eventId: dedupKey, type: event.type },
-        bubbles: true,
-      }));
+    if (dedupKey === null) {
+      await this._processWebhookEvent(event, null);
       return;
     }
-    if (dedupKey !== null) {
-      this._seenWebhookIds.set(dedupKey, true);
-      // Eviction: Map preserves insertion order, so `keys().next().value`
-      // is the oldest id. `delete` is O(1). The old Set+Array pair used
-      // `shift()` on the Array which is O(n); this branch stays O(1)
-      // even at `_MAX_WEBHOOK_DEDUP_CAPACITY = 1_000_000`.
-      //
-      // `while` instead of `if`: with the current code path the size can
-      // only ever exceed capacity by 1 per call (we just inserted one
-      // entry), so a single delete keeps the invariant. But a future
-      // refactor — e.g. exposing a setter that shrinks
-      // `_webhookDedupCapacity` at runtime, or restoring entries from a
-      // persisted dedup state — could leave `size` more than 1 over
-      // capacity at entry. Looping costs nothing in the common case (the
-      // condition is false on the second iteration) and turns the
-      // invariant from "true on every code path today" into "true after
-      // this block runs, regardless of how we got here".
-      while (this._seenWebhookIds.size > this._webhookDedupCapacity) {
-        const oldest = this._seenWebhookIds.keys().next().value;
-        if (oldest === undefined) break;
-        this._seenWebhookIds.delete(oldest);
-      }
+    // In-flight duplicate: the first delivery of this id is still running
+    // its fold or handlers. Checked before the window, which already holds
+    // the id. Answering 200 here would end Stripe's retries before the
+    // outcome is known: if the first delivery then failed, its id would
+    // leave the window but no retry would come. The duplicate settles with
+    // the first delivery's outcome instead (`_joinInflightWebhook`).
+    const inflight = this._inflightWebhooks.get(dedupKey);
+    if (inflight !== undefined) {
+      await this._joinInflightWebhook(inflight, dedupKey, event.type);
+      return;
+    }
+    if (this._seenWebhookIds.has(dedupKey)) {
+      this._dispatchWebhookDeduped(dedupKey, event.type);
+      return;
+    }
+    this._seenWebhookIds.set(dedupKey, true);
+    // Eviction: Map preserves insertion order, so `keys().next().value`
+    // is the oldest id. `delete` is O(1). The old Set+Array pair used
+    // `shift()` on the Array which is O(n); this branch stays O(1)
+    // even at `_MAX_WEBHOOK_DEDUP_CAPACITY = 1_000_000`.
+    //
+    // `while` instead of `if`: with the current code path the size can
+    // only ever exceed capacity by 1 per call (we just inserted one
+    // entry), so a single delete keeps the invariant. But a future
+    // refactor — e.g. exposing a setter that shrinks
+    // `_webhookDedupCapacity` at runtime, or restoring entries from a
+    // persisted dedup state — could leave `size` more than 1 over
+    // capacity at entry. Looping costs nothing in the common case (the
+    // condition is false on the second iteration) and turns the
+    // invariant from "true on every code path today" into "true after
+    // this block runs, regardless of how we got here".
+    //
+    // An in-flight id evicted here is still caught by `_inflightWebhooks`.
+    while (this._seenWebhookIds.size > this._webhookDedupCapacity) {
+      const oldest = this._seenWebhookIds.keys().next().value;
+      if (oldest === undefined) break;
+      this._seenWebhookIds.delete(oldest);
     }
 
+    // The in-flight entry is in place before any handler runs:
+    // `_processWebhookEvent` runs synchronously only up to the fold's first
+    // `await`, and the handlers come after it. `finally` removes it before
+    // `processing` settles, so whoever awaits `processing` (this delivery,
+    // its waiters, the route) already sees the map without it: a delivery
+    // after a failure is processed again rather than joining the failure.
+    // The identity check keeps a late cleanup from removing a newer entry
+    // (only `dispose()` clears the map while an entry is in flight, and a
+    // disposed Core accepts no new delivery, so today it is defensive).
+    const processing: Promise<void> = this._processWebhookEvent(event, dedupKey).finally(() => {
+      if (this._inflightWebhooks.get(dedupKey) === processing) this._inflightWebhooks.delete(dedupKey);
+    });
+    this._inflightWebhooks.set(dedupKey, processing);
+    await processing;
+  }
+
+  /**
+   * Settles a delivery whose id is in flight (`_inflightWebhooks`) with the
+   * first delivery's outcome, without running the fold or the handlers
+   * (SPEC §6.2). Resolves when the first resolves, dispatching
+   * `stripe-checkout:webhook-deduped` as for any suppressed duplicate.
+   * Rejects with the first delivery's error when it rejects. Either way the
+   * route answers this delivery as it answers the first one: a failure is
+   * a 500 for both, and Stripe retries.
+   *
+   * A disposed Core cannot vouch for the event: once `dispose()` has run,
+   * the waiter rejects with the disposed error, the same one a delivery
+   * arriving after dispose gets. `dispose()` releases waiters at once
+   * (`_inflightWebhookWaiters`), without waiting for a handler of the first
+   * delivery that is still running.
+   *
+   * The per-waiter `disposed` promise, instead of one shared per Core,
+   * keeps `Promise.race` from piling reactions onto a promise that lives
+   * as long as the Core.
+   */
+  private async _joinInflightWebhook(processing: Promise<void>, dedupKey: string, type: string): Promise<void> {
+    let releaseOnDispose!: () => void;
+    const disposed = new Promise<void>((resolve) => { releaseOnDispose = resolve; });
+    this._inflightWebhookWaiters.add(releaseOnDispose);
+    let failure: { error: unknown } | null = null;
+    try {
+      await Promise.race([processing, disposed]);
+    } catch (e: unknown) {
+      failure = { error: e };
+    }
+    this._inflightWebhookWaiters.delete(releaseOnDispose);
+    if (this._disposed) raiseError("StripeCore has been disposed.");
+    if (failure !== null) throw failure.error;
+    this._dispatchWebhookDeduped(dedupKey, type);
+  }
+
+  private _dispatchWebhookDeduped(eventId: string, type: string): void {
+    this._target.dispatchEvent(new CustomEvent("stripe-checkout:webhook-deduped", {
+      detail: { eventId, type },
+      bubbles: true,
+    }));
+  }
+
+  /**
+   * The fold and the registered handlers for one delivery: the part of
+   * `handleWebhook` that a duplicate of an in-flight delivery does not run.
+   * `dedupKey` is `null` for an event that bypasses dedup.
+   */
+  private async _processWebhookEvent(event: StripeEvent, dedupKey: string | null): Promise<void> {
     // Reflect common event types into observable state BEFORE app handlers.
     // Trade-off: if a fatal handler throws, UI may transiently observe a
     // terminal state (e.g. succeeded) while the webhook HTTP route returns

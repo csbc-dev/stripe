@@ -349,6 +349,10 @@ class StripeCore extends EventTarget {
     *
     * fatal handler が throw した場合は、当該 `event.id` を dedup window から
     * evict して re-throw する。これにより HTTP 5xx + Stripe retry で再配送可能。
+    *
+    * 最初の配送の fold か handler がまだ走っている間に同じ `event.id` が届いたら、
+    * その配送は署名と形の検証を通ったあと最初の配送の結果を待ち、同じ結果で
+    * resolve / reject する。fold も handler も走らせない(下の「処理中の重複」)。
    */
   registerWebhookHandler(type: string, handler: WebhookHandler, opts?: WebhookRegisterOptions): () => void;
 
@@ -375,6 +379,7 @@ class StripeCore extends EventTarget {
   * 署名検証 → event の形の検証 → dedup → status fold → 登録済み handler 実行。
   * resolve / reject するのは handler(fatal / non-fatal とも)をすべて実行し終えた後で、
   * HTTP ルートはその結果で応答する(下の「処理してから応答する設計」)。
+  * 同じ id の配送が処理中なら、dedup の段で最初の配送の結果を待ち、同じ結果で終わる。
    */
   handleWebhook(rawBody: string | Buffer | Uint8Array, signatureHeader: string): Promise<void>;
 }
@@ -386,9 +391,9 @@ class StripeCore extends EventTarget {
 
 | `handleWebhook` の結果 | 応答 | 理由 |
 |---|---|---|
-| resolve(dedup で抑止された重複を含む) | 200 | 配送完了。Stripe の再送が止まる |
+| resolve(dedup で抑止された重複、最初の配送が成功した処理中の重複を含む) | 200 | 配送完了。Stripe の再送が止まる |
 | `stripe-signature` ヘッダが無い、または署名検証の失敗(`StripeSignatureVerificationError`) | 400 | Stripe の例と同じ。偽造は Stripe の配送ではないので再送されない。本物の配送なら signing secret か raw body の誤りで、Stripe が再送を続けるので、直せば通る |
-| それ以外の reject(fatal handler の throw、`[@csbc-dev/stripe]` で始まる入力・設定・provider の形の不正、dispose 済みの Core) | 500 | サーバー側の失敗。Stripe が再送するので、原因を直せば同じ event が処理される |
+| それ以外の reject(fatal handler の throw、`[@csbc-dev/stripe]` で始まる入力・設定・provider の形の不正、dispose 済みの Core。処理中の重複は最初の配送と同じエラー、待っている間に dispose されたら dispose 済みのエラー) | 500 | サーバー側の失敗。Stripe が再送するので、原因を直せば同じ event が処理される |
 
 署名検証の失敗と形の不正が observable state・handler・dedup window に触れないのは、この再送で同じ event id が届いたときに通常どおり処理するためである。失敗した配送に 2xx を返してはならない(event が ack され再送が終わる)。失敗が数日続くエンドポイントは Stripe に無効化されるので、500 はログに流して監視する。
 
@@ -398,13 +403,21 @@ class StripeCore extends EventTarget {
 
 - **失敗を確実に Stripe の再送に乗せる。** fatal handler の失敗はそのまま 500 になり、Stripe が再送する(live モードで最大 3 日間)。先に 2xx を返すと、その時点で event は配送済みになり、後で handler が失敗しても Stripe は再送しない。応答コードが処理の結果を表すので、Event deliveries タブの `Failed` が「まだ処理できていない event」と一致する。
 - **アプリにキューや再処理の仕組みを要求しない。** 再送を待つ行列は Stripe 側にある。失敗した event を保存して後から処理し直すジョブ、dead letter、その監視を、webhook の失敗のためにアプリが持たなくてよい。Core も永続化を持たない(dedup window はプロセス内のメモリだけ)。
-- **dedup と組み合わせて at-least-once で収束する。** fatal handler が throw すると Core はその `event.id` を dedup window から外すので、再送は最初から処理される。成功した event の id は window に残るので、同じプロセスに届いた再送(タイムアウト後の再送、ダッシュボードからの再送)は fold も handler も走らせずに 200 で終わる。別のプロセスや再起動後に届いた再送は、handler 側の `event.id` による冪等化が吸収する。原因が Stripe の再送期間のうちに直れば、各 event の fatal handler は少なくとも 1 回成功し、重複した配送の副作用は dedup と冪等化で打ち消される(例外は下の「処理中の重複」)。
+- **dedup と組み合わせて at-least-once で収束する。** fatal handler が throw すると Core はその `event.id` を dedup window から外すので、再送は最初から処理される。成功した event の id は window に残るので、処理を終えた後に同じプロセスに届いた再送(タイムアウト後の再送、ダッシュボードからの再送)は fold も handler も走らせずに 200 で終わる。処理中に届いた再送は、最初の配送の結果を待って同じ応答になる(下の「処理中の重複」)。別のプロセスや再起動後に届いた再送は、handler 側の `event.id` による冪等化が吸収する。原因が Stripe の再送期間のうちに直れば、各 event の fatal handler は少なくとも 1 回成功し、重複した配送の副作用は dedup と冪等化で打ち消される。
+
+**処理中の重複は最初の配送の結果を待つ**: 最初の配送の fold か handler がまだ走っている間に、同じ `event.id` の配送が同じプロセスに届くことがある(handler が遅く Stripe がタイムアウトとして再送したとき、ダッシュボードから再送したとき)。タイムアウトした配送は Stripe からは失敗に見えるので、Stripe が結果として受け取るのは再送への応答である。そのため再送への応答は最初の配送の結果を表さなければならない。この配送も署名検証と形の検証は通常どおり受け(失敗すればその場で reject する。上の表の 400 / 500)、通過したら最初の配送の結果を待って同じ結果で終わる。fold も handler も走らせない。
+
+- 最初の配送が resolve したら、重複も resolve する(200)。`stripe-checkout:webhook-deduped` はこのとき重複ごとに 1 回出る。id は window に残るので、以後の重複はすぐに 200 で終わる。non-fatal handler の throw は配送の失敗ではないので、この場合に当たる。
+- 最初の配送が reject したら(fatal handler の throw)、重複も同じエラーで reject する(500)。id は window から外れるので、どちらの配送も Stripe が再送し、次に届いた配送は最初から処理される。
+- 待っている間に Core が `dispose()` されたら、重複はすぐに dispose 済みのエラー(`[@csbc-dev/stripe] StripeCore has been disposed.`)で reject する(500)。最初の配送の handler が終わるのは待たない。dispose 済みの Core は event を処理したと保証できないので、最初の配送がどう終わってもこの結果になる。
+- 同時に待つ重複がいくつあっても、すべて同じ結果で終わる。処理中の記録は、最初の配送の成功・失敗と `dispose()` のどれでも消える。
+- dedup の対象外の id(空文字・空白だけ・欠落・文字列でない値)は待ち合わせない。同時に届いた配送はそれぞれ fold と handler を並列に走らせる(従来どおり)。
+- handler の中から同じ event で `handleWebhook` を呼んで await してはならない。その呼び出しは handler 自身が終わるのを待つので、どちらも終わらない。
 
 代償:
 
-- **応答時間が処理時間になる。** handler が遅いと Stripe は応答を待ちきれずにタイムアウトとし(Event deliveries の `(Timed out) ERR`)、配送失敗として再送する([Fix HTTP status codes](https://docs.stripe.com/webhooks#fix-http-status-codes))。handler が最後には成功していても、その配送は失敗の扱いである。Stripe が何秒待つかは、ここで引用したページには書かれていない。
+- **応答時間が処理時間になる。** handler が遅いと Stripe は応答を待ちきれずにタイムアウトとし(Event deliveries の `(Timed out) ERR`)、配送失敗として再送する([Fix HTTP status codes](https://docs.stripe.com/webhooks#fix-http-status-codes))。handler が最後には成功していても、その配送は失敗の扱いである。Stripe が何秒待つかは、ここで引用したページには書かれていない。処理中の重複への応答も、最初の配送の処理が終わるまで待つ(上の「処理中の重複」)。そのため、まだ処理中の配送に当たった再送もタイムアウトしうる。最初の配送が終われば、次の再送は、成功していれば dedup ですぐに 200 で終わり、失敗していれば最初から処理される。
 - **失敗が続くとエンドポイントが無効化される。** 数日にわたって応答しない、またはエラーを返し続けるエンドポイントについて、Stripe は配送をやめ、webhook の設定でそのエンドポイントを無効にする([Why is Stripe trying to reach my webhook endpoints?](https://support.stripe.com/questions/why-is-stripe-trying-to-reach-my-webhook-endpoints))。毎回タイムアウトする遅い handler もこれに当たる。無効になると、そのエンドポイントで受けていた他の種類の event も届かなくなる。
-- **処理中の重複は ack される。** dedup window への登録は fold と handler の前に行う。そのため、最初の配送の handler がまだ走っている間に同じ id が同じプロセスに届くと(タイムアウト後の再送、ダッシュボードからの再送)、その配送は dedup で抑止され 200 で終わる。その後で最初の配送の fatal handler が throw すると、id は window から外れるが、Stripe はその event の 2xx をすでに受け取っているので自動の再送は終わる。取りこぼした event は、ダッシュボード(event の作成から 15 日まで)か Stripe CLI(30 日まで)から手で再送する([Manual retries](https://docs.stripe.com/webhooks#manual-retries))。これが起きるのは handler が次の配送が届くまで走り続けたときだけなので、handler を短く保つことが対策になる。
 
 推奨:
 
@@ -435,7 +448,7 @@ UI の即時反映を優先しつつ、配送確定(ack)の最終判定は handl
 - B (`succeeded` 配送) が interleave し `retrieveIntent` await 中
 - C (`processing` もう 1 件) が Flow A のあと着弾 → 古いステータスで上書きしうる
 
-Express デフォルト / 単一プロセス Node の request 直列化運用では顕在化しないが、**高並列 HTTP フレームワーク利用時は HTTP ルート側で webhook を intent-id 単位にシリアライズすることを推奨** (単純には Mutex / in-memory queue、水平スケール時は DB 行ロック or Stripe の `event.id` を key にしたキュー消化)。Core 側は **シリアライズ済み配送を前提に fold 正当性を保証**している。並列配送対応の per-intent-id mutex を Core に内蔵する案は v1 スコープ外 — アプリ側の運用層で解決する。
+同じ `event.id` の配送どうしは Core が待ち合わせる(上の「処理中の重複」)ので、ここで問題になるのは別々の event である。Express デフォルト / 単一プロセス Node の request 直列化運用では顕在化しないが、**高並列 HTTP フレームワーク利用時は HTTP ルート側で webhook を intent-id 単位にシリアライズすることを推奨** (単純には Mutex / in-memory queue、水平スケール時は DB 行ロック or Stripe の `event.id` を key にしたキュー消化)。Core 側は **シリアライズ済み配送を前提に fold 正当性を保証**している。並列配送対応の per-intent-id mutex を Core に内蔵する案は v1 スコープ外 — アプリ側の運用層で解決する。
 
 ### 6.4 `reportConfirmation` の paymentMethod 補完
 
@@ -537,7 +550,7 @@ Stripe.js の契約上、`confirmPayment` / `confirmSetup` の戻り値は `{ pa
 - `stripe-checkout:dispose-warning` — remote モードの disconnect 時 best-effort cleanup (`cancelIntent` / `reset` / `unbind` / `proxy.dispose` / `ws.close`) が失敗したときに、`detail: { phase, error }` で通知。要素は DOM-detached 直前のため、`el.addEventListener` で先行登録された listener (テスト / オブザーバビリティ) のみが受け取る
 
 **Core (`StripeCore` の EventTarget) 経由で dispatch されるもの:**
-- `stripe-checkout:webhook-deduped` — 同一 `event.id` の webhook が dedup window でスキップされたとき。`detail: { eventId, type }`
+- `stripe-checkout:webhook-deduped` — 同一 `event.id` の webhook が dedup window でスキップされたとき、および処理中の最初の配送を待った重複が、その成功を受けて resolve するとき(§6.2「処理中の重複」)。`detail: { eventId, type }`
 - `stripe-checkout:webhook-warning` — `fatal: false` で登録された webhook handler が throw したとき。`detail: { error, event }`
 - `stripe-checkout:authorizer-error` — `registerResumeAuthorizer` が登録した authorizer が throw したとき。`detail: { error, intentId, mode }` (server-side 運用者向け; 生例外は wire には流さず denial として扱う)
 - `stripe-checkout:unknown-status` — Core 側の `_reconcileFromIntentView` が未知 Stripe status を観測したとき。`detail: { source: "core", intentId, mode, status }`。retrieve の `status` が文字列でなかった場合(custom provider の数値・object・`null`・欠落など)は、その値を detail に載せず `status: ""` とし、`reason: "retrieveIntent returned a non-string status (<型名>)."`(型名は `number` / `object` / `array` / `null` / `undefined` など)を付ける。local モードではこの detail が要素の CustomEvent として観測されるため、provider の値そのものは入れない

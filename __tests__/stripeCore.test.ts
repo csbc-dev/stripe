@@ -1655,6 +1655,292 @@ describe("StripeCore", () => {
       });
     });
 
+    describe("a duplicate that arrives while the first delivery is still running waits for its outcome (regression: it was answered at once)", () => {
+      // The dedup entry is recorded before the fold and the handlers run. A
+      // delivery of the same id that reached the same process meanwhile (a
+      // Stripe retry after a timeout, a resend from the dashboard) resolved
+      // at once as a duplicate, so the route answered 200. If the first
+      // delivery's fatal handler then threw, the id left the window, but
+      // Stripe had its 2xx and stopped retrying: the event was lost. Now the
+      // duplicate waits for the first delivery and settles with its outcome.
+
+      type Internals = {
+        _seenWebhookIds: Map<string, true>;
+        _inflightWebhooks: Map<string, Promise<void>>;
+        _inflightWebhookWaiters: Set<() => void>;
+      };
+      const internals = (c: StripeCore): Internals => c as unknown as Internals;
+
+      /** A handler whose every call parks until the test settles it. */
+      function parkedHandler() {
+        const calls: { resolve: () => void; reject: (e: unknown) => void }[] = [];
+        const handler = () => new Promise<void>((resolve, reject) => { calls.push({ resolve, reject }); });
+        return { handler, calls };
+      }
+
+      /** Observes whether a promise has settled without awaiting it. */
+      function track(promise: Promise<void>) {
+        const state = { promise, settled: false };
+        promise.then(() => { state.settled = true; }, () => { state.settled = true; });
+        return state;
+      }
+
+      const flush = () => new Promise<void>((r) => setTimeout(r, 0));
+
+      function deliver(id: unknown, type = "x.y"): void {
+        provider.verifyWebhook = () => ({ id, type, data: { object: {} }, created: 1 } as unknown as StripeEvent);
+      }
+
+      function collectDeduped(c: StripeCore): unknown[] {
+        const deduped: unknown[] = [];
+        c.addEventListener("stripe-checkout:webhook-deduped", (e) => deduped.push((e as CustomEvent).detail));
+        return deduped;
+      }
+
+      it("first succeeds: the duplicate stays pending until then, resolves too, and runs neither the fold nor the handler", async () => {
+        core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+        await core.requestIntent({ mode: "payment", hint: {} });
+        const parked = parkedHandler();
+        core.registerWebhookHandler("payment_intent.succeeded", parked.handler);
+        const deduped = collectDeduped(core);
+        // No payment_method on the event, so the fold calls retrieveIntent once per run.
+        provider.webhookEvent = {
+          id: "evt_inflight",
+          type: "payment_intent.succeeded",
+          created: 1,
+          data: { object: { id: "pi_123", status: "succeeded" } },
+        };
+
+        const first = track(core.handleWebhook("raw", "sig"));
+        await flush();
+        expect(parked.calls).toHaveLength(1);
+        const dup = track(core.handleWebhook("raw", "sig"));
+        await flush();
+        expect(dup.settled).toBe(false);
+        expect(first.settled).toBe(false);
+        expect(deduped).toEqual([]);
+        expect(internals(core)._inflightWebhooks.size).toBe(1);
+
+        parked.calls[0].resolve();
+        await first.promise;
+        await dup.promise;
+
+        expect(parked.calls).toHaveLength(1);
+        expect(provider.retrieveCalls).toHaveLength(1);
+        expect(core.status).toBe("succeeded");
+        expect(deduped).toEqual([{ eventId: "evt_inflight", type: "payment_intent.succeeded" }]);
+        expect([...internals(core)._seenWebhookIds.keys()]).toEqual(["evt_inflight"]);
+        expect(internals(core)._inflightWebhooks.size).toBe(0);
+        expect(internals(core)._inflightWebhookWaiters.size).toBe(0);
+      });
+
+      it("first fails in a fatal handler: the duplicate rejects with the same error, the id leaves the window, and the retry is processed again", async () => {
+        const parked = parkedHandler();
+        core.registerWebhookHandler("x.y", parked.handler, { fatal: true });
+        const deduped = collectDeduped(core);
+        deliver("evt_inflight_fatal");
+
+        const first = track(core.handleWebhook("raw", "sig"));
+        await flush();
+        const dup = track(core.handleWebhook("raw", "sig"));
+        await flush();
+        expect(dup.settled).toBe(false);
+
+        const failure = new Error("transient DB lock");
+        parked.calls[0].reject(failure);
+        await expect(first.promise).rejects.toBe(failure);
+        await expect(dup.promise).rejects.toBe(failure);
+
+        expect(parked.calls).toHaveLength(1);
+        expect(deduped).toEqual([]);
+        expect(internals(core)._seenWebhookIds.has("evt_inflight_fatal")).toBe(false);
+        expect(internals(core)._inflightWebhooks.size).toBe(0);
+        expect(internals(core)._inflightWebhookWaiters.size).toBe(0);
+
+        // Stripe retries both failed deliveries; the next one runs the handler again.
+        const retry = core.handleWebhook("raw", "sig");
+        await flush();
+        expect(parked.calls).toHaveLength(2);
+        parked.calls[1].resolve();
+        await retry;
+        expect(internals(core)._seenWebhookIds.has("evt_inflight_fatal")).toBe(true);
+        expect(internals(core)._inflightWebhooks.size).toBe(0);
+      });
+
+      it("first fails in a non-fatal handler: both resolve, the warning fires once, and the id stays in the window", async () => {
+        const parked = parkedHandler();
+        core.registerWebhookHandler("x.y", parked.handler, { fatal: false });
+        const deduped = collectDeduped(core);
+        const warnings: unknown[] = [];
+        core.addEventListener("stripe-checkout:webhook-warning", (e) => warnings.push((e as CustomEvent).detail));
+        deliver("evt_inflight_nonfatal");
+
+        const first = track(core.handleWebhook("raw", "sig"));
+        await flush();
+        const dup = track(core.handleWebhook("raw", "sig"));
+        await flush();
+        expect(dup.settled).toBe(false);
+
+        parked.calls[0].reject(new Error("audit log down"));
+        await first.promise;
+        await dup.promise;
+
+        expect(parked.calls).toHaveLength(1);
+        expect(warnings).toHaveLength(1);
+        expect(deduped).toEqual([{ eventId: "evt_inflight_nonfatal", type: "x.y" }]);
+        expect(internals(core)._seenWebhookIds.has("evt_inflight_nonfatal")).toBe(true);
+        expect(internals(core)._inflightWebhooks.size).toBe(0);
+      });
+
+      it.each([
+        ["succeeds", true],
+        ["fails in a fatal handler", false],
+      ])("three duplicates in flight at once all settle like the first when it %s", async (_label, succeeds) => {
+        const parked = parkedHandler();
+        core.registerWebhookHandler("x.y", parked.handler);
+        const deduped = collectDeduped(core);
+        deliver("evt_inflight_many");
+
+        const first = track(core.handleWebhook("raw", "sig"));
+        await flush();
+        const dups = [track(core.handleWebhook("raw", "sig")), track(core.handleWebhook("raw", "sig")), track(core.handleWebhook("raw", "sig"))];
+        await flush();
+        expect(dups.map((d) => d.settled)).toEqual([false, false, false]);
+        expect(internals(core)._inflightWebhooks.size).toBe(1);
+        expect(internals(core)._inflightWebhookWaiters.size).toBe(3);
+
+        const failure = new Error("fulfillment db timeout");
+        if (succeeds) parked.calls[0].resolve();
+        else parked.calls[0].reject(failure);
+        for (const d of [first, ...dups]) {
+          if (succeeds) await expect(d.promise).resolves.toBeUndefined();
+          else await expect(d.promise).rejects.toBe(failure);
+        }
+
+        expect(parked.calls).toHaveLength(1);
+        expect(deduped).toHaveLength(succeeds ? 3 : 0);
+        expect(internals(core)._seenWebhookIds.has("evt_inflight_many")).toBe(succeeds);
+        expect(internals(core)._inflightWebhooks.size).toBe(0);
+        expect(internals(core)._inflightWebhookWaiters.size).toBe(0);
+      });
+
+      it("after the first succeeded, a duplicate resolves at once, even while another event is still in flight", async () => {
+        const parked = parkedHandler();
+        core.registerWebhookHandler("x.y", parked.handler);
+        const deduped = collectDeduped(core);
+
+        deliver("evt_done");
+        const done = core.handleWebhook("raw", "sig");
+        await flush();
+        parked.calls[0].resolve();
+        await done;
+
+        // A different id parks in its handler; it holds nothing up for evt_done.
+        deliver("evt_other");
+        const other = track(core.handleWebhook("raw", "sig"));
+        await flush();
+        expect(parked.calls).toHaveLength(2);
+
+        deliver("evt_done");
+        await core.handleWebhook("raw", "sig");
+        expect(parked.calls).toHaveLength(2);
+        expect(deduped).toEqual([{ eventId: "evt_done", type: "x.y" }]);
+        expect(other.settled).toBe(false);
+
+        parked.calls[1].resolve();
+        await other.promise;
+        expect(internals(core)._inflightWebhooks.size).toBe(0);
+      });
+
+      it("a duplicate is still signature- and shape-checked first: a failure there rejects at once without waiting", async () => {
+        const parked = parkedHandler();
+        core.registerWebhookHandler("x.y", parked.handler);
+        deliver("evt_inflight_checked");
+        const first = track(core.handleWebhook("raw", "sig"));
+        await flush();
+
+        const badSignature = Object.assign(new Error("No signatures found"), { type: "StripeSignatureVerificationError" });
+        provider.verifyWebhook = () => { throw badSignature; };
+        await expect(core.handleWebhook("raw", "sig")).rejects.toBe(badSignature);
+        provider.verifyWebhook = () => ({ id: "evt_inflight_checked", type: "x.y", data: null, created: 1 } as unknown as StripeEvent);
+        await expect(core.handleWebhook("raw", "sig")).rejects.toThrow(/did not return a valid event: data is not an object \(null\)/);
+
+        expect(first.settled).toBe(false);
+        expect(internals(core)._inflightWebhookWaiters.size).toBe(0);
+        parked.calls[0].resolve();
+        await first.promise;
+        expect(parked.calls).toHaveLength(1);
+        expect(internals(core)._inflightWebhooks.size).toBe(0);
+      });
+
+      it("dispose while duplicates wait: they reject with the disposed error at once and the in-flight state is cleared", async () => {
+        const parked = parkedHandler();
+        core.registerWebhookHandler("x.y", parked.handler);
+        deliver("evt_inflight_dispose");
+
+        const first = track(core.handleWebhook("raw", "sig"));
+        await flush();
+        const dups = [track(core.handleWebhook("raw", "sig")), track(core.handleWebhook("raw", "sig"))];
+        await flush();
+        expect(dups.map((d) => d.settled)).toEqual([false, false]);
+
+        core.dispose();
+        expect(internals(core)._inflightWebhooks.size).toBe(0);
+        expect(internals(core)._inflightWebhookWaiters.size).toBe(0);
+        // The first delivery's handler is still parked; the waiters do not wait for it.
+        for (const d of dups) await expect(d.promise).rejects.toThrow("[@csbc-dev/stripe] StripeCore has been disposed.");
+        expect(first.settled).toBe(false);
+
+        parked.calls[0].resolve();
+        await first.promise;
+        expect(parked.calls).toHaveLength(1);
+        expect(internals(core)._inflightWebhooks.size).toBe(0);
+      });
+
+      it("dispose, then the first delivery's fatal handler throws: the waiter gets the disposed error, not the throw", async () => {
+        // A disposed Core cannot vouch for the event, so the waiter's answer
+        // is the dispose even though the first delivery ends in a throw.
+        const parked = parkedHandler();
+        core.registerWebhookHandler("x.y", parked.handler, { fatal: true });
+        deliver("evt_inflight_dispose_fatal");
+        const first = track(core.handleWebhook("raw", "sig"));
+        await flush();
+        const dup = track(core.handleWebhook("raw", "sig"));
+        await flush();
+
+        core.dispose();
+        const failure = new Error("handler failed after dispose");
+        parked.calls[0].reject(failure);
+        await expect(first.promise).rejects.toBe(failure);
+        await expect(dup.promise).rejects.toThrow(/StripeCore has been disposed/);
+        expect(internals(core)._inflightWebhooks.size).toBe(0);
+        expect(internals(core)._inflightWebhookWaiters.size).toBe(0);
+      });
+
+      it.each([
+        ["an empty string", ""],
+        ["a whitespace-only string", "  "],
+        ["a number", 42],
+      ])("an id that is %s still bypasses dedup: concurrent deliveries run in parallel", async (_label, id) => {
+        const parked = parkedHandler();
+        core.registerWebhookHandler("x.y", parked.handler);
+        deliver(id);
+
+        const a = track(core.handleWebhook("raw", "sig"));
+        const b = track(core.handleWebhook("raw", "sig"));
+        await flush();
+        expect(parked.calls).toHaveLength(2);
+        expect(internals(core)._inflightWebhooks.size).toBe(0);
+
+        parked.calls[1].resolve();
+        await b.promise;
+        expect(a.settled).toBe(false);
+        parked.calls[0].resolve();
+        await a.promise;
+        expect(internals(core)._seenWebhookIds.size).toBe(0);
+      });
+    });
+
     it("cross-mode fold defense: setup_intent.* event with matching id does NOT flip a payment-mode active intent", async () => {
       // Stripe uses type-prefixed ids (`pi_` / `seti_`) so a colliding id
       // across modes is virtually impossible in practice, but the
