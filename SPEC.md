@@ -498,9 +498,11 @@ Shell クラス (`Stripe`) はモジュール realm 共有の static 注入点�
   シグネチャは `(publishableKey: string) => Promise<StripeJsLike>`。テストでモック注入、
   あるいは複数 PK を多重ロードする CDN フォールバック等のための seam。
   default は `loadStripe` ベースで `STRIPE_JS_URL` を尊重するローダ。
-- `Stripe.setLogger(logger)` / `Stripe.resetLogger()` — best-effort cleanup 経路 (remote
-  disconnect の `_disposeRemoteWithBestEffortReset`、`abort()` の `_teardownElements` 等)
-  で発生した例外の観測 sink を差し替える。シグネチャは `(phase: string, error: unknown) => void`。
+- `Stripe.setLogger(logger)` / `Stripe.resetLogger()` — best-effort 経路 (remote
+  disconnect の `_disposeRemoteWithBestEffortReset`、`abort()` の `_teardownElements`、
+  submit 後の `reportConfirmation` (phase `report-confirmation`)、孤児 intent の
+  `cancelIntent` / `reset` 等) で発生した例外の観測 sink を差し替える。これらの失敗は
+  `submit()` の結果を変えないため呼び出し元へは伝播しないが、黙って捨てずに必ず logger へ流す。シグネチャは `(phase: string, error: unknown) => void`。
   default は no-op。`stripe-checkout:dispose-warning` がバブルできない (要素が DOM-detached
   済み) 状況でも production observability に流すための fanout。logger が throw しても
   cleanup は継続する (内部で try/catch される)。

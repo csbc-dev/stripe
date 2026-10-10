@@ -1528,6 +1528,25 @@ export class Stripe extends HTMLElementCtor {
     await this._core.reportConfirmation(report);
   }
 
+  /**
+   * Report a confirmation outcome without letting a rejection escape the
+   * submit flow. The user-facing outcome (`error` state, events) is already
+   * settled by the caller before the report, and the Core / webhook path
+   * reconciles terminal state, so a failed report must not turn a declined
+   * card into a thrown `submit()`. But it must not vanish either: the
+   * former `.catch(() => {})` at every call site hid the 0.10 strict-JSON
+   * rejection that kept the Core from ever reaching `succeeded`. Route it
+   * through `Stripe._logger` (phase `report-confirmation`) so an
+   * operator-installed sink sees it.
+   */
+  private async _reportConfirmationBestEffort(report: ConfirmationReport): Promise<void> {
+    try {
+      await this._reportConfirmation(report);
+    } catch (e: unknown) {
+      this._safeLog("report-confirmation", e);
+    }
+  }
+
   private async _cancelIntent(intentId: string): Promise<void> {
     if (this._isRemote) {
       await this._proxy!.invokeWithOptions("cancelIntent", [intentId], { timeoutMs: 0 });
@@ -1539,7 +1558,7 @@ export class Stripe extends HTMLElementCtor {
 
   private async _coreReset(): Promise<void> {
     if (this._isRemote) {
-      await this._proxy!.invoke("reset").catch(() => {});
+      await this._proxy!.invoke("reset").catch((e: unknown) => { this._safeLog("reset", e); });
       return;
     }
     this._core?.reset();
@@ -1871,7 +1890,7 @@ export class Stripe extends HTMLElementCtor {
       // requires_payment_method row forever. The cleanup handler decides
       // whether to auto-retry based on the supersede reason.
       if (gen !== this._prepareGeneration) {
-        this._cancelIntent(creation.intentId).catch(() => {});
+        this._cancelIntent(creation.intentId).catch((e: unknown) => { this._safeLog("cancelIntent", e); });
         raiseError("prepare() superseded.");
       }
       // Latch the intent id BEFORE the `_mountElements` await so a
@@ -1907,7 +1926,7 @@ export class Stripe extends HTMLElementCtor {
         // Elements mount failed — roll back the intent on the server so it
         // does not sit in requires_payment_method forever billing nothing
         // but leaking a row. cancelIntent is a no-op for SetupIntents.
-        this._cancelIntent(creation.intentId).catch(() => {});
+        this._cancelIntent(creation.intentId).catch((e: unknown) => { this._safeLog("cancelIntent", e); });
         // Release the early-latched intent id on the mount-failure path
         // so a subsequent abort/disconnect does not double-cancel the
         // intent we already canceled here.
@@ -1926,7 +1945,7 @@ export class Stripe extends HTMLElementCtor {
       // _ensureStripeJs, or user action). Tear down and cancel.
       if (gen !== this._prepareGeneration) {
         this._teardownElements();
-        this._cancelIntent(creation.intentId).catch(() => {});
+        this._cancelIntent(creation.intentId).catch((e: unknown) => { this._safeLog("cancelIntent", e); });
         // Same release as the mount-failure branch above.
         if (this._preparedIntentId === creation.intentId) {
           this._preparedIntentId = null;
@@ -2169,11 +2188,11 @@ export class Stripe extends HTMLElementCtor {
       const rawThrowError = (e && typeof e === "object")
         ? this._sanitizeStripeJsError(e as Record<string, unknown>)
         : { message: "confirm threw." };
-      await this._reportConfirmation({
+      await this._reportConfirmationBestEffort({
         intentId: intentIdForReport,
         outcome: "failed",
         error: rawThrowError,
-      }).catch(() => {});
+      });
       throw e;
     }
 
@@ -2182,11 +2201,11 @@ export class Stripe extends HTMLElementCtor {
     if (result.error) {
       const err = this._sanitizeStripeJsError(result.error);
       this._setErrorState(err);
-      await this._reportConfirmation({
+      await this._reportConfirmationBestEffort({
         intentId: intentIdForReport,
         outcome: "failed",
         error: err,
-      }).catch(() => {});
+      });
       return;
     }
 
@@ -2207,10 +2226,10 @@ export class Stripe extends HTMLElementCtor {
         },
         bubbles: true,
       }));
-      await this._reportConfirmation({
+      await this._reportConfirmationBestEffort({
         intentId: intentIdForReport,
         outcome: "processing",
-      }).catch(() => {});
+      });
       return;
     }
     await this._applyIntentOutcome(intent, intentIdForReport, submitGen);
@@ -2229,7 +2248,7 @@ export class Stripe extends HTMLElementCtor {
     this._markSupersede(true);
     this._teardownElements();
     this._clearErrorState();
-    this._coreReset().catch(() => {});
+    this._coreReset().catch((e: unknown) => { this._safeLog("reset", e); });
   }
 
   /**
@@ -2350,8 +2369,8 @@ export class Stripe extends HTMLElementCtor {
     // rejects an `invoke` whose argument holds an `undefined` member before
     // sending it. A decline without `decline_code` / `type` — the common
     // case — would otherwise never reach the Core, which then never
-    // records `failed` (the `.catch(() => {})` at the call sites swallows
-    // the local rejection).
+    // records `failed` (`_reportConfirmationBestEffort` only logs the
+    // local rejection; it does not surface it).
     return compactStripeError({
       code: Stripe._safeToken(err.code, Stripe._STRIPE_ERROR_CODE_RE),
       declineCode: Stripe._safeToken(err.decline_code, Stripe._STRIPE_ERROR_CODE_RE),
@@ -2394,7 +2413,7 @@ export class Stripe extends HTMLElementCtor {
     switch (status) {
       case "succeeded":
         if (!stillCurrent()) return;
-        await this._reportConfirmation({
+        await this._reportConfirmationBestEffort({
           intentId,
           outcome: "succeeded",
           // SPEC §6.4 / §8.1: include `paymentMethod` only when Stripe.js
@@ -2405,22 +2424,22 @@ export class Stripe extends HTMLElementCtor {
           // (strict JsonValue arguments). The Core would then never reach
           // `succeeded` nor run its server-side retrieve fallback.
           ...(pm ? { paymentMethod: pm } : {}),
-        }).catch(() => {});
+        });
         break;
       case "requires_action":
       case "requires_confirmation":
         if (!stillCurrent()) return;
-        await this._reportConfirmation({
+        await this._reportConfirmationBestEffort({
           intentId,
           outcome: "requires_action",
-        }).catch(() => {});
+        });
         break;
       case "processing":
         if (!stillCurrent()) return;
-        await this._reportConfirmation({
+        await this._reportConfirmationBestEffort({
           intentId,
           outcome: "processing",
-        }).catch(() => {});
+        });
         break;
       case "requires_payment_method":
       case "canceled": {
@@ -2430,11 +2449,11 @@ export class Stripe extends HTMLElementCtor {
           ? this._sanitizeStripeJsError(lastErr as Record<string, unknown>)
           : { message: "Payment failed." };
         this._setErrorState(err);
-        await this._reportConfirmation({
+        await this._reportConfirmationBestEffort({
           intentId,
           outcome: "failed",
           error: err,
-        }).catch(() => {});
+        });
         break;
       }
       default: {
@@ -2448,10 +2467,10 @@ export class Stripe extends HTMLElementCtor {
           },
           bubbles: true,
         }));
-        await this._reportConfirmation({
+        await this._reportConfirmationBestEffort({
           intentId,
           outcome: "processing",
-        }).catch(() => {});
+        });
         break;
       }
     }
@@ -2917,12 +2936,12 @@ export class Stripe extends HTMLElementCtor {
     this._stripeJs = null;
     this._stripeJsKey = "";
     if (orphanId) {
-      this._cancelIntent(orphanId).catch(() => { /* best-effort */ });
+      this._cancelIntent(orphanId).catch((e: unknown) => { this._safeLog("cancelIntent", e); });
     } else {
       // No intent to cancel, but the Core may still hold stale observable
       // state (e.g. `error` from a prior failed prepare). Put it back to
       // idle so the upcoming auto-prepare starts from a clean baseline.
-      this._coreReset().catch(() => {});
+      this._coreReset().catch((e: unknown) => { this._safeLog("reset", e); });
     }
   }
 

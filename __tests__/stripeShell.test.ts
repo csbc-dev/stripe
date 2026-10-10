@@ -3158,6 +3158,44 @@ describe("<stripe-checkout> Shell", () => {
       expect((resetCalls[0].error as Error).message).toBe("synthetic reset failure");
     });
 
+    it("a rejected reportConfirmation reaches the logger without failing submit()", async () => {
+      // The report is best-effort (the Core / webhook path reconciles the
+      // terminal state), so its rejection must not make submit() throw —
+      // but it must not vanish either. The former `.catch(() => {})` hid
+      // the 0.10 strict-JSON rejection that kept the Core from reaching
+      // `succeeded`.
+      const calls: { phase: string; error: unknown }[] = [];
+      WcsStripe.setLogger((phase, error) => calls.push({ phase, error }));
+
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_123" });
+      el.attachLocalCore(core);
+      await el.prepare();
+      vi.spyOn(core, "reportConfirmation").mockRejectedValue(new Error("synthetic report failure"));
+
+      await expect(el.submit()).resolves.toBeUndefined();
+
+      const reportCalls = calls.filter(c => c.phase === "report-confirmation");
+      expect(reportCalls).toHaveLength(1);
+      expect((reportCalls[0].error as Error).message).toBe("synthetic report failure");
+    });
+
+    it("a failing Core reset after reset() reaches the logger", async () => {
+      const calls: { phase: string; error: unknown }[] = [];
+      WcsStripe.setLogger((phase, error) => calls.push({ phase, error }));
+
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_123" });
+      el.attachLocalCore(core);
+      await el.prepare();
+      vi.spyOn(core, "reset").mockImplementation(() => { throw new Error("synthetic core reset failure"); });
+
+      expect(() => el.reset()).not.toThrow();
+      await flushTransport(2);
+
+      const resetCalls = calls.filter(c => c.phase === "reset");
+      expect(resetCalls).toHaveLength(1);
+      expect((resetCalls[0].error as Error).message).toBe("synthetic core reset failure");
+    });
+
     it("a misbehaving logger does not break the dispose-cleanup path", async () => {
       // The `try { Stripe._logger(phase, error); } catch { /* ... */ }`
       // guard exists so a logger throw cannot half-tear-down the element.
