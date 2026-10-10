@@ -367,11 +367,13 @@ class StripeCore extends EventTarget {
    * アプリの HTTP ルートから呼ぶ。
    * rawBody は Buffer/string(body-parser の前段で保全されたもの)。
    * signatureHeader は `stripe-signature` ヘッダの値。
-  * 署名検証 → event ディスパッチ → status fold → 登録済み handler 実行。
+  * 署名検証 → event の形の検証 → dedup → status fold → 登録済み handler 実行。
    */
   handleWebhook(rawBody: string | Buffer | Uint8Array, signatureHeader: string): Promise<void>;
 }
 ```
+
+**`verifyWebhook` の戻り値の形**: Core は署名検証の後、event のどのメンバーを読むよりも前に、provider が返した値の形を確かめる(retrieve の結果に対する検査と同じ方針。§4)。条件は、object(`null` でも配列でもない)であること、`type` が空でない文字列であること、`data` と `data.object` が object であること。満たさなければ、固定メッセージ `"[@csbc-dev/stripe] provider.verifyWebhook did not return a valid event: <理由>."` で reject する。理由には欄の名前と値の型名(`null` / `number` / `array` / `empty string` など)だけを書き、値は含めない。署名検証の失敗と同じく何も変えない: observable state、Core の target へのイベント、handler、dedup window のどれにも触れないので、provider を直した後に同じ event id が再び届けば(Stripe の再送、ダッシュボードからの再送)通常どおり処理される。`id` は検査しない(空・欠落の `id` は dedup を通らないだけ、という従来の契約)。独自 `IStripeProvider` の `verifyWebhook` はこの形を返すこと。
 
 設計トレードオフ: Core は webhook を受けると handler 実行前に observable state を fold する。
 そのため fatal handler が throw した場合でも UI は先に `succeeded` などを観測しうる一方、
@@ -513,6 +515,8 @@ Stripe.js の契約上、`confirmPayment` / `confirmSetup` の戻り値は `{ pa
 3 の即時 null 化により、同期的 `removeChild` + `appendChild` の連続呼び出しでも
 `connectedCallback` が新セッションを起動できる。
 
+旧接続は非同期 cleanup が unbind するまで bind されたままだが、その接続から届く `update` は値にもイベントにも反映しない(`bind()` のコールバックは、自分の接続が現在の接続でなければ何もしない)。再接続した後に旧接続の `cancelIntent` / `reset` の結果(`status: "idle"`、`intentId: null` など)や旧 Core の `error` が届いても、新しい接続の値を上書きしたり `-changed` / `stripe-checkout:error` を dispatch したりすることはない。
+
 既知の制約: `requestIntent` RPC in-flight 中に disconnect が起きると、
 Core が作成した intent が Stripe 自然 expiry まで残存する可能性がある。
 Core の `reset` は Stripe API cancel を叩かない設計であるため。実害はないが
@@ -529,9 +533,9 @@ Shell クラス (`Stripe`) はモジュール realm 共有の static 注入点�
   あるいは複数 PK を多重ロードする CDN フォールバック等のための seam。
   default は `loadStripe` ベースで `STRIPE_JS_URL` を尊重するローダ。
 - `Stripe.setLogger(logger)` / `Stripe.resetLogger()` — best-effort 経路 (remote
-  disconnect の `_disposeRemoteWithBestEffortReset`、`abort()` の `_teardownElements`、
-  submit 後の `reportConfirmation` (phase `report-confirmation`)、孤児 intent の
-  `cancelIntent` / `reset` 等) で発生した例外の観測 sink を差し替える。これらの失敗は
+  disconnect の `_disposeRemoteWithBestEffortReset`、`abort()` の `_teardownElements`
+  と `cancelIntent` (phase `cancelIntent`)、submit 後の `reportConfirmation` (phase
+  `report-confirmation`)、孤児 intent の `cancelIntent` / `reset` 等) で発生した例外の観測 sink を差し替える。これらの失敗は
   `submit()` の結果を変えないため呼び出し元へは伝播しないが、黙って捨てずに必ず logger へ流す。シグネチャは `(phase: string, error: unknown) => void`。
   default は no-op。`stripe-checkout:dispose-warning` がバブルできない (要素が DOM-detached
   済み) 状況でも production observability に流すための fanout。logger が throw しても
@@ -558,16 +562,18 @@ provider が返す値も Core が組み立て直してから observable に載�
 
 **エラーの伝達**: コマンドが reject したとき、throw envelope は `name` / `message` / `stack` に加えて、remote 0.10 以降は producer が付けた文字列 `code` も運ぶ(`WC_BINDABLE_` 接頭辞の application code は `WC_BINDABLE_REMOTE_THROW` に置換される)。非 `Error` の throw は `name: "NonErrorThrow"` の `Error` として届く。`declineCode` / `type` は envelope に乗らないため、完全な `StripeError` は Core が throw の直前に publish する `error` の `update`(§8.2)から読む。Shell は受け取った `code` を Stripe taxonomy(小文字のみ)で allowlist するので、remote 層が合成する大文字の `WC_BINDABLE_*` code が `el.error.code` に現れることはない。
 
-**RPC の失敗の報告(送信時点の窓)**: Shell が Core に送る RPC のうち、失敗を `el.error` に報告するもの(`prepare()` の `requestIntent`、3DS 復帰の `resumeIntent`、入力の `setWithAck`)は、送信の直前に「窓」(その接続と、その時点までに Core が publish した `error` の数)を取る。reject を受けたら次の規則で報告者を決め、1 つの失敗につき `stripe-checkout:error` を 1 回だけ dispatch する:
+**RPC の失敗の報告(送信時点の窓)**: Shell が Core に送る RPC のうち、失敗を `el.error` に報告するもの(`prepare()` の `requestIntent`、3DS 復帰の `resumeIntent`、入力の `setWithAck`)は、送信の直前に「窓」(その接続と、その時点までに Core が publish した `error` の数、Shell が報告した WebSocket 切断の数)を取る。reject を受けたら次の規則で報告者を決め、1 つの失敗につき `stripe-checkout:error` を 1 回だけ dispatch する:
 
 1. 送信後に**同じ接続で** Core が non-null の `error` を publish しており、かつ reject が remote 層の失敗でない → その publish が今回の失敗の報告である。`bind()` のミラーが `declineCode` / `type` を含む完全形で既に 1 回 dispatch しているので、Shell は何もしない(Core は `_setError` で publish してから throw し、producer は `update` を `throw` より先に送るので、reject が届いた時点でミラーは適用済み)。
 2. それ以外 → Shell が reject をサニタイズして 1 回報告する。該当するのは、Core が publish せずに reject したとき(validation の `raiseError`、dispose 済みの Core、generation の supersede、同じ値で dedup された `_setError`)、remote 層の失敗(`WC_BINDABLE_` 接頭辞の code。ただし Core の throw を表しうる `WC_BINDABLE_REMOTE_THROW` は除く。consumer 側の `_TIMEOUT` / `_DISPOSED` / `_TERMINAL_FAILURE` / 送信前の `_INVALID_JSON_VALUE`、producer が Core に触れる前に返す `_UNDECLARED_COMMAND` / `_UNDECLARED_INPUT` / `_PROTOCOL_ERROR` など)、窓を取った接続が切断・置換された後に届いた reject である。
+
+**切断の後に届いた reject**: 規則 1 / 2 より先に判定する。送信後に WebSocket の切断を Shell が報告していれば(`code: "transport_unavailable"`。Shell の `_connectionFailureSeq` が窓の値から進んでいる)、その RPC の reject は切断の結果(切断で proxy を破棄したときの `WC_BINDABLE_DISPOSED` など)なので報告しない。切断 1 回につき `stripe-checkout:error` は `transport_unavailable` の 1 回だけで、`el.error` もそれのまま残る。RPC 自体(`prepare()` など)は従来どおりその reject で失敗する。3DS resume の分類は変わらない(`WC_BINDABLE_*` の reject は一時的で、URL は残る)。切断の後に始めた RPC は窓が切断より後なので、その失敗(`no core attached` など)は別の失敗として報告される。s3-uploader と同じ規則。
 
 窓で数えるのは、その接続の初期 `sync` を適用した後に届いた non-null の `update` だけである(§4 と同じ規則)。送信前から Core にあった `error`、つまり送信前に publish されたもの(`reportConfirmation` で記録された decline、失敗した cancel、webhook の fold など)や初期 `sync` が運んだものは、今回の失敗の報告として扱わない。扱うと今回の失敗が表示されず、古い error が見えたままになる。別の接続で publish された `error` とも対応付けない。
 
 local モード(`attachLocalCore`)にはミラーも接続も無いので、窓は常に「publish なし」と答え、Shell の報告は従来と変わらない。RPC を伴わない Shell 側の失敗(Stripe.js のロード・Elements の mount・confirm の throw、WebSocket の初期化失敗)も、常に Shell が報告する。
 
-best-effort の RPC(submit 後の `reportConfirmation`、孤児 intent の `cancelIntent`、`abort()` の `cancelIntent`、`reset`)は、どちらのモードでも reject を `el.error` に報告しない(`reportConfirmation` と孤児 intent の `cancelIntent` / `reset` は `Stripe._logger` に流す。§7.6)。Core がそれらの呼び出しで `error` を publish した場合は、ミラー(remote)または Core 自身の dispatch(local)が 1 回だけ報告する。上の規則により、その publish が後続の別の RPC の失敗の報告と取り違えられることはない。
+best-effort の RPC(submit 後の `reportConfirmation`、孤児 intent の `cancelIntent`、`abort()` の `cancelIntent`、`reset`)は、どちらのモードでも reject を `el.error` に報告しない(`reportConfirmation`、孤児 intent と `abort()` の `cancelIntent`、`reset` は `Stripe._logger` に流す。§7.6)。Core がそれらの呼び出しで `error` を publish した場合は、ミラー(remote)または Core 自身の dispatch(local)が 1 回だけ報告する。上の規則により、その publish が後続の別の RPC の失敗の報告と取り違えられることはない。
 
 3DS resume の失敗分類(§4「resume 失敗の分類」)は、reject の `code` か、規則 1 で今回の失敗の報告と判定された `error` の `code` だけを使う。初期 `sync` が運ぶ値も、remote 層の失敗の窓に入った別の呼び出しの publish も使わない。
 
@@ -655,7 +661,7 @@ auth0-gate における token 非露出と同じ哲学。
 - **User 分離**: `registerIntentBuilder` に渡る `UserContext` は認証済み前提。ここで customer / metadata を他ユーザーのものに向けない検証を行う。
 - **Remote 切断時の再接続はアプリ側責務**: `<stripe-checkout>` の remote モード (`config.remote.enableRemote === true`) は `new WebSocket(url)` を 1 回だけ張り、`error` / `close` いずれかで `_disposeRemote` して Shell を transport 不能状態に確定させる。**自動再接続は行わない**。モバイル端末の回線瞬断 / サーバ rolling deploy / LB idle timeout 等で切断された後、ユーザーが `submit()` を叩くと proxy が null の `raiseError` 経路に落ちる。復旧は以下のいずれか:
 
-  1. 切断 event (`stripe-checkout:error` with `code: "transport_unavailable"`) を listen し、アプリ側で element を `removeChild` → `appendChild` で再マウント (推奨)。
+  1. 切断 event (`stripe-checkout:error` with `code: "transport_unavailable"`) を listen し、アプリ側で element を `removeChild` → `appendChild` で再マウント (推奨)。この event は切断 1 回につき 1 回だけ dispatch され、切断で reject された進行中の RPC が別の `stripe-checkout:error` を足すことはない(§8)。
   2. ページ全体を reload する。
   3. 将来的に `reconnect-on-close="true"` 等の opt-in 属性が提供される可能性はあるが v1 では実装しない。
 

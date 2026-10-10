@@ -96,7 +96,8 @@ core.registerWebhookHandler("payment_intent.succeeded", async (event) => {
 //       · StripeSignatureVerificationError (forged/wrong signing secret)
 //       · stripe-checkout input/config guards (missing rawBody, missing
 //         stripe-signature header, webhookSecret not configured on the
-//         Core). These come through as plain Errors whose `message`
+//         Core, a custom provider's verifyWebhook returning a malformed
+//         event). These come through as plain Errors whose `message`
 //         starts with `[@csbc-dev/stripe]`.
 //   5xx — Stripe retries per its delivery policy. Reserve for fatal
 //     fulfillment handler failures (DB write failed, downstream 5xx).
@@ -135,7 +136,7 @@ Auto-prepare mounts Stripe Elements as soon as the element is connected and a `p
 
 If that resume fails, what happens to the redirect params depends only on whether the Core's answer carries a Stripe error `code`. With a code (`resume_client_secret_mismatch`, `resume_not_authorized`, a Stripe reject such as `resource_missing`) the failure is decisive: the params are stripped so a reload does not resume again. Without one (the server could not reach Stripe, a custom provider's `retrieveIntent` resolved with something that is not an object, the WebSocket dropped, the command never reached the Core) it is transient: the params stay in the URL, auto-prepare stays blocked, and the next connect / re-mount / reload retries the resume — the charge may already have gone through at Stripe. Local and remote mode classify the same failure the same way; in remote mode an `error` the Core held before the resume was sent (for example one delivered by the initial sync) never counts as its answer. See SPEC.md §4.
 
-The same rule decides how any failed call to the Core shows up in remote mode — the intent request behind `prepare()`, the 3DS resume, and an attribute value sent to the Core. Each failure produces one `stripe-checkout:error`. If the Core published an `error` for the call after it was sent, that error (with `declineCode` / `type`) is the report; otherwise the element reports the rejection itself. An error the Core already held when the call went out, such as an earlier decline or one delivered by the initial sync, is never shown in place of the new failure. Best-effort calls (the confirmation report, orphan-intent cleanup, `reset`) are not reported on `el.error`; they go to `Stripe.setLogger`. See SPEC.md §8.
+The same rule decides how any failed call to the Core shows up in remote mode — the intent request behind `prepare()`, the 3DS resume, and an attribute value sent to the Core. Each failure produces one `stripe-checkout:error`. If the Core published an `error` for the call after it was sent, that error (with `declineCode` / `type`) is the report; otherwise the element reports the rejection itself. An error the Core already held when the call went out, such as an earlier decline or one delivered by the initial sync, is never shown in place of the new failure. A WebSocket drop is reported once, as `transport_unavailable`; the calls it cuts off still reject, but add no second `stripe-checkout:error`. Best-effort calls (the confirmation report, orphan-intent cleanup, the cancel in `abort()`, `reset`) are not reported on `el.error`; they go to `Stripe.setLogger`. See SPEC.md §8.
 
 ## Security — Your Responsibilities
 
