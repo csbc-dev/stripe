@@ -514,14 +514,25 @@ Shell クラス (`Stripe`) はモジュール realm 共有の static 注入点�
 
 wc-bindable-protocol remote の既存ワイヤ形式に乗る(新しい message type は足さない)。独自 Shell を実装する場合はこの節が wire 契約のソース。型は [types.ts](./src/types.ts) の `IntentRequest` / `IntentRequestHint` / `IntentCreationResult` / `ConfirmationReport` / `StripeError` / `StripePaymentMethod` / `StripeAmount` と一対一に対応する。
 
+**JsonValue 要件(`@wc-bindable/remote` ≥ 0.10)**: wire を通る値(`cmd.args`、`return.value`、`update.value`、`sync.values`)はすべて厳密な JsonValue でなければならない。以下の `?` 付きフィールドは、値が無いとき**キーごと省略**する(`undefined` を入れない)。remote 0.10 は値が `undefined` のメンバーを含むオブジェクトを `JSON.stringify` のように黙って落とさず、値全体を拒否する:
+
+- consumer(Shell 側)— `invoke` / `setWithAck` の引数なら送信前に `WC_BINDABLE_INVALID_JSON_VALUE` で reject。
+- producer(Core 側)— プロパティ値なら `update` を警告付きで破棄し、`sync` では `getterFailures` に載せる(consumer は直前の値を保持する)。コマンド戻り値なら `WC_BINDABLE_INVALID_RETURN_VALUE` の throw に置き換わる。
+- `Date` / `NaN` / `±Infinity` / クラスインスタンス(`toJSON` を持っていても)/ `Map` なども同様に拒否される。トップレベルの `undefined` だけは、プロパティ値(`value` なしの `update`)とコマンド戻り値で許容される。
+
+本パッケージでは Shell が hint と confirmation report を省略形で組み立て(`_buildIntentHint`、`compactStripeError`)、Core がサニタイズ済み `StripeError` と `requestIntent` の戻り値を省略形で組み立て直す。独自 Shell を実装する場合も同じ規則に従うこと。独自 `IStripeProvider` の `retrieveIntent` が返す `amount` / `paymentMethod` は observable(§8.2)にそのまま載るため、JsonValue で返すこと。
+
+**エラーの伝達**: コマンドが reject したとき、throw envelope は `name` / `message` / `stack` に加えて、remote 0.10 以降は producer が付けた文字列 `code` も運ぶ(`WC_BINDABLE_` 接頭辞の application code は `WC_BINDABLE_REMOTE_THROW` に置換される)。非 `Error` の throw は `name: "NonErrorThrow"` の `Error` として届く。`declineCode` / `type` は envelope に乗らないため、完全な `StripeError` は Core が throw の直前に publish する `error` の `update`(§8.2)から読む。Shell は受け取った `code` を Stripe taxonomy(小文字のみ)で allowlist するので、remote 層が合成する大文字の `WC_BINDABLE_*` code が `el.error.code` に現れることはない。
+
 ### 8.1 Shell → Core(`cmd` / 戻りは `return`)
 
 - `requestIntent` — `args: [{ mode: "payment"|"setup", hint: { amountValue?, amountCurrency?, customerId? } }]` → `return.value: { intentId, clientSecret, mode, amount?: { value, currency } }`
-  - `hint` は助言扱い(SPEC §9.3)。`amount` は payment mode のみ返る可能性があり、`{ value, currency }` の入れ子で `value` は最小通貨単位の整数。
+  - `hint` は助言扱い(SPEC §9.3)。Shell は値の無い欄(対応する属性が未設定)をキーごと省略する。Core は欠けた欄ごとにインスタンスの入力値(`core.amountValue` / `core.amountCurrency` / `core.customerId`)で補ってから `IntentBuilder` に渡す。
+  - `return.value` は provider の戻り値をそのまま返すのではなく、Core が組み立て直した値。`mode` は検証済みのリクエスト mode。`amount` は payment mode で provider が返したときだけ `{ value, currency }` の 2 欄をコピーして載せ、無ければキーごと省略する(setup mode では常に省略)。`value` は最小通貨単位の整数。
 - `reportConfirmation` — `args: [{ intentId, outcome, paymentMethod?, error? }]` → `return.value: undefined`
   - `outcome: "succeeded" | "requires_action" | "processing" | "failed"` — `processing` は Stripe が非同期決済(bank debit 等)で返す状態で、Core は `processing` 分岐で `retrieveIntent` を一度叩いた後 webhook 経由の終局を待つ。
   - `paymentMethod?: { id, brand, last4 }` — `confirmPayment` の戻りが expand 済み object のときのみ Shell が同梱。id 文字列のみの場合は omit し、Core の succeeded 分岐が server-side retrieve で補完する(§6.4)。
-  - `error?: { code?, declineCode?, message, type? }` — `outcome: "failed"` 時に `StripeError` の sanitized 形で同梱。`failureCode` のような flat 文字列ではない。`message` のみ必須。
+  - `error?: { code?, declineCode?, message, type? }` — `outcome: "failed"` 時に `StripeError` の sanitized 形で同梱。`failureCode` のような flat 文字列ではない。`message` のみ必須で、Stripe.js が返さなかった欄・allowlist で落ちた欄はキーごと省略する。
 - `cancelIntent` — `args: [intentId: string]` → `return.value: undefined`
   - 引数は intent id 文字列そのもの(オブジェクトで包まない)。PaymentIntent は Stripe の cancel を叩く。SetupIntent はデフォルトでは Core 側の状態 reset のみ(コスト最適化)だが、`new StripeCore(provider, { cancelSetupIntents: true })` を指定し、provider が `cancelSetupIntent(id)` を実装していれば `setupIntents.cancel` を呼ぶ。
 - `resumeIntent` — `args: [intentId: string, mode: "payment"|"setup", clientSecret: string]` → `return.value: undefined`
@@ -538,7 +549,7 @@ wc-bindable-protocol remote の既存ワイヤ形式に乗る(新しい message 
 - `amount` — `{ value: number, currency: string } | null`(payment mode のみ populate)
 - `paymentMethod` — `{ id, brand, last4 } | null`
 - `intentId` — `string | null`
-- `error` — `{ code?, declineCode?, message, type? } | null`
+- `error` — `{ code?, declineCode?, message, type? } | null`(欠けた欄はキーごと省略。`undefined` の欄は持たない)
 
 駆動元は Shell 経由の RPC 結果、webhook handler の fold、および 3DS resume の view 反映(§6.2 / §6.4)。
 
@@ -649,6 +660,7 @@ packages/stripe/
 
 - npm scope: `@csbc-dev/stripe`
 - tag: `<stripe-checkout>`
+- dependencies: `@wc-bindable/core` / `@wc-bindable/remote`(`^0.10.0`。remote は §8 の JsonValue 要件を強制する。サーバー側で `RemoteShellProxy` を自前で組む場合も 0.10 以降を使う)
 - peerDependencies: `stripe`(server Provider が使う。optional: true)、`@stripe/stripe-js`(Shell がロードに使う。optional: true)
 
 ### 11.1 Runtime requirements(server entry)

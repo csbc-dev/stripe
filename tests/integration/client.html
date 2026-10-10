@@ -22,6 +22,13 @@
 
     const params = new URLSearchParams(location.search);
     const scenario = params.get("scenario") ?? "submit";
+    // `minimal=1`: only `mode` / `publishable-key` / `return-url`, like the
+    // examples (no `amount-*`, no `customer-id`). `pm=id`: Stripe.js returns
+    // `payment_method` as a bare id string (its usual shape). Both used to
+    // put `undefined` members into `invoke` args, which @wc-bindable/remote
+    // >= 0.10 rejects before sending.
+    const minimal = params.get("minimal") === "1";
+    const bareIdPaymentMethod = params.get("pm") === "id";
     const { bootstrapStripe, WcsStripe } = await import("@csbc-dev/stripe");
 
     const loaderCalls = [];
@@ -70,10 +77,12 @@
             paymentIntent: {
               id: parseIntentId(opts.clientSecret),
               status: "succeeded",
-              payment_method: {
-                id: "pm_card_visa",
-                card: { brand: "visa", last4: "4242" },
-              },
+              payment_method: bareIdPaymentMethod
+                ? "pm_card_visa"
+                : {
+                  id: "pm_card_visa",
+                  card: { brand: "visa", last4: "4242" },
+                },
             },
           };
         },
@@ -137,9 +146,11 @@
     const el = document.createElement("stripe-checkout");
     el.setAttribute("mode", params.get("mode") ?? "payment");
     el.setAttribute("publishable-key", "pk_test_e2e");
-    el.setAttribute("amount-value", "1980");
-    el.setAttribute("amount-currency", "jpy");
-    el.setAttribute("customer-id", "cus_e2e");
+    if (!minimal) {
+      el.setAttribute("amount-value", "1980");
+      el.setAttribute("amount-currency", "jpy");
+      el.setAttribute("customer-id", "cus_e2e");
+    }
     el.setAttribute("return-url", `${location.origin}${location.pathname}`);
 
     const statusEvents = [];

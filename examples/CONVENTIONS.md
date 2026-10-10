@@ -159,7 +159,7 @@ Matching s3-uploader: the three Vite clients are **built**, and the shared
   (`@csbc-dev/stripe` → `/vendor/csbc/index.js`, plus the `@wc-bindable/*` deps
   it reaches → `/vendor/wcb-core/`, `/vendor/wcb-remote/`). After publishing,
   swap those to pinned `https://esm.run/@csbc-dev/stripe` URLs. `@wc-bindable/*`
-  is pinned at the version the package depends on (`^0.4.0`) so the wire/protocol
+  is pinned at the version the package depends on (`^0.10.0`) so the wire/protocol
   version stays stable.
 - **Ordering**: the inline setup module (which `bootstrapStripe()`s and so
   defines `<stripe-checkout>`) must appear **before** the `@wcstack/state/auto`
@@ -227,7 +227,7 @@ These keep the demos small; production must replace them:
 
 1. **Vite framework client**: create the project; depend on
    `@csbc-dev/stripe` via `file:../..` and the framework's `@wc-bindable/*`
-   adapter (`^0.4.0`); read the WS URL from `VITE_REMOTE_CORE_URL`;
+   adapter (`^0.10.0`); read the WS URL from `VITE_REMOTE_CORE_URL`;
    `bootstrapStripe({ remote: … })`; honor the mock/real switch via
    `VITE_STRIPE_PUBLISHABLE_KEY`; render the same checkout-card surface; set
    `publishable-key` + a `return-url` of `location.origin + location.pathname`;

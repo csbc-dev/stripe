@@ -39,6 +39,29 @@ test("remote payment flow auto-prepares and submits through the fake Stripe.js b
   expect(server.state.createCalls[0].options).toMatchObject({ amount: 1980, currency: "jpy" });
 });
 
+test("remote payment flow without optional inputs and with a bare payment_method id reaches succeeded", async ({ page }) => {
+  // Regression for @wc-bindable/remote >= 0.10 (strict JsonValue): the
+  // prepare() hint used to carry `customerId: undefined` etc. and the
+  // success report `paymentMethod: undefined`, both rejected before
+  // sending. Runs over the real WebSocket + JSON boundary.
+  await page.goto(`http://localhost:${server.port}/client.html?scenario=submit&minimal=1&pm=id`);
+  await expect(page.locator("#status")).toHaveText("done", { timeout: 15000 });
+
+  const results = JSON.parse((await page.locator("#results").textContent()) ?? "{}");
+
+  expect(results.fatal).toBeUndefined();
+  expect(results.status).toBe("succeeded");
+  expect(results.intentId).toMatch(/^pi_e2e_\d+$/);
+  expect(results.error).toBeNull();
+  // The builder fell back to its defaults because no hint field was sent.
+  expect(results.amount).toEqual({ value: 1111, currency: "usd" });
+  expect(server.state.createCalls).toHaveLength(1);
+  expect(server.state.createCalls[0].options).toMatchObject({ amount: 1111, currency: "usd" });
+  // The report omitted `paymentMethod`, so the Core ran its server-side
+  // retrieve fallback (SPEC §6.4) before settling on `succeeded`.
+  expect(server.state.retrieveCalls).toEqual([{ mode: "payment", id: results.intentId }]);
+});
+
 test("post-redirect resume hydrates remote state without mounting Stripe Elements", async ({ page }) => {
   server.state.resumeFixtures.set("pi_resume_ok", {
     id: "pi_resume_ok",

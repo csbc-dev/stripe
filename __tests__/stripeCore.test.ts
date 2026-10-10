@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
+import { isJsonValue } from "@wc-bindable/remote";
 import { StripeCore } from "../src/core/StripeCore";
 import {
   IStripeProvider, IntentCreationResult, PaymentIntentOptions, SetupIntentOptions,
@@ -138,6 +139,64 @@ describe("StripeCore", () => {
       expect(provider.createSetupCalls[0].payment_method).toBe("pm_123");
       expect(provider.createSetupCalls[0].mandate_data).toEqual({
         customer_acceptance: { type: "online" },
+      });
+    });
+
+    describe("return value is a Core-built JsonValue (regression: @wc-bindable/remote >= 0.10 INVALID_RETURN_VALUE)", () => {
+      // The `requestIntent` return crosses the wire as the cmd `return`;
+      // 0.10 rejects a non-JsonValue return with
+      // WC_BINDABLE_INVALID_RETURN_VALUE after the intent already exists
+      // at Stripe. The Core must not hand back the provider object
+      // verbatim (SPEC §8.1 `{ intentId, clientSecret, mode, amount? }`).
+
+      it("omits `amount` when the provider reports amount: undefined", async () => {
+        core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+        provider.createPaymentIntent = async () => ({
+          intentId: "pi_no_amount",
+          clientSecret: "pi_no_amount_secret",
+          mode: "payment",
+          amount: undefined,
+        });
+        const result = await core.requestIntent({ mode: "payment", hint: {} });
+        expect(result).toEqual({ intentId: "pi_no_amount", clientSecret: "pi_no_amount_secret", mode: "payment" });
+        expect(Object.keys(result)).toEqual(["intentId", "clientSecret", "mode"]);
+        expect(isJsonValue(result)).toBe(true);
+        expect(core.amount).toBeNull();
+      });
+
+      it("drops provider-private fields and copies only { value, currency } into amount", async () => {
+        core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+        provider.createPaymentIntent = async () => ({
+          intentId: "pi_extra",
+          clientSecret: "pi_extra_secret",
+          mode: "payment",
+          amount: { value: 1000, currency: "usd", fetchedAt: new Date(0) } as unknown as { value: number; currency: string },
+          raw: { created: new Date(0) },
+        } as unknown as IntentCreationResult);
+        const result = await core.requestIntent({ mode: "payment", hint: {} });
+        expect(result).toEqual({
+          intentId: "pi_extra",
+          clientSecret: "pi_extra_secret",
+          mode: "payment",
+          amount: { value: 1000, currency: "usd" },
+        });
+        expect(isJsonValue(result)).toBe(true);
+        // The observable amount carries the same documented shape.
+        expect(core.amount).toEqual({ value: 1000, currency: "usd" });
+        expect(Object.keys(core.amount!)).toEqual(["value", "currency"]);
+      });
+
+      it("never returns an amount for a SetupIntent, even if the provider supplies one", async () => {
+        core.registerIntentBuilder(() => ({ mode: "setup" }));
+        provider.createSetupIntent = async () => ({
+          intentId: "seti_amt",
+          clientSecret: "seti_amt_secret",
+          mode: "setup",
+          amount: { value: 1, currency: "usd" },
+        });
+        const result = await core.requestIntent({ mode: "setup", hint: {} });
+        expect(result).toEqual({ intentId: "seti_amt", clientSecret: "seti_amt_secret", mode: "setup" });
+        expect(core.amount).toBeNull();
       });
     });
 
@@ -2363,6 +2422,62 @@ describe("StripeCore", () => {
       // code / type must still pass through.
       expect(c.error?.code).toBe("card_declined");
       expect(c.error?.type).toBe("StripeCardError");
+    });
+
+    describe("wire shape: absent fields are omitted, not undefined (@wc-bindable/remote >= 0.10)", () => {
+      // 0.10 rejects a whole value whose object members include
+      // `undefined`, so an `error` carrying `code: undefined` was dropped
+      // at the producer (update discarded / `getterFailures` on sync).
+      // Pin the compact shape on every observable channel the
+      // RemoteShellProxy reads: the getter (sync) and the event detail
+      // (update).
+
+      it("a provider error without code / decline_code yields { type, message } only", async () => {
+        const c = new StripeCore(provider);
+        c.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+        const details: unknown[] = [];
+        c.addEventListener("stripe-checkout:error", (e) => details.push((e as CustomEvent).detail));
+        provider.paymentError = Object.assign(new Error("Could not connect to Stripe."), {
+          type: "StripeConnectionError",
+        });
+        await expect(c.requestIntent({ mode: "payment", hint: {} })).rejects.toThrow();
+
+        expect(Object.keys(c.error!)).toEqual(["type", "message"]);
+        expect(isJsonValue(c.error)).toBe(true);
+        const last = details[details.length - 1] as Record<string, unknown>;
+        expect(Object.keys(last)).toEqual(["type", "message"]);
+        expect(isJsonValue(last)).toBe(true);
+      });
+
+      it("the generic fallback and a failed report without error are { message } only", async () => {
+        const c = new StripeCore(provider);
+        c.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+        await c.requestIntent({ mode: "payment", hint: {} });
+        await c.reportConfirmation({ intentId: "pi_123", outcome: "failed" });
+        expect(c.error).toEqual({ message: "Payment failed." });
+        expect(Object.keys(c.error!)).toEqual(["message"]);
+      });
+
+      it("a sanitized error keeps the code / declineCode / type / message field order", async () => {
+        const c = new StripeCore(provider);
+        c.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+        provider.paymentError = Object.assign(new Error("Your card was declined."), {
+          type: "StripeCardError",
+          code: "card_declined",
+          decline_code: "insufficient_funds",
+        });
+        await expect(c.requestIntent({ mode: "payment", hint: {} })).rejects.toThrow();
+        expect(Object.keys(c.error!)).toEqual(["code", "declineCode", "type", "message"]);
+      });
+
+      it("the storage sink compacts even a caller-built StripeError with undefined members", () => {
+        const c = new StripeCore(provider);
+        const details: unknown[] = [];
+        c.addEventListener("stripe-checkout:error", (e) => details.push((e as CustomEvent).detail));
+        (c as any)._setError({ code: undefined, declineCode: undefined, type: undefined, message: "x" });
+        expect(Object.keys(c.error!)).toEqual(["message"]);
+        expect(Object.keys(details[0] as object)).toEqual(["message"]);
+      });
     });
   });
 

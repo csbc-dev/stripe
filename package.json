@@ -43,8 +43,8 @@
     "declarative"
   ],
   "dependencies": {
-    "@wc-bindable/core": "^0.4.0",
-    "@wc-bindable/remote": "^0.4.0"
+    "@wc-bindable/core": "^0.10.0",
+    "@wc-bindable/remote": "^0.10.0"
   },
   "peerDependencies": {
     "@stripe/stripe-js": "^5.0.0",

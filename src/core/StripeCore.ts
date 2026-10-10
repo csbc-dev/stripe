@@ -14,6 +14,7 @@ import {
   STRIPE_KNOWN_TYPES,
   MAX_ERROR_MESSAGE_LENGTH,
   summarizeUntrustedValue,
+  compactStripeError,
 } from "../internal/errorTaxonomy.js";
 import { STRIPE_CORE_WC_BINDABLE } from "./wcBindable.js";
 import { timingSafeEqual } from "node:crypto";
@@ -607,9 +608,20 @@ export class StripeCore extends EventTarget {
     // input shape on entry closes the same gate at the dispatch side
     // too — the event's `detail` is a copy so a downstream listener
     // mutating it cannot poison the in-memory `_error` slot either.
-    this._error = err ? { ...err } : null;
+    //
+    // The copy is taken through `compactStripeError`, which omits an
+    // absent optional field instead of keeping it as `undefined`. This
+    // slot is wire-visible twice — the event `detail` is what
+    // RemoteShellProxy forwards as the `error` update, and `get error()`
+    // is what it reads for `sync` — and @wc-bindable/remote ≥ 0.10 drops a
+    // value carrying an `undefined` member wholesale (SPEC §8.2, see
+    // `compactStripeError`). `_sanitizeError` already builds compact
+    // shapes; compacting again at the single storage sink keeps the
+    // guarantee for every caller, including literal `StripeError`s.
+    const next = err ? compactStripeError(err) : null;
+    this._error = next;
     this._target.dispatchEvent(new CustomEvent("stripe-checkout:error", {
-      detail: err ? { ...err } : null,
+      detail: next ? { ...next } : null,
       bubbles: true,
     }));
   }
@@ -682,13 +694,19 @@ export class StripeCore extends EventTarget {
       const safeMessage = (stripeShaped || internal) && rawMessage !== undefined
         ? rawMessage
         : "Payment failed.";
-      return {
+      // Omit (not `undefined`) any field the allowlist rejected or the
+      // source did not carry — SPEC §8.2 `{ code?, declineCode?, message,
+      // type? }`. A present-as-`undefined` member makes @wc-bindable/remote
+      // ≥ 0.10 reject the whole `error` value at the wire, so the browser
+      // would never see this error (see `compactStripeError`). Equality
+      // in `_setError`'s dedup is per field, so omission is equivalent.
+      return compactStripeError({
         code: sanitizeToken(e.code, StripeCore._STRIPE_ERROR_CODE_RE),
         declineCode: sanitizeToken(e.decline_code, StripeCore._STRIPE_ERROR_CODE_RE)
           ?? sanitizeToken(e.declineCode, StripeCore._STRIPE_ERROR_CODE_RE),
         type,
         message: truncateMessage(safeMessage),
-      };
+      });
     }
     return { message: "Payment failed." };
   }
@@ -823,8 +841,10 @@ export class StripeCore extends EventTarget {
     } catch (e: unknown) {
       // Sanitize the throw too — not just the observable `_error`. The
       // RemoteShellProxy serializes thrown `Error` instances by their
-      // raw `message` (and name/stack), so a `throw e` would put the
-      // un-allowlisted IntentBuilder error message onto the wire even
+      // raw `message` (plus name / stack and, since @wc-bindable/remote
+      // 0.10, a string `code`), so a `throw e` would put the
+      // un-allowlisted IntentBuilder error message — and whatever `code`
+      // the builder attached — onto the wire even
       // though `_setError` upstairs already replaced it with the sanitized
       // shape on the observable state. Mirrors the `mode_mismatch` /
       // `intent_builder_not_registered` branches below, which already
@@ -903,20 +923,43 @@ export class StripeCore extends EventTarget {
     }
 
     this._activeIntent = { id: creation.intentId, mode, generation: gen };
+    // amount is only meaningful in payment mode (SPEC §5.1). In setup mode
+    // force it to null so a prior payment-mode amount does not bleed through
+    // into a subsequent setup session on the same Core. Copy the two
+    // documented fields so the observable `amount` and the `amount` in the
+    // return value below are the same `{ value, currency }` shape.
+    const amount: StripeAmount | null = mode === "payment" && creation.amount
+      ? { value: creation.amount.value, currency: creation.amount.currency }
+      : null;
     // Dispatch order: amount → intentId → status. A listener that
     // subscribes to `intentId-changed` and reads `el.amount` must see
     // the NEW amount, not the value from the prior intent. Swapping
     // this order was a subtle UX regression where "total" labels flashed
     // stale on new-intent transitions.
-    //
-    // amount is only meaningful in payment mode (SPEC §5.1). In setup mode
-    // force it to null so a prior payment-mode amount does not bleed through
-    // into a subsequent setup session on the same Core.
-    this._setAmount(mode === "payment" && creation.amount ? creation.amount : null);
+    this._setAmount(amount);
     this._setIntentId(creation.intentId);
     this._setStatus("collecting");
     this._setLoading(false);
-    return creation;
+    // Return a Core-built result instead of the provider's object
+    // verbatim. This value is the `return` of the `requestIntent` command,
+    // and @wc-bindable/remote ≥ 0.10 rejects a non-JsonValue return with
+    // `WC_BINDABLE_INVALID_RETURN_VALUE` — so a provider that reports
+    // `amount: undefined` (`StripeSdkProvider.createPaymentIntent` does
+    // whenever Stripe's response lacks a numeric `amount` / string
+    // `currency`) or carries any other provider-private field would make
+    // the Shell's prepare() fail AFTER the intent was created at Stripe,
+    // orphaning it. SPEC §8.1 fixes the wire shape as
+    // `{ intentId, clientSecret, mode, amount? }` with `amount` omitted
+    // when absent; build exactly that. `mode` is the validated request
+    // mode, for the same reason the supersede cleanup above routes on it
+    // instead of on `creation.mode`.
+    const result: IntentCreationResult = {
+      intentId: creation.intentId,
+      clientSecret: creation.clientSecret,
+      mode,
+    };
+    if (amount) result.amount = amount;
+    return result;
   }
 
   /**
@@ -1193,8 +1236,9 @@ export class StripeCore extends EventTarget {
         // Sanitize the throw too, mirroring `requestIntent` /
         // `resumeIntent`. `_cancelIntent` is invoked by the Shell over
         // RemoteCoreProxy, which serializes thrown `Error` instances by
-        // their raw `message` (and name/stack); without sanitization a
-        // raw provider error would put un-allowlisted text on the wire.
+        // their raw `message` (plus name / stack and, since
+        // @wc-bindable/remote 0.10, a string `code`); without sanitization
+        // a raw provider error would put un-allowlisted text on the wire.
         throw Object.assign(new Error(sanitized.message), sanitized.code ? { code: sanitized.code } : {});
       }
     } else if (this._cancelSetupIntents && this._provider.cancelSetupIntent) {
@@ -1301,10 +1345,12 @@ export class StripeCore extends EventTarget {
       // Same rationale as `requestIntent`'s IntentBuilder / provider-create
       // catches. A transient provider failure during resume is not a
       // definitive Core decision — the Shell's `_resumeFromRedirect`
-      // distinguishes Core-origin from transport via the seq counter (see
-      // `_remoteErrorSeq`), but the message portion that the Shell
-      // surfaces from the throw must still come through the same
-      // allowlist as observable `_error`.
+      // classifies the rejection by its `code` (a sanitized Stripe
+      // taxonomy code means "decisive", no code means "transient") and,
+      // in remote mode, also by whether an `error` update crossed the
+      // wire during the resume (see `_remoteErrorSeq`). The `code` and
+      // message portions the Shell surfaces from the throw must still
+      // come through the same allowlist as observable `_error`.
       const sanitized = this._sanitizeError(e);
       if (gen === this._generation) {
         this._setError(sanitized);

@@ -117,4 +117,6 @@ The webhook fan-out in [`server/src/index.ts`](./server/src/index.ts) is **examp
 
 ## Version pinning
 
-The server pins `@wc-bindable/remote@^0.4.0` to match the wire-protocol version that `@csbc-dev/stripe` bundles. The front-ends pin `@wc-bindable/{core,react,vue}@^0.4.0` for the same reason. If you bump `@wc-bindable/*` in the package, bump the examples in lockstep.
+The server pins `@wc-bindable/remote@^0.10.0` to match the wire-protocol version that `@csbc-dev/stripe` bundles. The front-ends pin `@wc-bindable/{core,react,vue}@^0.10.0` for the same reason. If you bump `@wc-bindable/*` in the package, bump the examples in lockstep (and refresh each example's `package-lock.json` / `node_modules` with `npm install`).
+
+`@wc-bindable/remote` 0.10 validates every value on the wire as a strict JSON value — an object member set to `undefined` makes the whole value fail, where 0.4 silently dropped it. Keep the server and the front-ends on the same `@wc-bindable/*` line as the package; see [`../SPEC.md`](../SPEC.md) §8 for the wire shapes.

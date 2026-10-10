@@ -159,6 +159,8 @@ npm install @csbc-dev/stripe stripe @stripe/stripe-js
 
 `stripe` (server SDK) and `@stripe/stripe-js` (browser loader) are declared as optional peer dependencies. Install whichever side you consume.
 
+`@wc-bindable/core` and `@wc-bindable/remote` come in as regular dependencies (`^0.10.0`). Remote 0.10 enforces strict JSON values on the wire: an object member set to `undefined` (or a `Date`, `NaN`, class instance, …) rejects the whole value instead of being silently dropped. If your server wires the Core with its own `RemoteShellProxy`, use `@wc-bindable/remote` 0.10 or newer there too, and have a custom `IStripeProvider` return plain JSON — the `amount` / `paymentMethod` of its `retrieveIntent` views reach observable state as-is. A rejected command's `code` now crosses the wire as well (still limited to the sanitizer's allowlist). See SPEC.md §8 for the wire shapes.
+
 ## License
 
 MIT. See [LICENSE](./LICENSE).
