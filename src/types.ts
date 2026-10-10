@@ -269,7 +269,18 @@ export interface StripeIntentView {
   id: string;
   status: string;
   mode: StripeMode;
+  /**
+   * The Core does not put this object on observable state as-is: it copies
+   * `value` (finite number) and `currency` (non-empty string) into a fresh
+   * `{ value, currency }`, and treats a value that does not fit as absent.
+   * Extra members never reach the wire (SPEC §8.2).
+   */
   amount?: StripeAmount;
+  /**
+   * Rebuilt by the Core as `{ id, brand, last4 }` (non-empty, length-capped
+   * strings) before it reaches observable state; a value that does not fit
+   * is treated as absent (SPEC §6.4 / §8.2).
+   */
   paymentMethod?: StripePaymentMethod;
   lastPaymentError?: StripeError;
   /**

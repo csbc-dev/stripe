@@ -20,25 +20,33 @@ import { StripePaymentMethod } from "../types.js";
 const _PM_FIELD_MAX_LENGTH = { id: 128, brand: 64, last4: 8 } as const;
 
 /**
- * Validate that an externally-supplied `StripePaymentMethod`-shaped value
- * actually matches the published shape — three non-empty strings, no
- * extra fields the rest of the codebase will treat as authoritative.
+ * Rebuild an externally-supplied `StripePaymentMethod`-shaped value into
+ * the observable view — three non-empty strings, no extra fields the rest
+ * of the codebase will treat as authoritative. This is the only gate a
+ * value passes before `StripeCore._setPaymentMethod`, from either source:
  *
- * Wire surface: `reportConfirmation({ paymentMethod })` arrives verbatim
- * from a tamperable Shell (the browser, optionally over RemoteShellProxy
- * + WebSocket). Without this gate, a forged report could put arbitrary
- * shape onto the Core's `_paymentMethod` slot — observable through the
- * `paymentMethod-changed` CustomEvent detail, the bindable surface, and
- * any UI that renders `el.paymentMethod`. Card-data leakage is
- * structurally prevented by Stripe Elements (raw card never leaves the
- * iframe), but a malformed report could still ship attacker-controlled
- * strings for `id` / `brand` / `last4`.
+ * - **Shell report.** `reportConfirmation({ paymentMethod })` arrives
+ *   verbatim from a tamperable Shell (the browser, optionally over
+ *   RemoteShellProxy + WebSocket). Without this gate, a forged report
+ *   could put arbitrary shape onto the Core's `_paymentMethod` slot —
+ *   observable through the `paymentMethod-changed` CustomEvent detail,
+ *   the bindable surface, and any UI that renders `el.paymentMethod`.
+ *   Card-data leakage is structurally prevented by Stripe Elements (raw
+ *   card never leaves the iframe), but a malformed report could still
+ *   ship attacker-controlled strings for `id` / `brand` / `last4`.
+ * - **Provider view.** `IStripeProvider.retrieveIntent(...).paymentMethod`
+ *   (3DS resume, the processing reconcile, the succeeded-branch and
+ *   webhook retrieve fallbacks). The provider seam is open to custom
+ *   implementations, and @wc-bindable/remote ≥ 0.10 drops a whole
+ *   property value holding an `undefined` member, a `Date`, `NaN`, …
+ *   (SPEC §8) — the browser would keep its stale value — while any
+ *   extra member (a fingerprint, an internal id) would otherwise reach
+ *   the browser.
  *
- * Returns the narrowed value on pass, `undefined` on fail. The caller
- * (`StripeCore._setPaymentMethod`) treats `undefined` the same as a
- * report that omitted `paymentMethod` — fall back to the server-side
- * retrieve / webhook fold path, which is sourced from Stripe directly
- * and trustworthy.
+ * Returns a freshly built `{ id, brand, last4 }` on pass, `undefined` on
+ * fail. Callers treat `undefined` the same as "no paymentMethod
+ * reported": a report falls back to the server-side retrieve, a retrieve
+ * leaves the current value in place for the webhook fold to fill.
  *
  * Rejection policy (deliberately strict): a malformed shape — wrong
  * field type, missing field, oversize string — is rejected WHOLESALE.
@@ -51,7 +59,7 @@ const _PM_FIELD_MAX_LENGTH = { id: 128, brand: 64, last4: 8 } as const;
  * authoritative source for these fields; relying on it consistently is
  * safer than letting Shell-supplied partial data sneak in.
  */
-export function validateReportedPaymentMethod(value: unknown): StripePaymentMethod | undefined {
+export function toObservablePaymentMethod(value: unknown): StripePaymentMethod | undefined {
   if (!value || typeof value !== "object") return undefined;
   const v = value as Record<string, unknown>;
   const id = typeof v.id === "string" ? v.id : "";
@@ -84,7 +92,7 @@ export function validateReportedPaymentMethod(value: unknown): StripePaymentMeth
  * etc.) only requires an update here. Lives under `internal/` because it
  * is an implementation helper, not part of the package's public surface.
  *
- * Field length caps mirror `validateReportedPaymentMethod` even though
+ * Field length caps mirror `toObservablePaymentMethod` even though
  * this path is server-trusted (Stripe.js / webhook / retrieve) — a Stripe-
  * side anomaly or a browser-extension that rewrites the Stripe.js confirm
  * result before it reaches us could still inject pathological strings,
@@ -106,7 +114,7 @@ export function extractCardPaymentMethod(obj: Record<string, unknown>): StripePa
       // fall back to the webhook / retrieve channel that CAN populate
       // them than to emit a half-populated shape that lies to the UI.
       if (!id || !brand || !last4) return undefined;
-      // Length caps shared with `validateReportedPaymentMethod` — drop the
+      // Length caps shared with `toObservablePaymentMethod` — drop the
       // shape rather than truncate so a downstream subscriber never sees
       // a half-rendered "Visa •• 424242…" display.
       if (id.length > _PM_FIELD_MAX_LENGTH.id) return undefined;

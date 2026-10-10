@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { isJsonValue } from "@wc-bindable/remote";
 import { StripeCore } from "../src/core/StripeCore";
+import { StripeSdkProvider, type StripeNodeLike } from "../src/providers/StripeSdkProvider";
 import {
   IStripeProvider, IntentCreationResult, PaymentIntentOptions, SetupIntentOptions,
-  StripeEvent, StripeIntentView, StripeMode,
+  StripeAmount, StripeEvent, StripeIntentView, StripeMode, StripePaymentMethod,
 } from "../src/types";
 
 class FakeProvider implements IStripeProvider {
@@ -2239,6 +2240,334 @@ describe("StripeCore", () => {
       await core.handleWebhook("{}", "sig");
       expect(core.paymentMethod).toEqual({ id: "pm_already", brand: "visa", last4: "4242" });
       expect(provider.retrieveCalls.length).toBe(retrievesBefore);
+    });
+  });
+
+  describe("provider amount / paymentMethod are rebuilt by the Core before reaching observable state (regression: @wc-bindable/remote >= 0.10)", () => {
+    // A custom IStripeProvider's `retrieveIntent` (and `createPaymentIntent`)
+    // result used to reach `amount` / `paymentMethod` as-is. Remote 0.10
+    // drops an `update` whose value holds `undefined` / `Date` / `NaN` (and
+    // lists it in `getterFailures` on `sync`), and any extra field rode
+    // along to the browser. The Core now keeps only the documented fields
+    // and treats a value that does not fit as "not reported".
+
+    // Valid documented fields plus an internal id, `undefined`, a `Date`
+    // and `NaN` — every kind of member the 0.10 wire rejects or must not see.
+    const dirtyAmount = (value = 2500, currency = "usd"): StripeAmount => ({
+      value,
+      currency,
+      internalOrderId: "ord_internal_42",
+      note: undefined,
+      fetchedAt: new Date(0),
+      fxRate: Number.NaN,
+    }) as unknown as StripeAmount;
+    const dirtyPaymentMethod = (id = "pm_dirty"): StripePaymentMethod => ({
+      id,
+      brand: "visa",
+      last4: "4242",
+      fingerprint: "fp_internal_secret",
+      wallet: undefined,
+      createdAt: new Date(0),
+      riskScore: Number.NaN,
+    }) as unknown as StripePaymentMethod;
+
+    const invalidAmounts: Array<[string, unknown]> = [
+      ["value NaN", { value: Number.NaN, currency: "usd" }],
+      ["value Infinity", { value: Number.POSITIVE_INFINITY, currency: "usd" }],
+      ["value -Infinity", { value: Number.NEGATIVE_INFINITY, currency: "usd" }],
+      ["value as a string", { value: "2500", currency: "usd" }],
+      ["value undefined", { value: undefined, currency: "usd" }],
+      ["currency missing", { value: 2500 }],
+      ["currency undefined", { value: 2500, currency: undefined }],
+      ["currency empty", { value: 2500, currency: "" }],
+      ["currency as a number", { value: 2500, currency: 840 }],
+      ["a Date", new Date(0)],
+      ["an array", [2500, "usd"]],
+      ["a bare number", 2500],
+      ["null", null],
+    ];
+    const invalidPaymentMethods: Array<[string, unknown]> = [
+      ["last4 missing", { id: "pm_bad", brand: "visa" }],
+      ["last4 undefined", { id: "pm_bad", brand: "visa", last4: undefined }],
+      ["brand empty", { id: "pm_bad", brand: "", last4: "4242" }],
+      ["id as a number", { id: 42, brand: "visa", last4: "4242" }],
+      ["id over the length cap", { id: "pm_" + "x".repeat(200), brand: "visa", last4: "4242" }],
+      ["a bare pm id string", "pm_bare"],
+      ["a Date", new Date(0)],
+      ["null", null],
+    ];
+
+    function observe(c: StripeCore): { amounts: unknown[]; paymentMethods: unknown[] } {
+      const amounts: unknown[] = [];
+      const paymentMethods: unknown[] = [];
+      c.addEventListener("stripe-checkout:amount-changed", (e) => amounts.push((e as CustomEvent).detail));
+      c.addEventListener("stripe-checkout:paymentMethod-changed", (e) => paymentMethods.push((e as CustomEvent).detail));
+      return { amounts, paymentMethods };
+    }
+
+    /** Both wire channels RemoteShellProxy reads: the getter (`sync`) and the event detail (`update`). */
+    function expectCleanSurface(c: StripeCore, seen: { amounts: unknown[]; paymentMethods: unknown[] }, amount: StripeAmount | null, pm: StripePaymentMethod | null): void {
+      expect(c.amount).toEqual(amount);
+      expect(c.paymentMethod).toEqual(pm);
+      expect(isJsonValue(c.amount)).toBe(true);
+      expect(isJsonValue(c.paymentMethod)).toBe(true);
+      if (amount) expect(Object.keys(c.amount!)).toEqual(["value", "currency"]);
+      if (pm) expect(Object.keys(c.paymentMethod!)).toEqual(["id", "brand", "last4"]);
+      for (const detail of [...seen.amounts, ...seen.paymentMethods]) {
+        expect(isJsonValue(detail)).toBe(true);
+      }
+      const wire = JSON.stringify([c.amount, c.paymentMethod, seen.amounts, seen.paymentMethods]);
+      expect(wire).not.toContain("ord_internal_42");
+      expect(wire).not.toContain("fp_internal_secret");
+    }
+
+    it("resumeIntent: keeps only { value, currency } and { id, brand, last4 }", async () => {
+      const seen = observe(core);
+      provider.retrieveResult = {
+        id: "pi_resume_dirty",
+        status: "succeeded",
+        mode: "payment",
+        amount: dirtyAmount(),
+        paymentMethod: dirtyPaymentMethod(),
+        clientSecret: "pi_resume_dirty_secret_ok",
+      };
+      await core.resumeIntent("pi_resume_dirty", "payment", "pi_resume_dirty_secret_ok");
+
+      expect(core.status).toBe("succeeded");
+      expectCleanSurface(core, seen, { value: 2500, currency: "usd" }, { id: "pm_dirty", brand: "visa", last4: "4242" });
+      expect(seen.amounts).toEqual([{ value: 2500, currency: "usd" }]);
+      expect(seen.paymentMethods).toEqual([{ id: "pm_dirty", brand: "visa", last4: "4242" }]);
+    });
+
+    it("reportConfirmation(processing) reconcile: keeps only the documented fields", async () => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await core.requestIntent({ mode: "payment", hint: {} });
+      const seen = observe(core);
+      provider.retrieveResult = {
+        id: "pi_123",
+        status: "succeeded",
+        mode: "payment",
+        amount: dirtyAmount(1200, "usd"),
+        paymentMethod: dirtyPaymentMethod(),
+      };
+      await core.reportConfirmation({ intentId: "pi_123", outcome: "processing" });
+
+      expect(core.status).toBe("succeeded");
+      expectCleanSurface(core, seen, { value: 1200, currency: "usd" }, { id: "pm_dirty", brand: "visa", last4: "4242" });
+    });
+
+    it("reportConfirmation(succeeded) server-side retrieve fallback: keeps only { id, brand, last4 }", async () => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await core.requestIntent({ mode: "payment", hint: {} });
+      const seen = observe(core);
+      provider.retrieveResult = {
+        id: "pi_123",
+        status: "succeeded",
+        mode: "payment",
+        paymentMethod: dirtyPaymentMethod("pm_fallback"),
+      };
+      await core.reportConfirmation({ intentId: "pi_123", outcome: "succeeded" });
+
+      expect(provider.retrieveCalls).toEqual([{ mode: "payment", id: "pi_123" }]);
+      expect(core.status).toBe("succeeded");
+      expectCleanSurface(core, seen, { value: 1000, currency: "usd" }, { id: "pm_fallback", brand: "visa", last4: "4242" });
+    });
+
+    it("webhook succeeded retrieve fallback: keeps only { id, brand, last4 }", async () => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await core.requestIntent({ mode: "payment", hint: {} });
+      const seen = observe(core);
+      provider.retrieveResult = {
+        id: "pi_123",
+        status: "succeeded",
+        mode: "payment",
+        paymentMethod: dirtyPaymentMethod("pm_webhook"),
+      };
+      provider.webhookEvent = {
+        id: "evt_dirty_pm",
+        type: "payment_intent.succeeded",
+        data: { object: { id: "pi_123", payment_method: "pm_bare_id_only" } },
+        created: 0,
+      };
+      await core.handleWebhook("{}", "sig");
+
+      expect(core.status).toBe("succeeded");
+      expectCleanSurface(core, seen, { value: 1000, currency: "usd" }, { id: "pm_webhook", brand: "visa", last4: "4242" });
+    });
+
+    it.each(invalidAmounts)("an amount that does not fit (%s) is treated as not reported: reconcile keeps the current amount", async (_label, bad) => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await core.requestIntent({ mode: "payment", hint: {} });
+      const seen = observe(core);
+      provider.retrieveResult = {
+        id: "pi_123",
+        status: "succeeded",
+        mode: "payment",
+        amount: bad as StripeAmount,
+      };
+      await core.reportConfirmation({ intentId: "pi_123", outcome: "processing" });
+
+      expect(core.status).toBe("succeeded");
+      expect(core.amount).toEqual({ value: 1000, currency: "usd" });
+      expect(seen.amounts).toEqual([]);
+    });
+
+    it.each(invalidAmounts)("an amount that does not fit (%s) is treated as not reported: resume leaves amount null", async (_label, bad) => {
+      provider.retrieveResult = {
+        id: "pi_resume_bad_amount",
+        status: "succeeded",
+        mode: "payment",
+        amount: bad as StripeAmount,
+        clientSecret: "pi_resume_bad_amount_secret",
+      };
+      await core.resumeIntent("pi_resume_bad_amount", "payment", "pi_resume_bad_amount_secret");
+      expect(core.status).toBe("succeeded");
+      expect(core.amount).toBeNull();
+    });
+
+    it.each(invalidPaymentMethods)("a paymentMethod that does not fit (%s) is treated as not reported by the retrieve fallback", async (_label, bad) => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await core.requestIntent({ mode: "payment", hint: {} });
+      const seen = observe(core);
+      provider.retrieveResult = {
+        id: "pi_123",
+        status: "succeeded",
+        mode: "payment",
+        paymentMethod: bad as StripePaymentMethod,
+      };
+      await core.reportConfirmation({ intentId: "pi_123", outcome: "succeeded" });
+
+      // Same as a retrieve that found no card: succeeded, paymentMethod
+      // left for the webhook path to fill.
+      expect(core.status).toBe("succeeded");
+      expect(core.paymentMethod).toBeNull();
+      expect(seen.paymentMethods).toEqual([]);
+    });
+
+    it.each(invalidPaymentMethods)("a paymentMethod that does not fit (%s) does not replace the current one on reconcile", async (_label, bad) => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await core.requestIntent({ mode: "payment", hint: {} });
+      await core.reportConfirmation({
+        intentId: "pi_123",
+        outcome: "succeeded",
+        paymentMethod: { id: "pm_reported", brand: "visa", last4: "4242" },
+      });
+      provider.retrieveResult = {
+        id: "pi_123",
+        status: "succeeded",
+        mode: "payment",
+        paymentMethod: bad as StripePaymentMethod,
+      };
+      await core.reportConfirmation({ intentId: "pi_123", outcome: "processing" });
+      expect(core.paymentMethod).toEqual({ id: "pm_reported", brand: "visa", last4: "4242" });
+    });
+
+    it.each(invalidPaymentMethods)("a paymentMethod that does not fit (%s) is ignored by the webhook retrieve fallback", async (_label, bad) => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await core.requestIntent({ mode: "payment", hint: {} });
+      provider.retrieveResult = {
+        id: "pi_123",
+        status: "succeeded",
+        mode: "payment",
+        paymentMethod: bad as StripePaymentMethod,
+      };
+      provider.webhookEvent = {
+        id: "evt_bad_pm",
+        type: "payment_intent.succeeded",
+        data: { object: { id: "pi_123" } },
+        created: 0,
+      };
+      await core.handleWebhook("{}", "sig");
+      expect(core.status).toBe("succeeded");
+      expect(core.paymentMethod).toBeNull();
+    });
+
+    it("a setup-mode view still clears amount even when its amount is dirty", async () => {
+      provider.retrieveResult = {
+        id: "seti_dirty",
+        status: "succeeded",
+        mode: "setup",
+        amount: dirtyAmount(),
+        paymentMethod: dirtyPaymentMethod("pm_setup"),
+        clientSecret: "seti_dirty_secret",
+      };
+      const seen = observe(core);
+      await core.resumeIntent("seti_dirty", "setup", "seti_dirty_secret");
+      expectCleanSurface(core, seen, null, { id: "pm_setup", brand: "visa", last4: "4242" });
+    });
+
+    it.each(invalidAmounts)("requestIntent: a provider amount that does not fit (%s) is omitted from the return and the observable amount", async (_label, bad) => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      provider.createPaymentIntent = async () => ({
+        intentId: "pi_bad_amount",
+        clientSecret: "pi_bad_amount_secret",
+        mode: "payment",
+        amount: bad as StripeAmount,
+      });
+      const result = await core.requestIntent({ mode: "payment", hint: {} });
+      expect(result).toEqual({ intentId: "pi_bad_amount", clientSecret: "pi_bad_amount_secret", mode: "payment" });
+      expect("amount" in result).toBe(false);
+      expect(isJsonValue(result)).toBe(true);
+      expect(core.amount).toBeNull();
+    });
+
+    it("requestIntent: a dirty provider amount is rebuilt in the return and the observable amount", async () => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 2500, currency: "usd" }));
+      provider.createPaymentIntent = async () => ({
+        intentId: "pi_dirty_amount",
+        clientSecret: "pi_dirty_amount_secret",
+        mode: "payment",
+        amount: dirtyAmount(),
+      });
+      const seen = observe(core);
+      const result = await core.requestIntent({ mode: "payment", hint: {} });
+      expect(result.amount).toEqual({ value: 2500, currency: "usd" });
+      expect(Object.keys(result.amount!)).toEqual(["value", "currency"]);
+      expect(isJsonValue(result)).toBe(true);
+      expectCleanSurface(core, seen, { value: 2500, currency: "usd" }, null);
+    });
+
+    it("the StripeSdkProvider view reaches observable state with the same values (default provider unchanged)", async () => {
+      // A Stripe retrieve response carries far more than the view keeps;
+      // StripeSdkProvider already narrows it, and the Core's rebuild must
+      // not change any value it produces.
+      const stripeIntent = {
+        id: "pi_sdk",
+        object: "payment_intent",
+        status: "succeeded",
+        amount: 1980,
+        currency: "jpy",
+        client_secret: "pi_sdk_secret_ok",
+        metadata: { userId: "u_1" },
+        payment_method: {
+          id: "pm_sdk",
+          object: "payment_method",
+          card: { brand: "mastercard", last4: "4444", exp_month: 12, exp_year: 2030, fingerprint: "fp_sdk" },
+        },
+      };
+      const client: StripeNodeLike = {
+        paymentIntents: {
+          async create() { throw new Error("not used"); },
+          async retrieve() { return stripeIntent; },
+          async cancel(id) { return { id, status: "canceled" }; },
+        },
+        setupIntents: {
+          async create() { throw new Error("not used"); },
+          async retrieve() { throw new Error("not used"); },
+        },
+        webhooks: {
+          constructEvent() { throw new Error("not used"); },
+        },
+      };
+      const sdkProvider = new StripeSdkProvider(client, { buildIdempotencyKey: () => undefined });
+      const view = await sdkProvider.retrieveIntent("payment", "pi_sdk");
+      const c = new StripeCore(sdkProvider);
+      await c.resumeIntent("pi_sdk", "payment", "pi_sdk_secret_ok");
+
+      expect(c.amount).toEqual(view.amount);
+      expect(c.paymentMethod).toEqual(view.paymentMethod);
+      expect(c.amount).toEqual({ value: 1980, currency: "jpy" });
+      expect(c.paymentMethod).toEqual({ id: "pm_sdk", brand: "mastercard", last4: "4444" });
     });
   });
 

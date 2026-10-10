@@ -7,7 +7,7 @@ import type {
 } from "../src/components/Stripe";
 import type {
   IStripeProvider, IntentCreationResult, PaymentIntentOptions, SetupIntentOptions,
-  StripeEvent, StripeIntentView, StripeMode,
+  StripeAmount, StripeEvent, StripeIntentView, StripeMode, StripePaymentMethod,
 } from "../src/types";
 import { RemoteShellProxy } from "@wc-bindable/remote";
 import type {
@@ -2621,6 +2621,245 @@ describe("<stripe-checkout> Shell", () => {
         } finally {
           shellProxy.dispose();
         }
+      });
+
+      describe("a custom provider's retrieveIntent amount / paymentMethod reach the browser rebuilt by the Core (regression)", () => {
+        // `retrieveIntent` views used to land on `amount` / `paymentMethod`
+        // as-is. With an `undefined` / `Date` / `NaN` member the 0.10
+        // producer dropped the `update` (and listed the property in
+        // `getterFailures` on `sync`), so the browser kept a stale value;
+        // an extra member (an internal id) reached the browser. Every path
+        // that folds a retrieve result is driven here through the real
+        // 0.10 proxy pair: the 3DS resume, the processing reconcile, the
+        // server-side paymentMethod fallback, and the webhook fallback.
+
+        const dirtyAmount = (value = 2500, currency = "usd"): StripeAmount => ({
+          value,
+          currency,
+          internalOrderId: "ord_internal_42",
+          note: undefined,
+          fetchedAt: new Date(0),
+          fxRate: Number.NaN,
+        }) as unknown as StripeAmount;
+        const dirtyPaymentMethod = (id = "pm_dirty"): StripePaymentMethod => ({
+          id,
+          brand: "visa",
+          last4: "4242",
+          fingerprint: "fp_internal_secret",
+          wallet: undefined,
+          createdAt: new Date(0),
+          riskScore: Number.NaN,
+        }) as unknown as StripePaymentMethod;
+
+        /** Records every server→client frame the producer actually sent. */
+        function createInspectingPair(): { client: ClientTransport; server: ServerTransport; received: ServerMessage[] } {
+          const pair = createMockTransportPair();
+          const received: ServerMessage[] = [];
+          const server: ServerTransport = {
+            send: (msg) => { received.push(msg); pair.server.send(msg); },
+            onMessage: (handler) => pair.server.onMessage(handler),
+          };
+          return { client: pair.client, server, received };
+        }
+
+        function expectNoInternalFields(received: ServerMessage[]): void {
+          const wire = JSON.stringify(received);
+          expect(wire).not.toContain("ord_internal_42");
+          expect(wire).not.toContain("fp_internal_secret");
+          expect(wire).not.toContain("internalOrderId");
+          expect(wire).not.toContain("fingerprint");
+        }
+
+        it("3DS resume: the browser gets { value, currency } / { id, brand, last4 }, and a later sync carries them too", async () => {
+          setUrlSearch("?payment_intent=pi_dirty_resume&payment_intent_client_secret=pi_dirty_resume_secret_ok&redirect_status=succeeded");
+          provider.retrieveResult = {
+            id: "pi_dirty_resume",
+            status: "succeeded",
+            mode: "payment",
+            amount: dirtyAmount(),
+            paymentMethod: dirtyPaymentMethod(),
+            clientSecret: "pi_dirty_resume_secret_ok",
+          };
+          el = createEl({ mode: "payment", "publishable-key": "pk_test_dirty_resume" });
+          const { client, server, received } = createInspectingPair();
+          const { logger, messages } = createWireLogger();
+          const shellProxy = new RemoteShellProxy(core, server, { logger });
+          let secondProxy: RemoteShellProxy | null = null;
+          try {
+            el._connectRemote(client);
+            await flushTransport(8);
+
+            expect(provider.retrieveCalls).toEqual([{ mode: "payment", id: "pi_dirty_resume" }]);
+            expect(el.status).toBe("succeeded");
+            expect(el.amount).toEqual({ value: 2500, currency: "usd" });
+            expect(Object.keys(el.amount!)).toEqual(["value", "currency"]);
+            expect(el.paymentMethod).toEqual({ id: "pm_dirty", brand: "visa", last4: "4242" });
+            expect(Object.keys(el.paymentMethod!)).toEqual(["id", "brand", "last4"]);
+            expect(messages).toEqual([]);
+            expectNoInternalFields(received);
+
+            // A second browser connecting now reads the Core through `sync`
+            // (the getters): nothing may land in `getterFailures`.
+            const el2 = createEl({ mode: "payment" }); // no key, URL already stripped
+            const second = createInspectingPair();
+            const secondLog = createWireLogger();
+            secondProxy = new RemoteShellProxy(core, second.server, { logger: secondLog.logger });
+            el2._connectRemote(second.client);
+            await flushTransport(4);
+
+            const sync = second.received.find((m): m is Extract<ServerMessage, { type: "sync" }> => m.type === "sync");
+            expect(sync).toBeDefined();
+            expect(sync?.getterFailures).toBeUndefined();
+            expect(sync?.values.amount).toEqual({ value: 2500, currency: "usd" });
+            expect(sync?.values.paymentMethod).toEqual({ id: "pm_dirty", brand: "visa", last4: "4242" });
+            expect(el2.amount).toEqual({ value: 2500, currency: "usd" });
+            expect(el2.paymentMethod).toEqual({ id: "pm_dirty", brand: "visa", last4: "4242" });
+            expect(secondLog.messages).toEqual([]);
+            expectNoInternalFields(second.received);
+          } finally {
+            secondProxy?.dispose();
+            shellProxy.dispose();
+          }
+        });
+
+        it("processing reconcile: the retrieved amount / paymentMethod reach the browser rebuilt", async () => {
+          fakes.setConfirmResult({ paymentIntent: { id: "pi_shell", status: "processing" } });
+          provider.retrieveResult = {
+            id: "pi_shell",
+            status: "succeeded",
+            mode: "payment",
+            amount: dirtyAmount(2100, "jpy"),
+            paymentMethod: dirtyPaymentMethod("pm_reconciled"),
+          };
+          el = createEl({ mode: "payment" });
+          const { client, server, received } = createInspectingPair();
+          const { logger, messages } = createWireLogger();
+          const shellProxy = new RemoteShellProxy(core, server, { logger });
+          try {
+            el._connectRemote(client);
+            await flushTransport(2);
+            el.setAttribute("publishable-key", "pk_test_dirty_reconcile");
+            await el.prepare();
+            expect(el.amount).toEqual({ value: 1980, currency: "jpy" }); // from requestIntent
+            await el.submit();
+            await flushTransport(4);
+
+            expect(provider.retrieveCalls).toEqual([{ mode: "payment", id: "pi_shell" }]);
+            expect(el.status).toBe("succeeded");
+            expect(el.amount).toEqual({ value: 2100, currency: "jpy" });
+            expect(Object.keys(el.amount!)).toEqual(["value", "currency"]);
+            expect(el.paymentMethod).toEqual({ id: "pm_reconciled", brand: "visa", last4: "4242" });
+            expect(Object.keys(el.paymentMethod!)).toEqual(["id", "brand", "last4"]);
+            expect(messages).toEqual([]);
+            expectNoInternalFields(received);
+          } finally {
+            shellProxy.dispose();
+          }
+        });
+
+        it("processing reconcile: an amount / paymentMethod that does not fit never reaches the wire and keeps the current values", async () => {
+          fakes.setConfirmResult({ paymentIntent: { id: "pi_shell", status: "processing" } });
+          provider.retrieveResult = {
+            id: "pi_shell",
+            status: "succeeded",
+            mode: "payment",
+            amount: { value: Number.NaN, currency: "usd" },
+            paymentMethod: { id: "pm_partial", brand: "visa", last4: undefined } as unknown as StripePaymentMethod,
+          };
+          el = createEl({ mode: "payment" });
+          const { client, server } = createInspectingPair();
+          const { logger, messages } = createWireLogger();
+          const shellProxy = new RemoteShellProxy(core, server, { logger });
+          try {
+            el._connectRemote(client);
+            await flushTransport(2);
+            el.setAttribute("publishable-key", "pk_test_invalid_reconcile");
+            await el.prepare();
+            await el.submit();
+            await flushTransport(4);
+
+            expect(el.status).toBe("succeeded");
+            expect(core.amount).toEqual({ value: 1980, currency: "jpy" });
+            expect(el.amount).toEqual({ value: 1980, currency: "jpy" });
+            expect(core.paymentMethod).toBeNull();
+            expect(el.paymentMethod).toBeNull();
+            // Nothing was dropped at the producer: no non-JSON value was published.
+            expect(messages).toEqual([]);
+          } finally {
+            shellProxy.dispose();
+          }
+        });
+
+        it("server-side retrieve fallback after a bare payment_method id: the browser gets { id, brand, last4 }", async () => {
+          fakes.setConfirmResult({
+            paymentIntent: { id: "pi_shell", status: "succeeded", payment_method: "pm_bare_id" },
+          });
+          provider.retrieveResult = {
+            id: "pi_shell",
+            status: "succeeded",
+            mode: "payment",
+            paymentMethod: dirtyPaymentMethod("pm_fallback"),
+          };
+          el = createEl({ mode: "payment" });
+          const { client, server, received } = createInspectingPair();
+          const { logger, messages } = createWireLogger();
+          const shellProxy = new RemoteShellProxy(core, server, { logger });
+          try {
+            el._connectRemote(client);
+            await flushTransport(2);
+            el.setAttribute("publishable-key", "pk_test_dirty_fallback");
+            await el.prepare();
+            await el.submit();
+            await flushTransport(4);
+
+            expect(provider.retrieveCalls).toEqual([{ mode: "payment", id: "pi_shell" }]);
+            expect(el.status).toBe("succeeded");
+            expect(el.paymentMethod).toEqual({ id: "pm_fallback", brand: "visa", last4: "4242" });
+            expect(Object.keys(el.paymentMethod!)).toEqual(["id", "brand", "last4"]);
+            expect(messages).toEqual([]);
+            expectNoInternalFields(received);
+          } finally {
+            shellProxy.dispose();
+          }
+        });
+
+        it("webhook retrieve fallback: the browser gets { id, brand, last4 }", async () => {
+          provider.retrieveResult = {
+            id: "pi_shell",
+            status: "succeeded",
+            mode: "payment",
+            paymentMethod: dirtyPaymentMethod("pm_webhook"),
+          };
+          provider.verifyWebhook = () => ({
+            id: "evt_dirty_webhook",
+            type: "payment_intent.succeeded",
+            data: { object: { id: "pi_shell", payment_method: "pm_bare_id" } },
+            created: 0,
+          });
+          el = createEl({ mode: "payment" });
+          const { client, server, received } = createInspectingPair();
+          const { logger, messages } = createWireLogger();
+          const shellProxy = new RemoteShellProxy(core, server, { logger });
+          try {
+            el._connectRemote(client);
+            await flushTransport(2);
+            el.setAttribute("publishable-key", "pk_test_dirty_webhook");
+            await el.prepare();
+            expect(el.status).toBe("collecting");
+
+            await core.handleWebhook("{}", "t=0,v1=sig");
+            await flushTransport(4);
+
+            expect(provider.retrieveCalls).toEqual([{ mode: "payment", id: "pi_shell" }]);
+            expect(el.status).toBe("succeeded");
+            expect(el.paymentMethod).toEqual({ id: "pm_webhook", brand: "visa", last4: "4242" });
+            expect(Object.keys(el.paymentMethod!)).toEqual(["id", "brand", "last4"]);
+            expect(messages).toEqual([]);
+            expectNoInternalFields(received);
+          } finally {
+            shellProxy.dispose();
+          }
+        });
       });
 
       it("a remote resume denial is classified decisive by its code even if the error update is not observed", async () => {
