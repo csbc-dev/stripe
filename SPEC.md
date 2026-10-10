@@ -380,6 +380,8 @@ class StripeCore extends EventTarget {
   * resolve / reject するのは handler(fatal / non-fatal とも)をすべて実行し終えた後で、
   * HTTP ルートはその結果で応答する(下の「処理してから応答する設計」)。
   * 同じ id の配送が処理中なら、dedup の段で最初の配送の結果を待ち、同じ結果で終わる。
+  * fold か handler を await している間に dispose() されたら、残りの handler を走らせずに
+  * dispose 済みのエラーで reject する(下の「処理の途中の dispose」)。
    */
   handleWebhook(rawBody: string | Buffer | Uint8Array, signatureHeader: string): Promise<void>;
 }
@@ -393,7 +395,7 @@ class StripeCore extends EventTarget {
 |---|---|---|
 | resolve(dedup で抑止された重複、最初の配送が成功した処理中の重複を含む) | 200 | 配送完了。Stripe の再送が止まる |
 | `stripe-signature` ヘッダが無い、または署名検証の失敗(`StripeSignatureVerificationError`) | 400 | Stripe の例と同じ。偽造は Stripe の配送ではないので再送されない。本物の配送なら signing secret か raw body の誤りで、Stripe が再送を続けるので、直せば通る |
-| それ以外の reject(fatal handler の throw、`[@csbc-dev/stripe]` で始まる入力・設定・provider の形の不正、dispose 済みの Core。処理中の重複は最初の配送と同じエラー、待っている間に dispose されたら dispose 済みのエラー) | 500 | サーバー側の失敗。Stripe が再送するので、原因を直せば同じ event が処理される |
+| それ以外の reject(fatal handler の throw、`[@csbc-dev/stripe]` で始まる入力・設定・provider の形の不正、dispose 済みの Core(処理の途中で dispose された配送を含む)。処理中の重複は最初の配送と同じエラー、最初の配送の結果が決まる前に dispose されたら dispose 済みのエラー) | 500 | サーバー側の失敗。Stripe が再送するので、原因を直せば同じ event が処理される |
 
 署名検証の失敗と形の不正が observable state・handler・dedup window に触れないのは、この再送で同じ event id が届いたときに通常どおり処理するためである。失敗した配送に 2xx を返してはならない(event が ack され再送が終わる)。失敗が数日続くエンドポイントは Stripe に無効化されるので、500 はログに流して監視する。
 
@@ -409,10 +411,18 @@ class StripeCore extends EventTarget {
 
 - 最初の配送が resolve したら、重複も resolve する(200)。`stripe-checkout:webhook-deduped` はこのとき重複ごとに 1 回出る。id は window に残るので、以後の重複はすぐに 200 で終わる。non-fatal handler の throw は配送の失敗ではないので、この場合に当たる。
 - 最初の配送が reject したら(fatal handler の throw)、重複も同じエラーで reject する(500)。id は window から外れるので、どちらの配送も Stripe が再送し、次に届いた配送は最初から処理される。
-- 待っている間に Core が `dispose()` されたら、重複はすぐに dispose 済みのエラー(`[@csbc-dev/stripe] StripeCore has been disposed.`)で reject する(500)。最初の配送の handler が終わるのは待たない。dispose 済みの Core は event を処理したと保証できないので、最初の配送がどう終わってもこの結果になる。
+- 最初の配送の結果が決まる前に Core が `dispose()` されたら、重複はすぐに dispose 済みのエラー(`[@csbc-dev/stripe] StripeCore has been disposed.`)で reject する(500)。最初の配送の handler が終わるのは待たない。最初の配送も、そのとき await していた fold か handler から戻ったところで同じエラーで reject するので(下の「処理の途中の dispose」)、どちらも 500 になる。dispose 済みの Core は event を処理したと保証できないので、そのとき走っていた handler がどう終わってもこの結果になる。結果が決まった後の `dispose()` は、重複の結果も変えない(最初の配送と同じ結果で終わる)。
 - 同時に待つ重複がいくつあっても、すべて同じ結果で終わる。処理中の記録は、最初の配送の成功・失敗と `dispose()` のどれでも消える。
 - dedup の対象外の id(空文字・空白だけ・欠落・文字列でない値)は待ち合わせない。同時に届いた配送はそれぞれ fold と handler を並列に走らせる(従来どおり)。
 - handler の中から同じ event で `handleWebhook` を呼んで await してはならない。その呼び出しは handler 自身が終わるのを待つので、どちらも終わらない。
+
+**処理の途中の dispose**: 配送の fold か handler を await している間、または `stripe-checkout:webhook-warning` の listener の中で Core が `dispose()` されたら(handler 自身が呼んだときも、別の処理が呼んだときも)、その配送はその await や dispatch から戻ったところで残りの handler を走らせずに、dispose 済みのエラー(`[@csbc-dev/stripe] StripeCore has been disposed.`)で reject する(500)。Stripe が再送し、event は別の Core かプロセスで処理される。そのとき await していた handler 自身が失敗していた場合(fatal でも non-fatal でも)、その失敗は dispose 済みのエラーの `cause`(列挙されない、ES2022 の `new Error(message, { cause })` と同じ属性)に付き、ルートのログで追える。webhook のエラーは remote の wire を通らないので、`cause` がブラウザに届くことはない。resolve して 200 を返すと、走らなかった fatal handler の event が ack され、Stripe の再送が止まって失われる。
+
+- **境界**: 結果が決まるのは、Core が最後の handler(handler が 1 つも登録されていなければ fold)の await から戻り、dispose されていないことを確かめた時点である。その前の `dispose()` は、await していた fold や handler がどう終わっても結果を dispose 済みのエラーにする。fatal handler が throw した場合も、返るのは handler のエラーではなく dispose 済みのエラーである(処理中の重複と同じエラーにそろえる)。最後の handler が処理を終えていても、Core がその await から戻る前に dispose されたら reject になる。このとき Stripe の再送で handler がもう一度走ることがあるが、handler 側の `event.id` による冪等化が吸収する(at-least-once)。結果が決まった後の `dispose()` は、配送の結果も、それを待つ重複の結果も変えない。
+- **observable state とイベント**: fold は dispose を見つけると observable state を変えずに戻る(従来どおり)。dispose の後は `stripe-checkout:webhook-warning` も `stripe-checkout:webhook-deduped` も出さない(結果が決まった後に dispose された重複は resolve するが、`webhook-deduped` は出さない)。
+- **dedup window**: reject した配送の id は window に残らない。`dispose()` が window 全体を消すので、fatal handler の throw で id を外すのと同じ状態になる。処理中の記録も消える。dispose 済みの Core は以後の配送を入口で同じエラーで reject するので、再送は別の Core かプロセスに届き、そこで最初から処理される。
+- dedup の対象外の id(空文字・空白だけ・欠落・文字列でない値)の配送も同じように reject する。待ち合わせる重複がないだけである。
+- webhook を受ける Core を止めるとき(tenant の削除、プロセスの停止)は、先にその Core へ新しい配送を回すのをやめ、処理中の `handleWebhook` が終わるのを待ってから `dispose()` すると、処理中の配送を 500 にせずに済む。待たずに dispose しても event は失われない(500 になり Stripe が再送する)。
 
 代償:
 

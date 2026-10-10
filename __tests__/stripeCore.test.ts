@@ -1655,6 +1655,42 @@ describe("StripeCore", () => {
       });
     });
 
+    // Helpers for the in-flight and dispose-mid-processing tests below.
+    type Internals = {
+      _seenWebhookIds: Map<string, true>;
+      _inflightWebhooks: Map<string, Promise<void>>;
+      _inflightWebhookWaiters: Set<() => void>;
+    };
+    const internals = (c: StripeCore): Internals => c as unknown as Internals;
+
+    const DISPOSED = "[@csbc-dev/stripe] StripeCore has been disposed.";
+
+    /** A handler whose every call parks until the test settles it. */
+    function parkedHandler() {
+      const calls: { resolve: () => void; reject: (e: unknown) => void }[] = [];
+      const handler = () => new Promise<void>((resolve, reject) => { calls.push({ resolve, reject }); });
+      return { handler, calls };
+    }
+
+    /** Observes whether a promise has settled without awaiting it. */
+    function track(promise: Promise<void>) {
+      const state = { promise, settled: false };
+      promise.then(() => { state.settled = true; }, () => { state.settled = true; });
+      return state;
+    }
+
+    const flush = () => new Promise<void>((r) => setTimeout(r, 0));
+
+    function deliver(id: unknown, type = "x.y"): void {
+      provider.verifyWebhook = () => ({ id, type, data: { object: {} }, created: 1 } as unknown as StripeEvent);
+    }
+
+    function collectDeduped(c: StripeCore): unknown[] {
+      const deduped: unknown[] = [];
+      c.addEventListener("stripe-checkout:webhook-deduped", (e) => deduped.push((e as CustomEvent).detail));
+      return deduped;
+    }
+
     describe("a duplicate that arrives while the first delivery is still running waits for its outcome (regression: it was answered at once)", () => {
       // The dedup entry is recorded before the fold and the handlers run. A
       // delivery of the same id that reached the same process meanwhile (a
@@ -1663,39 +1699,6 @@ describe("StripeCore", () => {
       // delivery's fatal handler then threw, the id left the window, but
       // Stripe had its 2xx and stopped retrying: the event was lost. Now the
       // duplicate waits for the first delivery and settles with its outcome.
-
-      type Internals = {
-        _seenWebhookIds: Map<string, true>;
-        _inflightWebhooks: Map<string, Promise<void>>;
-        _inflightWebhookWaiters: Set<() => void>;
-      };
-      const internals = (c: StripeCore): Internals => c as unknown as Internals;
-
-      /** A handler whose every call parks until the test settles it. */
-      function parkedHandler() {
-        const calls: { resolve: () => void; reject: (e: unknown) => void }[] = [];
-        const handler = () => new Promise<void>((resolve, reject) => { calls.push({ resolve, reject }); });
-        return { handler, calls };
-      }
-
-      /** Observes whether a promise has settled without awaiting it. */
-      function track(promise: Promise<void>) {
-        const state = { promise, settled: false };
-        promise.then(() => { state.settled = true; }, () => { state.settled = true; });
-        return state;
-      }
-
-      const flush = () => new Promise<void>((r) => setTimeout(r, 0));
-
-      function deliver(id: unknown, type = "x.y"): void {
-        provider.verifyWebhook = () => ({ id, type, data: { object: {} }, created: 1 } as unknown as StripeEvent);
-      }
-
-      function collectDeduped(c: StripeCore): unknown[] {
-        const deduped: unknown[] = [];
-        c.addEventListener("stripe-checkout:webhook-deduped", (e) => deduped.push((e as CustomEvent).detail));
-        return deduped;
-      }
 
       it("first succeeds: the duplicate stays pending until then, resolves too, and runs neither the fold nor the handler", async () => {
         core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
@@ -1873,7 +1876,7 @@ describe("StripeCore", () => {
         expect(internals(core)._inflightWebhooks.size).toBe(0);
       });
 
-      it("dispose while duplicates wait: they reject with the disposed error at once and the in-flight state is cleared", async () => {
+      it("dispose while duplicates wait: they reject with the disposed error at once, and so does the first delivery once its handler returns", async () => {
         const parked = parkedHandler();
         core.registerWebhookHandler("x.y", parked.handler);
         deliver("evt_inflight_dispose");
@@ -1888,18 +1891,21 @@ describe("StripeCore", () => {
         expect(internals(core)._inflightWebhooks.size).toBe(0);
         expect(internals(core)._inflightWebhookWaiters.size).toBe(0);
         // The first delivery's handler is still parked; the waiters do not wait for it.
-        for (const d of dups) await expect(d.promise).rejects.toThrow("[@csbc-dev/stripe] StripeCore has been disposed.");
+        for (const d of dups) await expect(d.promise).rejects.toThrow(DISPOSED);
         expect(first.settled).toBe(false);
 
+        // The handler succeeds, but the Core was disposed before it resumed:
+        // the first delivery answers like its duplicates (500, Stripe retries).
         parked.calls[0].resolve();
-        await first.promise;
+        await expect(first.promise).rejects.toThrow(DISPOSED);
         expect(parked.calls).toHaveLength(1);
+        expect(internals(core)._seenWebhookIds.size).toBe(0);
         expect(internals(core)._inflightWebhooks.size).toBe(0);
       });
 
-      it("dispose, then the first delivery's fatal handler throws: the waiter gets the disposed error, not the throw", async () => {
-        // A disposed Core cannot vouch for the event, so the waiter's answer
-        // is the dispose even though the first delivery ends in a throw.
+      it("dispose, then the first delivery's fatal handler throws: both get the disposed error, not the throw", async () => {
+        // A disposed Core cannot vouch for the event, so the answer is the
+        // dispose even though the first delivery's handler ends in a throw.
         const parked = parkedHandler();
         core.registerWebhookHandler("x.y", parked.handler, { fatal: true });
         deliver("evt_inflight_dispose_fatal");
@@ -1911,8 +1917,9 @@ describe("StripeCore", () => {
         core.dispose();
         const failure = new Error("handler failed after dispose");
         parked.calls[0].reject(failure);
-        await expect(first.promise).rejects.toBe(failure);
-        await expect(dup.promise).rejects.toThrow(/StripeCore has been disposed/);
+        await expect(first.promise).rejects.toThrow(DISPOSED);
+        await expect(dup.promise).rejects.toThrow(DISPOSED);
+        expect(internals(core)._seenWebhookIds.size).toBe(0);
         expect(internals(core)._inflightWebhooks.size).toBe(0);
         expect(internals(core)._inflightWebhookWaiters.size).toBe(0);
       });
@@ -1938,6 +1945,268 @@ describe("StripeCore", () => {
         parked.calls[0].resolve();
         await a.promise;
         expect(internals(core)._seenWebhookIds.size).toBe(0);
+      });
+    });
+
+    describe("dispose while a delivery is being processed rejects it (regression: it resolved and skipped the remaining handlers)", () => {
+      // `dispose()` during the fold or a handler used to end the handler
+      // loop with a plain return: the delivery resolved, the route answered
+      // 200, and Stripe stopped retrying an event whose remaining fatal
+      // handlers never ran. Now the delivery rejects with the disposed error
+      // once its current await returns (500, Stripe retries and another Core
+      // or process handles the event), like the duplicates waiting on it.
+      // The outcome is decided when the Core resumes after the last handler;
+      // a dispose after that changes nothing.
+
+      /** A handler that counts its calls and returns at once. */
+      function countingHandler() {
+        const counter = { calls: 0, handler: () => { counter.calls++; } };
+        return counter;
+      }
+
+      function collectWarnings(c: StripeCore): unknown[] {
+        const warnings: unknown[] = [];
+        c.addEventListener("stripe-checkout:webhook-warning", (e) => warnings.push((e as CustomEvent).detail));
+        return warnings;
+      }
+
+      function expectNothingLeft(c: StripeCore): void {
+        expect(internals(c)._seenWebhookIds.size).toBe(0);
+        expect(internals(c)._inflightWebhooks.size).toBe(0);
+        expect(internals(c)._inflightWebhookWaiters.size).toBe(0);
+      }
+
+      it("during the fold's retrieve await: the delivery and its waiting duplicate reject, no handler runs, and the fold changes nothing", async () => {
+        await core.requestIntent({ mode: "payment", hint: {} });
+        let releaseRetrieve!: (v: StripeIntentView) => void;
+        provider.retrieveIntent = () => new Promise<StripeIntentView>((resolve) => { releaseRetrieve = resolve; });
+        const fatal = countingHandler();
+        const nonFatal = countingHandler();
+        core.registerWebhookHandler("payment_intent.succeeded", fatal.handler, { fatal: true });
+        core.registerWebhookHandler("payment_intent.succeeded", nonFatal.handler, { fatal: false });
+        // No payment_method on the event, so the fold awaits retrieveIntent.
+        provider.webhookEvent = {
+          id: "evt_dispose_fold",
+          type: "payment_intent.succeeded",
+          created: 1,
+          data: { object: { id: "pi_123", status: "succeeded" } },
+        };
+
+        const first = track(core.handleWebhook("raw", "sig"));
+        await flush();
+        const dup = track(core.handleWebhook("raw", "sig"));
+        await flush();
+        expect(internals(core)._seenWebhookIds.has("evt_dispose_fold")).toBe(true);
+        expect(internals(core)._inflightWebhooks.size).toBe(1);
+        expect(internals(core)._inflightWebhookWaiters.size).toBe(1);
+
+        core.dispose();
+        await expect(dup.promise).rejects.toThrow(DISPOSED);
+        expect(first.settled).toBe(false);
+
+        releaseRetrieve({
+          id: "pi_123",
+          status: "succeeded",
+          mode: "payment",
+          paymentMethod: { id: "pm_late", brand: "visa", last4: "0001" },
+        });
+        await expect(first.promise).rejects.toThrow(DISPOSED);
+        expect(fatal.calls).toBe(0);
+        expect(nonFatal.calls).toBe(0);
+        expect(core.status).toBe("collecting");
+        expect(core.paymentMethod).toBeNull();
+        expectNothingLeft(core);
+      });
+
+      it.each([
+        ["returns", false],
+        ["throws", true],
+      ])("during a fatal handler's await (the handler then %s): the delivery and its waiting duplicate reject with the disposed error, and the remaining handlers do not run", async (_label, throws) => {
+        const parked = parkedHandler();
+        const laterFatal = countingHandler();
+        const laterNonFatal = countingHandler();
+        core.registerWebhookHandler("x.y", parked.handler, { fatal: true });
+        core.registerWebhookHandler("x.y", laterFatal.handler, { fatal: true });
+        core.registerWebhookHandler("x.y", laterNonFatal.handler, { fatal: false });
+        const warnings = collectWarnings(core);
+        deliver("evt_dispose_fatal");
+
+        const first = track(core.handleWebhook("raw", "sig"));
+        await flush();
+        const dup = track(core.handleWebhook("raw", "sig"));
+        await flush();
+        expect(parked.calls).toHaveLength(1);
+
+        core.dispose();
+        await expect(dup.promise).rejects.toThrow(DISPOSED);
+        expect(first.settled).toBe(false);
+
+        if (throws) parked.calls[0].reject(new Error("fulfillment db down"));
+        else parked.calls[0].resolve();
+        await expect(first.promise).rejects.toThrow(DISPOSED);
+        expect(parked.calls).toHaveLength(1);
+        expect(laterFatal.calls).toBe(0);
+        expect(laterNonFatal.calls).toBe(0);
+        expect(warnings).toEqual([]);
+        expectNothingLeft(core);
+      });
+
+      it.each([
+        ["fatal", true],
+        ["non-fatal", false],
+      ])("the interrupted %s handler's own failure rides along as the disposed error's cause", async (_label, fatal) => {
+        const parked = parkedHandler();
+        core.registerWebhookHandler("x.y", parked.handler, { fatal });
+        deliver("evt_dispose_cause");
+
+        const first = track(core.handleWebhook("raw", "sig"));
+        await flush();
+        core.dispose();
+        const handlerError = new Error("fulfillment db down");
+        parked.calls[0].reject(handlerError);
+
+        const error = await first.promise.catch((e: unknown) => e) as Error & { cause?: unknown };
+        expect(error).toBeInstanceOf(Error);
+        expect(error.message).toMatch(DISPOSED);
+        expect(error.cause).toBe(handlerError);
+        // Non-enumerable, like ES2022 `new Error(message, { cause })`.
+        expect(Object.keys(error)).not.toContain("cause");
+      });
+
+      it("a handler that succeeds before the dispose is noticed leaves no cause", async () => {
+        const parked = parkedHandler();
+        core.registerWebhookHandler("x.y", parked.handler, { fatal: true });
+        deliver("evt_dispose_no_cause");
+
+        const first = track(core.handleWebhook("raw", "sig"));
+        await flush();
+        core.dispose();
+        parked.calls[0].resolve();
+
+        const error = await first.promise.catch((e: unknown) => e) as Error & { cause?: unknown };
+        expect(error.message).toMatch(DISPOSED);
+        expect("cause" in error).toBe(false);
+      });
+      it.each([
+        ["returns", false],
+        ["throws", true],
+      ])("during a non-fatal handler's await (the handler then %s): the delivery and its waiting duplicate reject, no warning is dispatched, and the remaining handlers do not run", async (_label, throws) => {
+        const parked = parkedHandler();
+        const laterFatal = countingHandler();
+        core.registerWebhookHandler("x.y", parked.handler, { fatal: false });
+        core.registerWebhookHandler("x.y", laterFatal.handler, { fatal: true });
+        const warnings = collectWarnings(core);
+        deliver("evt_dispose_nonfatal");
+
+        const first = track(core.handleWebhook("raw", "sig"));
+        await flush();
+        const dup = track(core.handleWebhook("raw", "sig"));
+        await flush();
+
+        core.dispose();
+        await expect(dup.promise).rejects.toThrow(DISPOSED);
+        expect(first.settled).toBe(false);
+
+        if (throws) parked.calls[0].reject(new Error("audit log down"));
+        else parked.calls[0].resolve();
+        await expect(first.promise).rejects.toThrow(DISPOSED);
+        expect(parked.calls).toHaveLength(1);
+        expect(laterFatal.calls).toBe(0);
+        expect(warnings).toEqual([]);
+        expectNothingLeft(core);
+      });
+
+      it("a webhook-warning listener that disposes the Core: the delivery rejects before the next handler runs", async () => {
+        core.registerWebhookHandler("x.y", () => { throw new Error("audit log down"); }, { fatal: false });
+        const laterFatal = countingHandler();
+        core.registerWebhookHandler("x.y", laterFatal.handler, { fatal: true });
+        const warnings = collectWarnings(core);
+        core.addEventListener("stripe-checkout:webhook-warning", () => core.dispose());
+        deliver("evt_dispose_warning");
+
+        await expect(core.handleWebhook("raw", "sig")).rejects.toThrow(DISPOSED);
+        expect(warnings).toHaveLength(1);
+        expect(laterFatal.calls).toBe(0);
+        expectNothingLeft(core);
+      });
+
+      it("during the last handler's await, after the handler has returned but before the Core resumes: the delivery and its waiting duplicate still reject", async () => {
+        // All handlers have done their work, but the outcome is not decided
+        // until the Core resumes, and the duplicate was already rejected at
+        // the dispose: the first delivery answers the same way.
+        const parked = parkedHandler();
+        core.registerWebhookHandler("x.y", parked.handler);
+        deliver("evt_dispose_last");
+
+        const first = track(core.handleWebhook("raw", "sig"));
+        await flush();
+        const dup = track(core.handleWebhook("raw", "sig"));
+        await flush();
+
+        parked.calls[0].resolve();
+        core.dispose();
+        await expect(first.promise).rejects.toThrow(DISPOSED);
+        await expect(dup.promise).rejects.toThrow(DISPOSED);
+        expect(parked.calls).toHaveLength(1);
+        expectNothingLeft(core);
+      });
+
+      it.each([
+        ["succeeded", true],
+        ["failed in a fatal handler", false],
+      ])("after the outcome is decided (the first delivery %s): a dispose before either promise settles changes nothing for the delivery or its waiting duplicate", async (_label, succeeds) => {
+        const parked = parkedHandler();
+        core.registerWebhookHandler("x.y", parked.handler, { fatal: true });
+        const deduped = collectDeduped(core);
+        deliver("evt_dispose_after");
+
+        const first = track(core.handleWebhook("raw", "sig"));
+        await flush();
+        const dup = track(core.handleWebhook("raw", "sig"));
+        await flush();
+
+        // The Core's await on the handler resumes in the first microtask and
+        // decides the outcome; dispose() runs in the next one, before either
+        // promise has settled.
+        const failure = new Error("fulfillment db down");
+        if (succeeds) parked.calls[0].resolve();
+        else parked.calls[0].reject(failure);
+        let settledAtDispose: boolean[] = [];
+        queueMicrotask(() => {
+          settledAtDispose = [first.settled, dup.settled];
+          core.dispose();
+        });
+
+        if (succeeds) {
+          await expect(first.promise).resolves.toBeUndefined();
+          await expect(dup.promise).resolves.toBeUndefined();
+        } else {
+          await expect(first.promise).rejects.toBe(failure);
+          await expect(dup.promise).rejects.toBe(failure);
+        }
+        expect(settledAtDispose).toEqual([false, false]);
+        expect(parked.calls).toHaveLength(1);
+        // A disposed Core dispatches nothing, so the duplicate's
+        // `webhook-deduped` is skipped even though it resolves.
+        expect(deduped).toEqual([]);
+        // dispose() cleared the window either way.
+        expectNothingLeft(core);
+      });
+
+      it("an id that bypasses dedup is rejected the same way", async () => {
+        const parked = parkedHandler();
+        const laterFatal = countingHandler();
+        core.registerWebhookHandler("x.y", parked.handler);
+        core.registerWebhookHandler("x.y", laterFatal.handler);
+        deliver("");
+
+        const delivery = track(core.handleWebhook("raw", "sig"));
+        await flush();
+        core.dispose();
+        parked.calls[0].resolve();
+        await expect(delivery.promise).rejects.toThrow(DISPOSED);
+        expect(laterFatal.calls).toBe(0);
+        expectNothingLeft(core);
       });
     });
 
@@ -2094,9 +2363,9 @@ describe("StripeCore", () => {
         mode: "payment",
         paymentMethod: { id: "pm_late", brand: "visa", last4: "0001" },
       });
-      // handleWebhook awaits the fold but its own _disposed guard at
-      // entry already ran before dispose, so the await must complete.
-      await handlePromise;
+      // handleWebhook's own _disposed guard at entry ran before dispose; the
+      // delivery rejects once the fold returns, so the route answers 500.
+      await expect(handlePromise).rejects.toThrow(/StripeCore has been disposed/);
 
       // Critical: dispose drops _activeIntent, so the late paymentMethod
       // must NOT land on observable state. Reading post-dispose `error` /
