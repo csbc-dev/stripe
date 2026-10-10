@@ -1,9 +1,26 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { isJsonValue } from "@wc-bindable/remote";
+
+// Pass-through counter on the constant-time compare `resumeIntent` uses for
+// the clientSecret ownership check, so a test can pin that the compare still
+// runs whatever the provider put in `clientSecret` (no short-circuit for a
+// missing or non-string value). Behavior is unchanged: the real
+// `timingSafeEqual` does the work. Vitest resolves a builtin's named imports
+// through its `default` export, so the wrapper goes on both.
+const cryptoSpy = vi.hoisted(() => ({ timingSafeEqualCalls: 0 }));
+vi.mock("node:crypto", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:crypto")>();
+  const timingSafeEqual = (a: NodeJS.ArrayBufferView, b: NodeJS.ArrayBufferView): boolean => {
+    cryptoSpy.timingSafeEqualCalls++;
+    return actual.timingSafeEqual(a, b);
+  };
+  return { ...actual, default: { ...actual, timingSafeEqual }, timingSafeEqual };
+});
 import { StripeCore } from "../src/core/StripeCore";
+import { StripeSdkProvider, type StripeNodeLike } from "../src/providers/StripeSdkProvider";
 import {
   IStripeProvider, IntentCreationResult, PaymentIntentOptions, SetupIntentOptions,
-  StripeEvent, StripeIntentView, StripeMode,
+  StripeAmount, StripeEvent, StripeIntentView, StripeMode, StripePaymentMethod,
 } from "../src/types";
 
 class FakeProvider implements IStripeProvider {
@@ -2239,6 +2256,630 @@ describe("StripeCore", () => {
       await core.handleWebhook("{}", "sig");
       expect(core.paymentMethod).toEqual({ id: "pm_already", brand: "visa", last4: "4242" });
       expect(provider.retrieveCalls.length).toBe(retrievesBefore);
+    });
+  });
+
+  describe("provider amount / paymentMethod are rebuilt by the Core before reaching observable state (regression: @wc-bindable/remote >= 0.10)", () => {
+    // A custom IStripeProvider's `retrieveIntent` (and `createPaymentIntent`)
+    // result used to reach `amount` / `paymentMethod` as-is. Remote 0.10
+    // drops an `update` whose value holds `undefined` / `Date` / `NaN` (and
+    // lists it in `getterFailures` on `sync`), and any extra field rode
+    // along to the browser. The Core now keeps only the documented fields
+    // and treats a value that does not fit as "not reported".
+
+    // Valid documented fields plus an internal id, `undefined`, a `Date`
+    // and `NaN` — every kind of member the 0.10 wire rejects or must not see.
+    const dirtyAmount = (value = 2500, currency = "usd"): StripeAmount => ({
+      value,
+      currency,
+      internalOrderId: "ord_internal_42",
+      note: undefined,
+      fetchedAt: new Date(0),
+      fxRate: Number.NaN,
+    }) as unknown as StripeAmount;
+    const dirtyPaymentMethod = (id = "pm_dirty"): StripePaymentMethod => ({
+      id,
+      brand: "visa",
+      last4: "4242",
+      fingerprint: "fp_internal_secret",
+      wallet: undefined,
+      createdAt: new Date(0),
+      riskScore: Number.NaN,
+    }) as unknown as StripePaymentMethod;
+
+    const invalidAmounts: Array<[string, unknown]> = [
+      ["value NaN", { value: Number.NaN, currency: "usd" }],
+      ["value Infinity", { value: Number.POSITIVE_INFINITY, currency: "usd" }],
+      ["value -Infinity", { value: Number.NEGATIVE_INFINITY, currency: "usd" }],
+      ["value as a string", { value: "2500", currency: "usd" }],
+      ["value undefined", { value: undefined, currency: "usd" }],
+      ["currency missing", { value: 2500 }],
+      ["currency undefined", { value: 2500, currency: undefined }],
+      ["currency empty", { value: 2500, currency: "" }],
+      ["currency as a number", { value: 2500, currency: 840 }],
+      ["a Date", new Date(0)],
+      ["an array", [2500, "usd"]],
+      ["a bare number", 2500],
+      ["null", null],
+    ];
+    const invalidPaymentMethods: Array<[string, unknown]> = [
+      ["last4 missing", { id: "pm_bad", brand: "visa" }],
+      ["last4 undefined", { id: "pm_bad", brand: "visa", last4: undefined }],
+      ["brand empty", { id: "pm_bad", brand: "", last4: "4242" }],
+      ["id as a number", { id: 42, brand: "visa", last4: "4242" }],
+      ["id over the length cap", { id: "pm_" + "x".repeat(200), brand: "visa", last4: "4242" }],
+      ["a bare pm id string", "pm_bare"],
+      ["a Date", new Date(0)],
+      ["null", null],
+    ];
+
+    function observe(c: StripeCore): { amounts: unknown[]; paymentMethods: unknown[] } {
+      const amounts: unknown[] = [];
+      const paymentMethods: unknown[] = [];
+      c.addEventListener("stripe-checkout:amount-changed", (e) => amounts.push((e as CustomEvent).detail));
+      c.addEventListener("stripe-checkout:paymentMethod-changed", (e) => paymentMethods.push((e as CustomEvent).detail));
+      return { amounts, paymentMethods };
+    }
+
+    /** Both wire channels RemoteShellProxy reads: the getter (`sync`) and the event detail (`update`). */
+    function expectCleanSurface(c: StripeCore, seen: { amounts: unknown[]; paymentMethods: unknown[] }, amount: StripeAmount | null, pm: StripePaymentMethod | null): void {
+      expect(c.amount).toEqual(amount);
+      expect(c.paymentMethod).toEqual(pm);
+      expect(isJsonValue(c.amount)).toBe(true);
+      expect(isJsonValue(c.paymentMethod)).toBe(true);
+      if (amount) expect(Object.keys(c.amount!)).toEqual(["value", "currency"]);
+      if (pm) expect(Object.keys(c.paymentMethod!)).toEqual(["id", "brand", "last4"]);
+      for (const detail of [...seen.amounts, ...seen.paymentMethods]) {
+        expect(isJsonValue(detail)).toBe(true);
+      }
+      const wire = JSON.stringify([c.amount, c.paymentMethod, seen.amounts, seen.paymentMethods]);
+      expect(wire).not.toContain("ord_internal_42");
+      expect(wire).not.toContain("fp_internal_secret");
+    }
+
+    it("resumeIntent: keeps only { value, currency } and { id, brand, last4 }", async () => {
+      const seen = observe(core);
+      provider.retrieveResult = {
+        id: "pi_resume_dirty",
+        status: "succeeded",
+        mode: "payment",
+        amount: dirtyAmount(),
+        paymentMethod: dirtyPaymentMethod(),
+        clientSecret: "pi_resume_dirty_secret_ok",
+      };
+      await core.resumeIntent("pi_resume_dirty", "payment", "pi_resume_dirty_secret_ok");
+
+      expect(core.status).toBe("succeeded");
+      expectCleanSurface(core, seen, { value: 2500, currency: "usd" }, { id: "pm_dirty", brand: "visa", last4: "4242" });
+      expect(seen.amounts).toEqual([{ value: 2500, currency: "usd" }]);
+      expect(seen.paymentMethods).toEqual([{ id: "pm_dirty", brand: "visa", last4: "4242" }]);
+    });
+
+    it("reportConfirmation(processing) reconcile: keeps only the documented fields", async () => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await core.requestIntent({ mode: "payment", hint: {} });
+      const seen = observe(core);
+      provider.retrieveResult = {
+        id: "pi_123",
+        status: "succeeded",
+        mode: "payment",
+        amount: dirtyAmount(1200, "usd"),
+        paymentMethod: dirtyPaymentMethod(),
+      };
+      await core.reportConfirmation({ intentId: "pi_123", outcome: "processing" });
+
+      expect(core.status).toBe("succeeded");
+      expectCleanSurface(core, seen, { value: 1200, currency: "usd" }, { id: "pm_dirty", brand: "visa", last4: "4242" });
+    });
+
+    it("reportConfirmation(succeeded) server-side retrieve fallback: keeps only { id, brand, last4 }", async () => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await core.requestIntent({ mode: "payment", hint: {} });
+      const seen = observe(core);
+      provider.retrieveResult = {
+        id: "pi_123",
+        status: "succeeded",
+        mode: "payment",
+        paymentMethod: dirtyPaymentMethod("pm_fallback"),
+      };
+      await core.reportConfirmation({ intentId: "pi_123", outcome: "succeeded" });
+
+      expect(provider.retrieveCalls).toEqual([{ mode: "payment", id: "pi_123" }]);
+      expect(core.status).toBe("succeeded");
+      expectCleanSurface(core, seen, { value: 1000, currency: "usd" }, { id: "pm_fallback", brand: "visa", last4: "4242" });
+    });
+
+    it("webhook succeeded retrieve fallback: keeps only { id, brand, last4 }", async () => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await core.requestIntent({ mode: "payment", hint: {} });
+      const seen = observe(core);
+      provider.retrieveResult = {
+        id: "pi_123",
+        status: "succeeded",
+        mode: "payment",
+        paymentMethod: dirtyPaymentMethod("pm_webhook"),
+      };
+      provider.webhookEvent = {
+        id: "evt_dirty_pm",
+        type: "payment_intent.succeeded",
+        data: { object: { id: "pi_123", payment_method: "pm_bare_id_only" } },
+        created: 0,
+      };
+      await core.handleWebhook("{}", "sig");
+
+      expect(core.status).toBe("succeeded");
+      expectCleanSurface(core, seen, { value: 1000, currency: "usd" }, { id: "pm_webhook", brand: "visa", last4: "4242" });
+    });
+
+    it.each(invalidAmounts)("an amount that does not fit (%s) is treated as not reported: reconcile keeps the current amount", async (_label, bad) => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await core.requestIntent({ mode: "payment", hint: {} });
+      const seen = observe(core);
+      provider.retrieveResult = {
+        id: "pi_123",
+        status: "succeeded",
+        mode: "payment",
+        amount: bad as StripeAmount,
+      };
+      await core.reportConfirmation({ intentId: "pi_123", outcome: "processing" });
+
+      expect(core.status).toBe("succeeded");
+      expect(core.amount).toEqual({ value: 1000, currency: "usd" });
+      expect(seen.amounts).toEqual([]);
+    });
+
+    it.each(invalidAmounts)("an amount that does not fit (%s) is treated as not reported: resume leaves amount null", async (_label, bad) => {
+      provider.retrieveResult = {
+        id: "pi_resume_bad_amount",
+        status: "succeeded",
+        mode: "payment",
+        amount: bad as StripeAmount,
+        clientSecret: "pi_resume_bad_amount_secret",
+      };
+      await core.resumeIntent("pi_resume_bad_amount", "payment", "pi_resume_bad_amount_secret");
+      expect(core.status).toBe("succeeded");
+      expect(core.amount).toBeNull();
+    });
+
+    it.each(invalidPaymentMethods)("a paymentMethod that does not fit (%s) is treated as not reported by the retrieve fallback", async (_label, bad) => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await core.requestIntent({ mode: "payment", hint: {} });
+      const seen = observe(core);
+      provider.retrieveResult = {
+        id: "pi_123",
+        status: "succeeded",
+        mode: "payment",
+        paymentMethod: bad as StripePaymentMethod,
+      };
+      await core.reportConfirmation({ intentId: "pi_123", outcome: "succeeded" });
+
+      // Same as a retrieve that found no card: succeeded, paymentMethod
+      // left for the webhook path to fill.
+      expect(core.status).toBe("succeeded");
+      expect(core.paymentMethod).toBeNull();
+      expect(seen.paymentMethods).toEqual([]);
+    });
+
+    it.each(invalidPaymentMethods)("a paymentMethod that does not fit (%s) does not replace the current one on reconcile", async (_label, bad) => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await core.requestIntent({ mode: "payment", hint: {} });
+      await core.reportConfirmation({
+        intentId: "pi_123",
+        outcome: "succeeded",
+        paymentMethod: { id: "pm_reported", brand: "visa", last4: "4242" },
+      });
+      provider.retrieveResult = {
+        id: "pi_123",
+        status: "succeeded",
+        mode: "payment",
+        paymentMethod: bad as StripePaymentMethod,
+      };
+      await core.reportConfirmation({ intentId: "pi_123", outcome: "processing" });
+      expect(core.paymentMethod).toEqual({ id: "pm_reported", brand: "visa", last4: "4242" });
+    });
+
+    it.each(invalidPaymentMethods)("a paymentMethod that does not fit (%s) is ignored by the webhook retrieve fallback", async (_label, bad) => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await core.requestIntent({ mode: "payment", hint: {} });
+      provider.retrieveResult = {
+        id: "pi_123",
+        status: "succeeded",
+        mode: "payment",
+        paymentMethod: bad as StripePaymentMethod,
+      };
+      provider.webhookEvent = {
+        id: "evt_bad_pm",
+        type: "payment_intent.succeeded",
+        data: { object: { id: "pi_123" } },
+        created: 0,
+      };
+      await core.handleWebhook("{}", "sig");
+      expect(core.status).toBe("succeeded");
+      expect(core.paymentMethod).toBeNull();
+    });
+
+    it("a setup-mode view still clears amount even when its amount is dirty", async () => {
+      provider.retrieveResult = {
+        id: "seti_dirty",
+        status: "succeeded",
+        mode: "setup",
+        amount: dirtyAmount(),
+        paymentMethod: dirtyPaymentMethod("pm_setup"),
+        clientSecret: "seti_dirty_secret",
+      };
+      const seen = observe(core);
+      await core.resumeIntent("seti_dirty", "setup", "seti_dirty_secret");
+      expectCleanSurface(core, seen, null, { id: "pm_setup", brand: "visa", last4: "4242" });
+    });
+
+    it.each(invalidAmounts)("requestIntent: a provider amount that does not fit (%s) is omitted from the return and the observable amount", async (_label, bad) => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      provider.createPaymentIntent = async () => ({
+        intentId: "pi_bad_amount",
+        clientSecret: "pi_bad_amount_secret",
+        mode: "payment",
+        amount: bad as StripeAmount,
+      });
+      const result = await core.requestIntent({ mode: "payment", hint: {} });
+      expect(result).toEqual({ intentId: "pi_bad_amount", clientSecret: "pi_bad_amount_secret", mode: "payment" });
+      expect("amount" in result).toBe(false);
+      expect(isJsonValue(result)).toBe(true);
+      expect(core.amount).toBeNull();
+    });
+
+    it("requestIntent: a dirty provider amount is rebuilt in the return and the observable amount", async () => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 2500, currency: "usd" }));
+      provider.createPaymentIntent = async () => ({
+        intentId: "pi_dirty_amount",
+        clientSecret: "pi_dirty_amount_secret",
+        mode: "payment",
+        amount: dirtyAmount(),
+      });
+      const seen = observe(core);
+      const result = await core.requestIntent({ mode: "payment", hint: {} });
+      expect(result.amount).toEqual({ value: 2500, currency: "usd" });
+      expect(Object.keys(result.amount!)).toEqual(["value", "currency"]);
+      expect(isJsonValue(result)).toBe(true);
+      expectCleanSurface(core, seen, { value: 2500, currency: "usd" }, null);
+    });
+
+    it("the StripeSdkProvider view reaches observable state with the same values (default provider unchanged)", async () => {
+      // A Stripe retrieve response carries far more than the view keeps;
+      // StripeSdkProvider already narrows it, and the Core's rebuild must
+      // not change any value it produces.
+      const stripeIntent = {
+        id: "pi_sdk",
+        object: "payment_intent",
+        status: "succeeded",
+        amount: 1980,
+        currency: "jpy",
+        client_secret: "pi_sdk_secret_ok",
+        metadata: { userId: "u_1" },
+        payment_method: {
+          id: "pm_sdk",
+          object: "payment_method",
+          card: { brand: "mastercard", last4: "4444", exp_month: 12, exp_year: 2030, fingerprint: "fp_sdk" },
+        },
+      };
+      const client: StripeNodeLike = {
+        paymentIntents: {
+          async create() { throw new Error("not used"); },
+          async retrieve() { return stripeIntent; },
+          async cancel(id) { return { id, status: "canceled" }; },
+        },
+        setupIntents: {
+          async create() { throw new Error("not used"); },
+          async retrieve() { throw new Error("not used"); },
+        },
+        webhooks: {
+          constructEvent() { throw new Error("not used"); },
+        },
+      };
+      const sdkProvider = new StripeSdkProvider(client, { buildIdempotencyKey: () => undefined });
+      const view = await sdkProvider.retrieveIntent("payment", "pi_sdk");
+      const c = new StripeCore(sdkProvider);
+      await c.resumeIntent("pi_sdk", "payment", "pi_sdk_secret_ok");
+
+      expect(c.amount).toEqual(view.amount);
+      expect(c.paymentMethod).toEqual(view.paymentMethod);
+      expect(c.amount).toEqual({ value: 1980, currency: "jpy" });
+      expect(c.paymentMethod).toEqual({ id: "pm_sdk", brand: "mastercard", last4: "4444" });
+    });
+  });
+
+  describe("a retrieveIntent result that is not an intent view object (regression)", () => {
+    // A custom IStripeProvider whose `retrieveIntent` resolved with `null`
+    // (or `undefined`) made `resumeIntent` read `view.clientSecret` and
+    // reject with a raw TypeError — unsanitized, with the Core left on
+    // status=processing / loading=true. A string / number / array "view"
+    // was read as an intent without a status or secret. The Core now checks
+    // the container first and treats anything that is not a plain object as
+    // "the provider gave no answer": the resume fails without a `code`
+    // (transient, SPEC §4 — the redirect URL is kept for a retry), and the
+    // best-effort retrieve paths behave as if the retrieve had failed.
+    const NO_VIEW_MESSAGE = "[@csbc-dev/stripe] provider.retrieveIntent did not return an intent view object.";
+    const notViews: Array<[string, unknown]> = [
+      ["null", null],
+      ["undefined", undefined],
+      ["a string", "succeeded"],
+      ["a number", 42],
+      ["an array", [{ id: "pi_resume_bad", status: "succeeded", mode: "payment", clientSecret: "pi_resume_bad_secret_ok" }]],
+    ];
+
+    function answerWith(value: unknown): void {
+      provider.retrieveIntent = async (mode, id) => {
+        provider.retrieveCalls.push({ mode, id });
+        return value as StripeIntentView;
+      };
+    }
+
+    async function rejectionOf(p: Promise<unknown>): Promise<unknown> {
+      return p.then(
+        () => { throw new Error("expected a rejection"); },
+        (e: unknown) => e,
+      );
+    }
+
+    it.each(notViews)("resumeIntent: %s fails with a sanitized, code-less error and lands on idle / loading=false", async (_label, bad) => {
+      const errors: unknown[] = [];
+      const statuses: unknown[] = [];
+      core.addEventListener("stripe-checkout:error", (e) => errors.push((e as CustomEvent).detail));
+      core.addEventListener("stripe-checkout:status-changed", (e) => statuses.push((e as CustomEvent).detail));
+      let authorizerCalls = 0;
+      core.registerResumeAuthorizer(() => { authorizerCalls++; return true; });
+      answerWith(bad);
+
+      const rejection = await rejectionOf(core.resumeIntent("pi_resume_bad", "payment", "pi_resume_bad_secret_ok"));
+
+      expect(provider.retrieveCalls).toEqual([{ mode: "payment", id: "pi_resume_bad" }]);
+      expect(rejection).toBeInstanceOf(Error);
+      expect(rejection).not.toBeInstanceOf(TypeError);
+      expect((rejection as Error).message).toBe(NO_VIEW_MESSAGE);
+      // No `code`: the Core reached no decision about the intent, so the
+      // SPEC §4 rule classifies the failure as transient in both modes.
+      expect("code" in (rejection as object)).toBe(false);
+      expect(core.error).toEqual({ message: NO_VIEW_MESSAGE });
+      expect(isJsonValue(core.error)).toBe(true);
+      expect(errors.at(-1)).toEqual({ message: NO_VIEW_MESSAGE });
+      expect(core.status).toBe("idle");
+      expect(statuses).toEqual(["processing", "idle"]);
+      expect(core.loading).toBe(false);
+      expect(core.intentId).toBeNull();
+      expect(core.amount).toBeNull();
+      expect(core.paymentMethod).toBeNull();
+      // Nothing after the retrieve ran: no authorizer, and the secret is
+      // nowhere on the observable surface or in the rejection.
+      expect(authorizerCalls).toBe(0);
+      expect(JSON.stringify([core.error, errors, (rejection as Error).message])).not.toContain("pi_resume_bad_secret_ok");
+      // `_activeIntent` was not rebuilt: a report for that id is dropped.
+      await core.reportConfirmation({ intentId: "pi_resume_bad", outcome: "succeeded" });
+      expect(core.status).toBe("idle");
+      expect(core.intentId).toBeNull();
+    });
+
+    it("resumeIntent: the same URL resumes once the provider answers again (the failure is not a decision)", async () => {
+      answerWith(null);
+      await expect(core.resumeIntent("pi_resume_retry", "payment", "pi_resume_retry_secret_ok")).rejects.toThrow(NO_VIEW_MESSAGE);
+      expect(core.status).toBe("idle");
+
+      answerWith({
+        id: "pi_resume_retry",
+        status: "succeeded",
+        mode: "payment",
+        amount: { value: 2500, currency: "usd" },
+        clientSecret: "pi_resume_retry_secret_ok",
+      });
+      await core.resumeIntent("pi_resume_retry", "payment", "pi_resume_retry_secret_ok");
+      expect(core.status).toBe("succeeded");
+      expect(core.loading).toBe(false);
+      expect(core.intentId).toBe("pi_resume_retry");
+      expect(core.amount).toEqual({ value: 2500, currency: "usd" });
+      expect(core.error).toBeNull();
+    });
+
+    it("resumeIntent: a superseded resume that gets no view stays silent, like any superseded resume", async () => {
+      provider.retrieveIntent = async () => { core.reset(); return null as unknown as StripeIntentView; };
+      await expect(core.resumeIntent("pi_resume_sup", "payment", "pi_resume_sup_secret_ok")).resolves.toBeUndefined();
+      expect(core.status).toBe("idle");
+      expect(core.loading).toBe(false);
+      expect(core.error).toBeNull();
+    });
+
+    it.each(notViews)("reportConfirmation(processing): %s is treated like a failed retrieve — processing / loading=true until the webhook", async (_label, bad) => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await core.requestIntent({ mode: "payment", hint: {} });
+      const unknown: unknown[] = [];
+      core.addEventListener("stripe-checkout:unknown-status", (e) => unknown.push((e as CustomEvent).detail));
+      answerWith(bad);
+
+      await core.reportConfirmation({ intentId: "pi_123", outcome: "processing" });
+
+      expect(provider.retrieveCalls).toEqual([{ mode: "payment", id: "pi_123" }]);
+      expect(core.status).toBe("processing");
+      expect(core.loading).toBe(true);
+      expect(core.error).toBeNull();
+      expect(core.amount).toEqual({ value: 1000, currency: "usd" });
+      expect(core.paymentMethod).toBeNull();
+      expect(unknown).toEqual([]);
+
+      // The webhook is still the authority and resolves the intent.
+      provider.webhookEvent = {
+        id: "evt_after_no_view",
+        type: "payment_intent.succeeded",
+        data: { object: { id: "pi_123" } },
+        created: 0,
+      };
+      await core.handleWebhook("{}", "sig");
+      expect(core.status).toBe("succeeded");
+      expect(core.loading).toBe(false);
+    });
+
+    it.each(notViews)("reportConfirmation(succeeded) retrieve fallback: %s counts as no card found", async (_label, bad) => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await core.requestIntent({ mode: "payment", hint: {} });
+      answerWith(bad);
+
+      await core.reportConfirmation({ intentId: "pi_123", outcome: "succeeded" });
+
+      expect(provider.retrieveCalls).toEqual([{ mode: "payment", id: "pi_123" }]);
+      expect(core.status).toBe("succeeded");
+      expect(core.loading).toBe(false);
+      expect(core.paymentMethod).toBeNull();
+      expect(core.error).toBeNull();
+    });
+
+    it.each(notViews)("webhook succeeded retrieve fallback: %s counts as no card found", async (_label, bad) => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await core.requestIntent({ mode: "payment", hint: {} });
+      answerWith(bad);
+      provider.webhookEvent = {
+        id: "evt_no_view",
+        type: "payment_intent.succeeded",
+        data: { object: { id: "pi_123", payment_method: "pm_bare_id_only" } },
+        created: 0,
+      };
+
+      await core.handleWebhook("{}", "sig");
+
+      expect(provider.retrieveCalls).toEqual([{ mode: "payment", id: "pi_123" }]);
+      expect(core.status).toBe("succeeded");
+      expect(core.loading).toBe(false);
+      expect(core.paymentMethod).toBeNull();
+    });
+  });
+
+  describe("resumeIntent: the clientSecret compare always runs (constant-time, regression)", () => {
+    // `clientSecretEquals` turns both sides into Buffers. A provider whose
+    // `clientSecret` was a number or an object made `Buffer.from` throw a
+    // raw TypeError (Core stuck on processing / loading=true, unsanitized
+    // rejection). A value that is not a string now counts as "not
+    // populated" — the documented hard reject — and still goes through the
+    // constant-time compare.
+    const nonStringSecrets: Array<[string, unknown]> = [
+      ["a number", 12345],
+      ["an object", { secret: "pi_resume_cs_secret_ok" }],
+    ];
+
+    beforeEach(() => { cryptoSpy.timingSafeEqualCalls = 0; });
+
+    it.each(nonStringSecrets)("a clientSecret that is %s is a mismatch (decisive), compared in constant time", async (_label, bad) => {
+      provider.retrieveResult = {
+        id: "pi_resume_cs",
+        status: "succeeded",
+        mode: "payment",
+        clientSecret: bad as string,
+      };
+      const rejection = await core.resumeIntent("pi_resume_cs", "payment", "pi_resume_cs_secret_ok").then(
+        () => { throw new Error("expected a rejection"); },
+        (e: unknown) => e,
+      );
+      expect(rejection).not.toBeInstanceOf(TypeError);
+      expect(rejection).toMatchObject({
+        code: "resume_client_secret_mismatch",
+        message: "clientSecret does not match the retrieved intent -- resume denied.",
+      });
+      expect(cryptoSpy.timingSafeEqualCalls).toBe(1);
+      expect(core.error).toEqual({
+        code: "resume_client_secret_mismatch",
+        message: "clientSecret does not match the retrieved intent -- resume denied.",
+      });
+      expect(core.status).toBe("idle");
+      expect(core.loading).toBe(false);
+      expect(core.intentId).toBeNull();
+    });
+
+    it("a missing clientSecret is compared too (no short-circuit before the compare)", async () => {
+      provider.retrieveResult = { id: "pi_resume_cs", status: "succeeded", mode: "payment" };
+      await expect(core.resumeIntent("pi_resume_cs", "payment", "pi_resume_cs_secret_ok")).rejects.toMatchObject({
+        code: "resume_client_secret_mismatch",
+      });
+      expect(cryptoSpy.timingSafeEqualCalls).toBe(1);
+    });
+
+    it("a matching clientSecret is accepted through the same compare", async () => {
+      provider.retrieveResult = { id: "pi_resume_cs", status: "succeeded", mode: "payment", clientSecret: "pi_resume_cs_secret_ok" };
+      await core.resumeIntent("pi_resume_cs", "payment", "pi_resume_cs_secret_ok");
+      expect(cryptoSpy.timingSafeEqualCalls).toBe(1);
+      expect(core.status).toBe("succeeded");
+    });
+  });
+
+  describe("a retrieved status that is not a string (regression)", () => {
+    // `view.status` went into the `stripe-checkout:unknown-status` detail
+    // as-is — in local mode that detail is a CustomEvent on the element. A
+    // status that is not a string is now handled like any unknown status
+    // (observable status unchanged, the webhook decides), and the detail
+    // carries only `status: ""` plus a reason naming the value's type.
+    const nonStringStatuses: Array<[string, unknown, string]> = [
+      ["a number", 42, "number"],
+      ["an object", { internal: "status_internal_marker" }, "object"],
+      ["an array", ["status_internal_marker"], "array"],
+      ["null", null, "null"],
+      ["missing", undefined, "undefined"],
+      ["a boolean", true, "boolean"],
+    ];
+
+    it.each(nonStringStatuses)("processing reconcile: %s → unknown-status with a safe detail, status unchanged", async (_label, bad, typeName) => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await core.requestIntent({ mode: "payment", hint: {} });
+      const unknown: unknown[] = [];
+      core.addEventListener("stripe-checkout:unknown-status", (e) => unknown.push((e as CustomEvent).detail));
+      provider.retrieveResult = { id: "pi_123", status: bad as string, mode: "payment" };
+
+      await core.reportConfirmation({ intentId: "pi_123", outcome: "processing" });
+
+      expect(core.status).toBe("processing");
+      expect(core.loading).toBe(true);
+      expect(core.error).toBeNull();
+      expect(unknown).toEqual([{
+        source: "core",
+        intentId: "pi_123",
+        mode: "payment",
+        status: "",
+        reason: `retrieveIntent returned a non-string status (${typeName}).`,
+      }]);
+      expect(isJsonValue(unknown[0])).toBe(true);
+      expect(JSON.stringify(unknown)).not.toContain("status_internal_marker");
+    });
+
+    it.each(nonStringStatuses)("3DS resume: %s → the resume is accepted, unknown-status with a safe detail, processing / loading=true", async (_label, bad, typeName) => {
+      const unknown: unknown[] = [];
+      core.addEventListener("stripe-checkout:unknown-status", (e) => unknown.push((e as CustomEvent).detail));
+      provider.retrieveResult = {
+        id: "pi_resume_status",
+        status: bad as string,
+        mode: "payment",
+        amount: { value: 1980, currency: "jpy" },
+        clientSecret: "pi_resume_status_secret_ok",
+      };
+
+      await core.resumeIntent("pi_resume_status", "payment", "pi_resume_status_secret_ok");
+
+      expect(core.intentId).toBe("pi_resume_status");
+      expect(core.amount).toEqual({ value: 1980, currency: "jpy" });
+      expect(core.status).toBe("processing");
+      expect(core.loading).toBe(true);
+      expect(unknown).toEqual([{
+        source: "core",
+        intentId: "pi_resume_status",
+        mode: "payment",
+        status: "",
+        reason: `retrieveIntent returned a non-string status (${typeName}).`,
+      }]);
+      expect(JSON.stringify(unknown)).not.toContain("status_internal_marker");
+      expect(JSON.stringify(unknown)).not.toContain("pi_resume_status_secret_ok");
+    });
+
+    it("an unknown status string is still reported verbatim, without a reason", async () => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await core.requestIntent({ mode: "payment", hint: {} });
+      const unknown: unknown[] = [];
+      core.addEventListener("stripe-checkout:unknown-status", (e) => unknown.push((e as CustomEvent).detail));
+      provider.retrieveResult = { id: "pi_123", status: "some_future_stripe_status", mode: "payment" };
+
+      await core.reportConfirmation({ intentId: "pi_123", outcome: "processing" });
+
+      expect(unknown).toEqual([{ source: "core", intentId: "pi_123", mode: "payment", status: "some_future_stripe_status" }]);
     });
   });
 

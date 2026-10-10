@@ -4,9 +4,10 @@ import {
   IntentRequestHint, ConfirmationReport, WebhookHandler, WebhookRegisterOptions,
   StripeError, StripeEvent, StripeMode, StripeStatus, StripeAmount, StripePaymentMethod,
   UserContext, PaymentIntentOptions, SetupIntentOptions, IntentBuilderResult,
-  ResumeAuthorizer, UnknownStatusDetail,
+  ResumeAuthorizer, UnknownStatusDetail, StripeIntentView,
 } from "../types.js";
-import { extractCardPaymentMethod, validateReportedPaymentMethod } from "../internal/paymentMethodShape.js";
+import { extractCardPaymentMethod, toObservablePaymentMethod } from "../internal/paymentMethodShape.js";
+import { toObservableAmount } from "../internal/amountShape.js";
 import {
   STRIPE_TAXONOMY_TOKEN_RE,
   STRIPE_ERROR_CODE_RE,
@@ -56,6 +57,53 @@ function clientSecretEquals(a: string, b: string): boolean {
     return false;
   }
   return timingSafeEqual(aBuf, bBuf);
+}
+
+/**
+ * An `IStripeProvider.retrieveIntent` result once the Core has checked that
+ * it is an object at all (`isRetrievedIntentView`). Every member is
+ * `unknown` on purpose: the provider seam is open to custom implementations,
+ * so each read validates its own field — `status` must be a string,
+ * `clientSecret` must be a string, `amount` / `paymentMethod` go through
+ * `toObservableAmount` / `toObservablePaymentMethod`, `lastPaymentError`
+ * through `_sanitizeError`.
+ */
+type RetrievedIntentView = { readonly [key: string]: unknown };
+
+/**
+ * Is a `retrieveIntent` result an object the Core can read as an intent
+ * view? Only the container is checked: a non-null, non-array object.
+ * Anything else (`null`, `undefined`, a string, a number, an array) means
+ * the provider gave no answer about the intent. Reading members off it
+ * would either throw a raw TypeError (`null` / `undefined`) or invent an
+ * intent with no status and no secret (a primitive / an array), so every
+ * retrieve path treats it like a retrieve that failed: the 3DS resume
+ * rejects without a `code` (transient, SPEC §4), the best-effort paths
+ * (processing reconcile, succeeded-branch and webhook fallbacks) change
+ * nothing and leave the webhook to decide.
+ */
+function isRetrievedIntentView(value: unknown): value is RetrievedIntentView {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Message of the resume failure for a `retrieveIntent` result that is not an
+ * intent view. A fixed, hand-curated `[@csbc-dev/stripe]` string — nothing
+ * from the provider's value is echoed — so it is what `_sanitizeError`
+ * would forward anyway, and it carries no `code` on purpose (see
+ * `resumeIntent`).
+ */
+const NO_INTENT_VIEW_MESSAGE = "[@csbc-dev/stripe] provider.retrieveIntent did not return an intent view object.";
+
+/**
+ * The type of a value, for a diagnostic that must not carry the value
+ * itself (`stripe-checkout:unknown-status` detail). `null` and arrays get
+ * their own names because `typeof` reports both as "object".
+ */
+function typeNameOf(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  return typeof value;
 }
 
 /**
@@ -546,24 +594,38 @@ export class StripeCore extends EventTarget {
     const prev = this._amount;
     if (prev === a) return;
     if (prev && a && prev.value === a.value && prev.currency === a.currency) return;
-    // Store a defensive shallow copy so a caller that retains the original
+    // Store a defensive copy so a caller that retains the original
     // reference (provider-returned object, IntentBuilder-produced struct)
     // and mutates it AFTER this set cannot retroactively change observable
     // state, the dedup baseline (`prev.value === a.value`), or future
     // event details. The getter (`get amount()`) and the dispatched event
     // detail already return / forward copies; this closes the same gate
     // on the storage side.
-    this._amount = a ? { ...a } : null;
-    this._target.dispatchEvent(new CustomEvent("stripe-checkout:amount-changed", { detail: a ? { ...a } : null, bubbles: true }));
+    //
+    // The copy names the two documented fields instead of spreading, so
+    // nothing but `{ value, currency }` can reach the wire-visible slot
+    // (the event detail is the `update`, the getter feeds `sync`). Values
+    // from a provider are validated before they get here — see
+    // `toObservableAmount`.
+    this._amount = a ? { value: a.value, currency: a.currency } : null;
+    this._target.dispatchEvent(new CustomEvent("stripe-checkout:amount-changed", {
+      detail: a ? { value: a.value, currency: a.currency } : null,
+      bubbles: true,
+    }));
   }
 
   private _setPaymentMethod(pm: StripePaymentMethod | null): void {
     const prev = this._paymentMethod;
     if (prev === pm) return;
     if (prev && pm && prev.id === pm.id && prev.brand === pm.brand && prev.last4 === pm.last4) return;
-    // Same defensive-copy rationale as `_setAmount`.
-    this._paymentMethod = pm ? { ...pm } : null;
-    this._target.dispatchEvent(new CustomEvent("stripe-checkout:paymentMethod-changed", { detail: pm ? { ...pm } : null, bubbles: true }));
+    // Same defensive, documented-fields-only copy as `_setAmount`. Report
+    // and provider values are validated before they get here — see
+    // `toObservablePaymentMethod`.
+    this._paymentMethod = pm ? { id: pm.id, brand: pm.brand, last4: pm.last4 } : null;
+    this._target.dispatchEvent(new CustomEvent("stripe-checkout:paymentMethod-changed", {
+      detail: pm ? { id: pm.id, brand: pm.brand, last4: pm.last4 } : null,
+      bubbles: true,
+    }));
   }
 
   private _setIntentId(id: string | null): void {
@@ -925,11 +987,13 @@ export class StripeCore extends EventTarget {
     this._activeIntent = { id: creation.intentId, mode, generation: gen };
     // amount is only meaningful in payment mode (SPEC §5.1). In setup mode
     // force it to null so a prior payment-mode amount does not bleed through
-    // into a subsequent setup session on the same Core. Copy the two
-    // documented fields so the observable `amount` and the `amount` in the
-    // return value below are the same `{ value, currency }` shape.
-    const amount: StripeAmount | null = mode === "payment" && creation.amount
-      ? { value: creation.amount.value, currency: creation.amount.currency }
+    // into a subsequent setup session on the same Core. `toObservableAmount`
+    // rebuilds the provider's value as `{ value, currency }` (finite number,
+    // non-empty string) — the same rule every `retrieveIntent` path uses —
+    // so the observable `amount` and the `amount` in the return value below
+    // are that shape, and a value that does not fit is treated as absent.
+    const amount: StripeAmount | null = mode === "payment"
+      ? toObservableAmount(creation.amount) ?? null
       : null;
     // Dispatch order: amount → intentId → status. A listener that
     // subscribes to `intentId-changed` and reads `el.amount` must see
@@ -998,7 +1062,7 @@ export class StripeCore extends EventTarget {
         // controlled strings onto the observable surface. A failed
         // validation collapses to "no report" and the server-side
         // retrieve fallback below picks up the real value from Stripe.
-        const validated = report.paymentMethod ? validateReportedPaymentMethod(report.paymentMethod) : undefined;
+        const validated = report.paymentMethod ? toObservablePaymentMethod(report.paymentMethod) : undefined;
         if (validated) {
           this._setPaymentMethod(validated);
         } else if (!this._paymentMethod) {
@@ -1010,9 +1074,17 @@ export class StripeCore extends EventTarget {
           // reliably. Best-effort: if the fetch fails, the webhook path can
           // still fill the slot later.
           try {
-            const view = await this._provider.retrieveIntent(active.mode, active.id);
+            const view: unknown = await this._provider.retrieveIntent(active.mode, active.id);
             if (gen !== this._generation) return; // superseded during fetch
-            if (view.paymentMethod) this._setPaymentMethod(view.paymentMethod);
+            // Rebuild, never forward, the provider's object: see
+            // `toObservablePaymentMethod`. A value that does not fit — or a
+            // result that is not an intent view at all
+            // (`isRetrievedIntentView`) — counts as "no card found": pm
+            // stays null for the webhook to fill.
+            const retrieved = isRetrievedIntentView(view)
+              ? toObservablePaymentMethod(view.paymentMethod)
+              : undefined;
+            if (retrieved) this._setPaymentMethod(retrieved);
           } catch { /* keep pm null; webhook will reconcile later */ }
         }
         // Re-check generation: the retrieveIntent catch above swallows
@@ -1054,9 +1126,13 @@ export class StripeCore extends EventTarget {
         // not get wedged. Best-effort: webhook path remains authoritative
         // for the actual DB writes via registered handlers.
         try {
-          const view = await this._provider.retrieveIntent(active.mode, active.id);
+          const view: unknown = await this._provider.retrieveIntent(active.mode, active.id);
           if (gen !== this._generation) return; // superseded during await
-          this._reconcileFromIntentView(active.mode, view);
+          // A result that is not an intent view is no answer: change
+          // nothing, exactly like a retrieve that threw — status stays
+          // `processing` / loading=true and the webhook decides. It is not
+          // an unknown *status* (there is none to report).
+          if (isRetrievedIntentView(view)) this._reconcileFromIntentView(active.mode, view);
         } catch { /* ignore — webhook or next confirmation will resolve */ }
         return;
       }
@@ -1091,20 +1167,38 @@ export class StripeCore extends EventTarget {
   * Core dispatches `stripe-checkout:unknown-status` on its target with
   * `{ source: "core", intentId, mode, status }`. Applications should
   * subscribe and apply a timeout/escalation policy for webhook-less or
-  * misconfigured webhook environments.
+  * misconfigured webhook environments. A `status` that is not a string is
+  * one more unknown status; its detail carries `status: ""` and a `reason`
+  * naming the value's type, never the value (see the default branch).
+  *
+  * Callers pass only a view that passed `isRetrievedIntentView`.
    */
-  private _reconcileFromIntentView(mode: StripeMode, view: { status: string; amount?: StripeAmount; paymentMethod?: StripePaymentMethod; lastPaymentError?: StripeError }): void {
-    if (view.paymentMethod) this._setPaymentMethod(view.paymentMethod);
+  private _reconcileFromIntentView(mode: StripeMode, view: RetrievedIntentView): void {
+    // The view comes from `IStripeProvider.retrieveIntent`, which a custom
+    // provider may fill with extra members or non-JSON values. Rebuild
+    // `paymentMethod` / `amount` from their documented fields before they
+    // touch observable state (both are wire-visible: event detail →
+    // `update`, getter → `sync`; @wc-bindable/remote ≥ 0.10 drops a value
+    // holding `undefined` / `Date` / `NaN`). A value that does not fit is
+    // treated as not reported and the current value stays — same as a
+    // view that omits the field. `lastPaymentError` goes through
+    // `_sanitizeError` below.
+    const paymentMethod = toObservablePaymentMethod(view.paymentMethod);
+    if (paymentMethod) this._setPaymentMethod(paymentMethod);
     // amount is only meaningful in payment mode (SPEC §5.1). Reflect it
     // only for payment-mode views — if a custom provider returns amount on
     // a setup intent view, drop it rather than leak it through the bindable
     // surface. Symmetric with the amount-clear in `requestIntent`.
     if (mode === "payment") {
-      if (view.amount) this._setAmount(view.amount);
+      const amount = toObservableAmount(view.amount);
+      if (amount) this._setAmount(amount);
     } else if (this._amount !== null) {
       this._setAmount(null);
     }
-    switch (view.status) {
+    // Only a string can name a Stripe status. Anything else falls to the
+    // default (unknown-status) branch as `null`.
+    const status = typeof view.status === "string" ? view.status : null;
+    switch (status) {
       case "succeeded":
         // Mirror the clear in reportConfirmation's direct succeeded
         // branch and the webhook succeeded fold — reach here through
@@ -1163,17 +1257,29 @@ export class StripeCore extends EventTarget {
         this._setStatus("failed");
         this._setLoading(false);
         break;
-      default:
+      default: {
+        // The detail reaches application listeners — in local mode it is a
+        // CustomEvent on the `<stripe-checkout>` element. A string status is
+        // reported verbatim, as before. A status that is not a string (a
+        // custom provider's number, object, null, missing field) is never
+        // put in the detail: `status` is `""`, the same value the Shell
+        // uses for a confirm result without a string status, and `reason`
+        // names only the value's type.
+        const detail: UnknownStatusDetail = {
+          source: "core",
+          intentId: this._intentId,
+          mode,
+          status: status ?? "",
+        };
+        if (status === null) {
+          detail.reason = `retrieveIntent returned a non-string status (${typeNameOf(view.status)}).`;
+        }
         this._target.dispatchEvent(new CustomEvent<UnknownStatusDetail>("stripe-checkout:unknown-status", {
-          detail: {
-            source: "core",
-            intentId: this._intentId,
-            mode,
-            status: view.status,
-          },
+          detail,
           bubbles: true,
         }));
-      // leave status unchanged (unrecognized Stripe status string).
+        // leave status unchanged (unrecognized or non-string Stripe status).
+      }
     }
   }
 
@@ -1337,7 +1443,7 @@ export class StripeCore extends EventTarget {
     this._setStatus("processing");
     this._setLoading(true);
 
-    let view;
+    let view: unknown;
     try {
       view = await this._provider.retrieveIntent(mode, intentId);
     } catch (e: unknown) {
@@ -1365,6 +1471,32 @@ export class StripeCore extends EventTarget {
 
     if (gen !== this._generation) return; // superseded mid-flight
 
+    // Shape gate, before anything reads a member. A custom provider that
+    // resolved with `null` / `undefined` made the `view.clientSecret` read
+    // below throw a raw TypeError: unsanitized on the wire, and the Core
+    // stayed on `processing` / loading=true because no branch below ran.
+    // A result that is not an object at all is no answer about the intent
+    // (`isRetrievedIntentView`), so the Core reached no decision — neither
+    // the ownership check nor the authorizer can run on it. Fail like a
+    // provider failure that carries no Stripe code: a fixed message, NO
+    // `code`, so the Shell classifies it as transient in both modes
+    // (SPEC §4 "resume 失敗の分類") and keeps the redirect URL. Consuming the
+    // URL here would lose the only way to fold an intent whose 3DS may have
+    // completed at Stripe, and let auto-prepare create a second intent for
+    // the same cart. Nothing is granted on this path, so failing before the
+    // constant-time compare opens no timing oracle on the caller's secret.
+    // The same `err` feeds `_setError` and the throw (remote reads either).
+    if (!isRetrievedIntentView(view)) {
+      const err: StripeError = { message: NO_INTENT_VIEW_MESSAGE };
+      // Same generation guard as the other failure branches below.
+      if (gen === this._generation) {
+        this._setError(err);
+        this._setStatus("idle");
+        this._setLoading(false);
+      }
+      throw new Error(err.message);
+    }
+
     // Ownership check. `view.clientSecret` is Stripe's authoritative value
     // for the intent; the caller must have been handed that same string by
     // Stripe's redirect URL. Any mismatch (tampered URL, foreign intent id,
@@ -1380,12 +1512,19 @@ export class StripeCore extends EventTarget {
     // present-but-wrong path, exposing a timing distinction between
     // "provider did not populate" and "secret does not match" that the
     // constant-time discipline elsewhere in this function takes pains
-    // to suppress. The empty-string fallback (`view.clientSecret ?? ""`)
-    // keeps the length-mismatch branch of `clientSecretEquals` reachable
-    // — that branch performs the dummy compare against a fresh zero-
-    // filled Buffer of the same length, preserving the documented
-    // work-profile property.
-    if (!clientSecretEquals(view.clientSecret ?? "", clientSecret)) {
+    // to suppress. The empty-string fallback keeps the length-mismatch
+    // branch of `clientSecretEquals` reachable — that branch performs the
+    // dummy compare against a fresh zero-filled Buffer of the same length,
+    // preserving the documented work-profile property.
+    //
+    // The fallback covers any value that is not a string, not only a
+    // missing one: `clientSecretEquals` hands both sides to `Buffer.from`,
+    // which throws a raw TypeError on a number / plain object (Core stuck
+    // on processing, unsanitized rejection). A non-string secret is the
+    // "provider forgot to populate clientSecret" case — a hard reject —
+    // and it still goes through the constant-time compare.
+    const expectedSecret = typeof view.clientSecret === "string" ? view.clientSecret : "";
+    if (!clientSecretEquals(expectedSecret, clientSecret)) {
       const err: StripeError = {
         code: "resume_client_secret_mismatch",
         message: "clientSecret does not match the retrieved intent -- resume denied.",
@@ -1420,7 +1559,10 @@ export class StripeCore extends EventTarget {
       // intent view it cannot use to forge resume.
       const { clientSecret: _omitted, ...authorizerView } = view;
       try {
-        ok = await this._resumeAuthorizer(intentId, mode, authorizerView, this._userContext);
+        // The provider's own view minus `clientSecret`, as before: the Core
+        // checked only that it is an object, and the authorizer reads it
+        // under the provider's `StripeIntentView` contract.
+        ok = await this._resumeAuthorizer(intentId, mode, authorizerView as unknown as StripeIntentView, this._userContext);
       } catch (e: unknown) {
         // Authorizer threw. Normalize to the same `resume_not_authorized`
         // denial path as an explicit `false` return — a thrown authorizer
@@ -1810,7 +1952,7 @@ export class StripeCore extends EventTarget {
             this._setPaymentMethod(pmFromEvent);
           } else {
             try {
-              const view = await this._provider.retrieveIntent(active.mode, active.id);
+              const view: unknown = await this._provider.retrieveIntent(active.mode, active.id);
               // Supersede / dispose guard: the only await in this fold
               // method. Without these checks, a stale retrieve landing
               // after `reset()` + new `requestIntent()` would paint
@@ -1820,7 +1962,13 @@ export class StripeCore extends EventTarget {
               // either keeps the fold from mutating state past its
               // ownership boundary.
               if (this._disposed || gen !== this._generation) return;
-              if (view.paymentMethod) this._setPaymentMethod(view.paymentMethod);
+              // Rebuilt from the documented fields, same as the other
+              // retrieve paths (`toObservablePaymentMethod`); a result that
+              // is not an intent view counts as "no card found".
+              const retrieved = isRetrievedIntentView(view)
+                ? toObservablePaymentMethod(view.paymentMethod)
+                : undefined;
+              if (retrieved) this._setPaymentMethod(retrieved);
             } catch {
               /* best-effort. Fall through — but the guard below still
                  covers the case where generation advanced DURING the

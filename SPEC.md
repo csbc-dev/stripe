@@ -121,7 +121,7 @@ Stripe の PaymentIntent/SetupIntent ネイティブ status から `StripeStatus
 | `processing` | `processing` | 非同期決済 (bank debit 等) の中間 |
 | `requires_payment_method` | `failed` | 直前の attempt が decline 等で失敗し PM 再入力要 |
 | `canceled` | `failed` | `last_payment_error` があれば error に反映 |
-| 上記以外 | **unchanged** | `stripe-checkout:unknown-status` を dispatch し status は現状維持 (webhook 権威) |
+| 上記以外(文字列でない値を含む) | **unchanged** | `stripe-checkout:unknown-status` を dispatch し status は現状維持 (webhook 権威)。retrieve の `status` が文字列でなければ、その値は detail に載せず `status: ""` とし、`reason` に値の型名だけを書く(§7.4) |
 
 ### loading は別軸
 
@@ -161,18 +161,21 @@ raw な authorizer 例外(ACL lookup 失敗、DB エラー、stack trace など)
 **resume 失敗の分類(redirect URL を消費するか残すか)**: resume が reject したとき、Shell は失敗を「決定的」か「一時的」かに分類して redirect URL の扱いを決める。規則は local / remote で同一で、**Core の回答が Stripe error-code taxonomy(`STRIPE_ERROR_CODE_RE`: 小文字・`_`・`.`、96 文字以内)に合う `code` を持つかどうか**だけで決まる:
 
 - **決定的**(`code` あり)— `resume_client_secret_mismatch` / `resume_not_authorized`、Stripe API の application-level reject(`resource_missing` 等)。同じ URL で再試行しても同じ拒否になるので、Shell は redirect パラメータ(`payment_intent` / `payment_intent_client_secret` / `setup_intent` / `setup_intent_client_secret` / `redirect_status`)を `history.replaceState` で取り除き、同じ要素での再 resume も止める(reload のたびに resume が繰り返される無限ループの防止)。成功時も同じ扱い。
-- **一時的**(それ以外)— `code` の無い Core 側の失敗(provider が Stripe に届かない `StripeConnectionError`・ネットワーク例外、generation の supersede、Core の validation throw)と、Core まで届かなかった失敗(cmd 送信失敗、切断、remote 層が合成する大文字の `WC_BINDABLE_*` code)。URL を残し、次の契機(再接続・再マウント・reload)で resume を再試行できるようにする。3DS 自体は Stripe 側で完了している可能性があり、ここで URL を捨てると intent の終局状態を fold し直す手段が無くなって、同じカートに新しい intent を auto-prepare してしまう(二重課金の露出)。
+- **一時的**(それ以外)— `code` の無い Core 側の失敗(provider が Stripe に届かない `StripeConnectionError`・ネットワーク例外、provider の `retrieveIntent` が intent view を返さない(object でない値で resolve する)、generation の supersede、Core の validation throw)と、Core まで届かなかった失敗(cmd 送信失敗、切断、remote 層が合成する大文字の `WC_BINDABLE_*` code)。URL を残し、次の契機(再接続・再マウント・reload)で resume を再試行できるようにする。3DS 自体は Stripe 側で完了している可能性があり、ここで URL を捨てると intent の終局状態を fold し直す手段が無くなって、同じカートに新しい intent を auto-prepare してしまう(二重課金の露出)。
 
 | 失敗 | local: throw の `code` | remote: reject の `code` | remote: 送信後に Core が publish した `error` | 分類 / URL |
 |---|---|---|---|---|
 | 成功 | — | — | — | 消費 |
-| clientSecret 不一致 | `resume_client_secret_mismatch` | 同じ | 同じ code | 決定的 / 消費 |
+| clientSecret 不一致(provider の `clientSecret` が欠落・文字列でない場合を含む) | `resume_client_secret_mismatch` | 同じ | 同じ code | 決定的 / 消費 |
 | authorizer 拒否(`false` / throw) | `resume_not_authorized` | 同じ | 同じ code | 決定的 / 消費 |
 | Stripe API の reject(`resource_missing` 等) | taxonomy code | 同じ | 同じ code | 決定的 / 消費 |
 | code 付きの失敗だが Core は publish しない(supersede) | taxonomy code | 同じ | なし | 決定的 / 消費 |
 | provider が Stripe に届かない(code 無し) | なし | なし | code 無しの `error` | 一時的 / 保持 |
+| provider の `retrieveIntent` が object でない値(`null` 等)を返す | なし | なし | code 無しの `error` | 一時的 / 保持 |
 | code 無しで Core も publish しない(supersede、disposed Core 等) | なし | なし | なし | 一時的 / 保持 |
 | Core まで届かない(送信失敗・切断・producer 側の reject) | — | なし or `WC_BINDABLE_*` | なし(`WC_BINDABLE_*` の reject では窓の publish を見ない) | 一時的 / 保持 |
+
+**retrieve 結果の形**: Core は `retrieveIntent` の結果のメンバーを読む前に、それが object(`null` でも配列でもない)であることを確かめる。object でなければ provider は intent について何も答えていないので、所有権検証も authorizer も実行できず、Core は決定に至っていない。Core は固定メッセージ `"[@csbc-dev/stripe] provider.retrieveIntent did not return an intent view object."` の `error` を `code` 無しで publish して同じものを throw し、`status = "idle"` / `loading = false` に戻す(上表のとおり一時的。provider の値は message に含めない)。object であっても `clientSecret` が文字列でなければ「provider が値を入れていない」と同じ扱いで、定数時間比較を省かずに通したうえで `resume_client_secret_mismatch`(決定的)になる。
 
 remote では reject の `code`(`@wc-bindable/remote` ≥ 0.10 で throw envelope に載る)に加え、**その resume の RPC を送った時点以降に、同じ接続で** Core が publish した `error`(`update`)の `code` も見る(throw に `code` を載せない 0.10 未満の producer への backstop。Core はどちらにも同じサニタイズ済み `code` を載せる)。この「送信時点の窓」は resume だけのものではなく、Shell が失敗を報告するすべての RPC に共通の規則である(§8「RPC の失敗の報告」)。このとき数えるのは non-null の `update` だけで、次は数えない:
 
@@ -395,6 +398,8 @@ Stripe.js の `confirmPayment` が返す `paymentIntent.payment_method` は **id
 
 Core の succeeded 分岐は、`report.paymentMethod` が欠けており `this._paymentMethod` が未セットなら、`provider.retrieveIntent` を best-effort で叩いて補完する。Provider 側の `retrieveIntent` は `expand: ["payment_method"]` を付けて Stripe を呼ぶので、brand / last4 を得られる。失敗しても UI は succeeded のまま、webhook 経由でさらに補完される。
 
+補完に使うのは provider の `paymentMethod` そのものではなく、Core が `{ id, brand, last4 }` の 3 欄だけで組み立て直した値である(§8.2 の規則。Shell の report に同梱された `paymentMethod` と同じ)。規則に合わない値(欄の欠落・型違い・空文字・長さ上限超過)は「retrieve でカードが得られなかった」のと同じ扱いになり、`paymentMethod` は未セットのまま webhook の補完を待つ。`retrieveIntent` の結果そのものが object でない場合(`null` 等)も同じ。webhook の succeeded fold が retrieve で補完する場合も同じ。
+
 #### 6.4.1 Stripe.js 異常応答時のフォールバック
 
 Stripe.js の契約上、`confirmPayment` / `confirmSetup` の戻り値は `{ paymentIntent }` / `{ setupIntent }` / `{ error }` のいずれか。これが壊れて **3 つとも不在**で返ってきた場合 (stripe.js の未知バグや互換性非互換の前向きな変化)、Shell は UI を `processing` / `loading=true` のまま塩漬けにしないため以下のフォールバックを取る:
@@ -490,7 +495,7 @@ Stripe.js の契約上、`confirmPayment` / `confirmSetup` の戻り値は `{ pa
 - `stripe-checkout:webhook-deduped` — 同一 `event.id` の webhook が dedup window でスキップされたとき。`detail: { eventId, type }`
 - `stripe-checkout:webhook-warning` — `fatal: false` で登録された webhook handler が throw したとき。`detail: { error, event }`
 - `stripe-checkout:authorizer-error` — `registerResumeAuthorizer` が登録した authorizer が throw したとき。`detail: { error, intentId, mode }` (server-side 運用者向け; 生例外は wire には流さず denial として扱う)
-- `stripe-checkout:unknown-status` — Core 側の `_reconcileFromIntentView` が未知 Stripe status を観測したとき。`detail: { source: "core", intentId, mode, status }`
+- `stripe-checkout:unknown-status` — Core 側の `_reconcileFromIntentView` が未知 Stripe status を観測したとき。`detail: { source: "core", intentId, mode, status }`。retrieve の `status` が文字列でなかった場合(custom provider の数値・object・`null`・欠落など)は、その値を detail に載せず `status: ""` とし、`reason: "retrieveIntent returned a non-string status (<型名>)."`(型名は `number` / `object` / `array` / `null` / `undefined` など)を付ける。local モードではこの detail が要素の CustomEvent として観測されるため、provider の値そのものは入れない
 
 `error` は `-changed` サフィックスを持たない (Core の `wcBindable.properties` 宣言と一致)。`-warning` 接尾辞は「UI を壊さない補足情報」の共通ファミリー (`appearance-warning` / `webhook-warning` / `missing-return-url-warning` / `dispose-warning` / `input-warning`)。
 
@@ -547,7 +552,9 @@ wc-bindable-protocol remote の既存ワイヤ形式に乗る(新しい message 
 - producer(Core 側)— プロパティ値なら `update` を警告付きで破棄し、`sync` では `getterFailures` に載せる(consumer は直前の値を保持する)。コマンド戻り値なら `WC_BINDABLE_INVALID_RETURN_VALUE` の throw に置き換わる。
 - `Date` / `NaN` / `±Infinity` / クラスインスタンス(`toJSON` を持っていても)/ `Map` なども同様に拒否される。トップレベルの `undefined` だけは、プロパティ値(`value` なしの `update`)とコマンド戻り値で許容される。
 
-本パッケージでは Shell が hint と confirmation report を省略形で組み立て(`_buildIntentHint`、`compactStripeError`)、Core がサニタイズ済み `StripeError` と `requestIntent` の戻り値を省略形で組み立て直す。独自 Shell を実装する場合も同じ規則に従うこと。独自 `IStripeProvider` の `retrieveIntent` が返す `amount` / `paymentMethod` は observable(§8.2)にそのまま載るため、JsonValue で返すこと。
+本パッケージでは Shell が hint と confirmation report を省略形で組み立て(`_buildIntentHint`、`compactStripeError`)、Core がサニタイズ済み `StripeError` と `requestIntent` の戻り値を省略形で組み立て直す。独自 Shell を実装する場合も同じ規則に従うこと。
+
+provider が返す値も Core が組み立て直してから observable に載せる。`createPaymentIntent` / `retrieveIntent` の `amount` と `retrieveIntent` の `paymentMethod` は、provider のオブジェクトをそのまま使わず、文書化された欄だけをコピーする(規則は §8.2)。独自 `IStripeProvider` が余計な欄(内部 ID 等)や JsonValue でないメンバー(`undefined` の欄、`Date`、`NaN` など)を含む値を返しても、それが wire に出ることはなく、`update` が破棄されたり `sync` の `getterFailures` に載ったりもしない。規則に合わない値は provider が返さなかったものとして扱う。`lastPaymentError` は `_sanitizeError` を通る(§6.3.1)。`retrieveIntent` の結果そのものが object でなければ(`null` 等)、Core はどの欄も読まず「答えが無かった」ものとして扱う(3DS resume は `code` 無しで失敗、processing の reconcile と succeeded 分岐・webhook の補完は何も変えない。§4 / §6.4)。
 
 **エラーの伝達**: コマンドが reject したとき、throw envelope は `name` / `message` / `stack` に加えて、remote 0.10 以降は producer が付けた文字列 `code` も運ぶ(`WC_BINDABLE_` 接頭辞の application code は `WC_BINDABLE_REMOTE_THROW` に置換される)。非 `Error` の throw は `name: "NonErrorThrow"` の `Error` として届く。`declineCode` / `type` は envelope に乗らないため、完全な `StripeError` は Core が throw の直前に publish する `error` の `update`(§8.2)から読む。Shell は受け取った `code` を Stripe taxonomy(小文字のみ)で allowlist するので、remote 層が合成する大文字の `WC_BINDABLE_*` code が `el.error.code` に現れることはない。
 
@@ -570,7 +577,7 @@ best-effort の RPC(submit 後の `reportConfirmation`、孤児 intent の `canc
 
 - `requestIntent` — `args: [{ mode: "payment"|"setup", hint: { amountValue?, amountCurrency?, customerId? } }]` → `return.value: { intentId, clientSecret, mode, amount?: { value, currency } }`
   - `hint` は助言扱い(SPEC §9.3)。Shell は値の無い欄(対応する属性が未設定)をキーごと省略する。Core は欠けた欄ごとにインスタンスの入力値(`core.amountValue` / `core.amountCurrency` / `core.customerId`)で補ってから `IntentBuilder` に渡す。
-  - `return.value` は provider の戻り値をそのまま返すのではなく、Core が組み立て直した値。`mode` は検証済みのリクエスト mode。`amount` は payment mode で provider が返したときだけ `{ value, currency }` の 2 欄をコピーして載せ、無ければキーごと省略する(setup mode では常に省略)。`value` は最小通貨単位の整数。
+  - `return.value` は provider の戻り値をそのまま返すのではなく、Core が組み立て直した値。`mode` は検証済みのリクエスト mode。`amount` は payment mode で provider が §8.2 の規則に合う値を返したときだけ `{ value, currency }` の 2 欄で組み立てて載せ、無いか合わなければキーごと省略する(setup mode では常に省略)。`value` は最小通貨単位の整数。
 - `reportConfirmation` — `args: [{ intentId, outcome, paymentMethod?, error? }]` → `return.value: undefined`
   - `outcome: "succeeded" | "requires_action" | "processing" | "failed"` — `processing` は Stripe が非同期決済(bank debit 等)で返す状態で、Core は `processing` 分岐で `retrieveIntent` を一度叩いた後 webhook 経由の終局を待つ。
   - `paymentMethod?: { id, brand, last4 }` — `confirmPayment` の戻りが expand 済み object のときのみ Shell が同梱。id 文字列のみの場合は omit し、Core の succeeded 分岐が server-side retrieve で補完する(§6.4)。
@@ -588,8 +595,8 @@ best-effort の RPC(submit 後の `reportConfirmation`、孤児 intent の `canc
 
 - `status` — `"idle" | "collecting" | "processing" | "requires_action" | "succeeded" | "failed"`
 - `loading` — `boolean`
-- `amount` — `{ value: number, currency: string } | null`(payment mode のみ populate)
-- `paymentMethod` — `{ id, brand, last4 } | null`
+- `amount` — `{ value: number, currency: string } | null`(payment mode のみ populate)。Core が組み立てた値で、`value` は有限の number、`currency` は空でない文字列、この 2 欄以外は持たない。provider の `amount` がこれに合わなければ返されなかったものとして扱う(retrieve 由来なら直前の値を保ち、`requestIntent` なら `null`)。
+- `paymentMethod` — `{ id, brand, last4 } | null`。Core が組み立てた値で、3 欄とも空でない文字列(長さ上限 `id` 128 / `brand` 64 / `last4` 8)、この 3 欄以外は持たない。Shell の report と provider の retrieve のどちらから来た値も同じ規則で、合わなければ返されなかったものとして扱う(report なら server-side retrieve に回り、retrieve 由来なら直前の値を保つ)。
 - `intentId` — `string | null`
 - `error` — `{ code?, declineCode?, message, type? } | null`(欠けた欄はキーごと省略。`undefined` の欄は持たない)
 

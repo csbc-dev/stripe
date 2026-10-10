@@ -146,3 +146,32 @@ test("post-redirect resume keeps the redirect URL when the provider fails withou
   expect(results.confirmCalls).toEqual([]);
   expect(server.state.retrieveCalls).toEqual([{ mode: "payment", id: "pi_resume_unreachable" }]);
 });
+
+test("post-redirect resume keeps the redirect URL and settles on idle when the provider returns no intent view", async ({ page }) => {
+  // A custom provider whose `retrieveIntent` resolves with `null`. The Core
+  // used to read `view.clientSecret` off it and reject with a raw
+  // TypeError, staying on processing / loading=true. It now publishes a
+  // fixed, code-less error and returns to idle; with no code the failure is
+  // transient, so the URL survives for a retry.
+  server.state.noViewIntents.add("pi_resume_no_view");
+  await page.goto(
+    `http://localhost:${server.port}/client.html?scenario=resume&payment_intent=pi_resume_no_view&payment_intent_client_secret=pi_resume_no_view_secret_ok&redirect_status=succeeded`,
+  );
+  await expect(page.locator("#status")).toHaveText("done", { timeout: 15000 });
+
+  const results = JSON.parse((await page.locator("#results").textContent()) ?? "{}");
+
+  expect(results.fatal).toBeUndefined();
+  expect(results.status).toBe("idle");
+  expect(results.loading).toBe(false);
+  expect(results.intentId).toBeNull();
+  expect(results.error).toEqual({
+    message: "[@csbc-dev/stripe] provider.retrieveIntent did not return an intent view object.",
+  });
+  expect(results.searchAfter).toBe(
+    "?scenario=resume&payment_intent=pi_resume_no_view&payment_intent_client_secret=pi_resume_no_view_secret_ok&redirect_status=succeeded",
+  );
+  expect(results.loaderCalls).toEqual([]);
+  expect(results.confirmCalls).toEqual([]);
+  expect(server.state.retrieveCalls).toEqual([{ mode: "payment", id: "pi_resume_no_view" }]);
+});
