@@ -71,6 +71,8 @@ Confirm the next version with the user before bumping. Follow semver:
   - any change to the remote wire protocol used by `@wc-bindable/remote` — including a `@wc-bindable/core` / `@wc-bindable/remote` dependency-range bump that crosses a breaking upstream release (pre-1.0 minors can change the wire contract: 0.10 made the wire enforce strict JsonValue, rejecting `undefined` object members, and started forwarding a rejection's `code`)
   - any change to the 3DS resume authorization model (`registerResumeAuthorizer`, the `clientSecret` constant-time compare contract)
 
+> **While the package is in `0.x.y`, map a breaking change to minor and a feature addition or fix to patch.** This is the convention of the upstream `@wc-bindable/*` line and of `@csbc-dev/ai-agent`. Upstream still ships breaking changes as 0.x minors, so a 1.0 here would not be a stable promise. Bump major only once the package is at 1.0 or later.
+
 Once the user approves the bump level, update `version` in [package.json](package.json). Prefer editing the field directly rather than running `npm version`, so the user keeps control over commit/tag creation.
 
 If the change touches the protocol, security invariants, or the state machine, also confirm whether [SPEC.md](SPEC.md) needs an updated note — particularly §9 (security responsibilities) and the state-machine section.
