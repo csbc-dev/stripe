@@ -1778,6 +1778,13 @@ export class StripeCore extends EventTarget {
    * switch. Resolve → 200. A missing `stripe-signature` header or a
    * signature verification failure → 400. Any other rejection → 500.
    *
+   * Response timing (SPEC §6.2, "処理してから応答する設計"): the promise
+   * settles only after the fold and every handler (fatal and non-fatal)
+   * have run, so the route answers after processing. This is deliberate,
+   * not an oversight of Stripe's "return 2xx quickly" advice: a fatal
+   * failure must reach Stripe as a 500 so Stripe retries it. Handlers
+   * must therefore stay fast.
+   *
    * `signatureHeader` is the value of the `stripe-signature` HTTP header.
    * Node's raw `req.headers` types the field as `string | string[] |
    * undefined`; for Stripe this is always a single value, but framework
@@ -1871,8 +1878,9 @@ export class StripeCore extends EventTarget {
     // the membership check, the insertion and the fatal-throw eviction
     // below all use the same key, so such an event runs handlers on every
     // retry and never takes a slot in the window. The default
-    // `StripeSdkProvider.verifyWebhook` raises on a non-string or empty
-    // id (see provider for the `event.id` check), but CUSTOM
+    // `StripeSdkProvider.verifyWebhook` raises on a non-string, empty or
+    // whitespace-only id (the same rule; see provider for the `event.id`
+    // check), but CUSTOM
     // `IStripeProvider` implementations MUST also guarantee a non-blank
     // string `event.id` after signature verification or accept this
     // dedup-bypass cost. A future hardening could fail-loud here too, but

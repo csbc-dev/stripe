@@ -477,7 +477,13 @@ export class StripeSdkProvider implements IStripeProvider {
     // to an empty string would bypass the dedup window (empty id never
     // matches) and silently skip every handler (empty type dispatches
     // nothing). Fail loud instead.
-    if (typeof event.id !== "string" || event.id === "") {
+    //
+    // The id rule is the Core's dedup-key rule (`webhookDedupKey` in
+    // StripeCore): only a non-blank string is a key. A whitespace-only id
+    // is rejected here too, or it would pass verification and then bypass
+    // the dedup window. A non-blank id is returned as delivered, untrimmed,
+    // because the Core keys on the value unchanged.
+    if (typeof event.id !== "string" || event.id.trim() === "") {
       raiseError("verifyWebhook: Stripe event has no id after signature verification.");
     }
     if (typeof event.type !== "string" || event.type === "") {
