@@ -1833,12 +1833,26 @@ export class Stripe extends HTMLElementCtor {
     await this._core.cancelIntent(intentId);
   }
 
+  /**
+   * Best-effort Core reset (SPEC §7.6 / §8): it never rejects, in either
+   * mode. A failure goes to `Stripe._logger` (phase `reset`) and never to
+   * `el.error`, and the caller's result (`reset()`, `abort()`, a key
+   * change) does not change.
+   *
+   * The local branch needs its own try/catch. `StripeCore.reset()` throws
+   * synchronously (a disposed Core's `_disposed` guard), and inside this
+   * `async` function that throw would become a rejection. `abort()` awaits
+   * this call without a catch, so before this guard a local Core whose
+   * reset threw made `abort()` reject, and the failure never reached the
+   * logger.
+   */
   private async _coreReset(): Promise<void> {
     if (this._isRemote) {
       await this._proxy!.invoke("reset").catch((e: unknown) => { this._safeLog("reset", e); });
       return;
     }
-    this._core?.reset();
+    try { this._core?.reset(); }
+    catch (e: unknown) { this._safeLog("reset", e); }
   }
 
   private async _coreResume(intentId: string, mode: StripeMode, clientSecret: string): Promise<void> {
@@ -2608,6 +2622,9 @@ export class Stripe extends HTMLElementCtor {
         this._safeLog("cancelIntent", e);
       }
     } else {
+      // Best-effort too: `_coreReset` routes a failure (a disposed local
+      // Core throws from `reset()`) to `_safeLog("reset", e)` and never
+      // rejects, so abort() still resolves.
       await this._coreReset();
     }
   }

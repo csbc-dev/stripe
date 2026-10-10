@@ -1542,6 +1542,119 @@ describe("StripeCore", () => {
       expect(calls).toBe(4);
     });
 
+    describe("only a non-blank string event.id is a dedup key (regression: the check was truthiness)", () => {
+      // The contract (JSDoc, SPEC §6.2) says only a non-empty string id enters
+      // the dedup window. The implementation checked `if (event.id)`, so a
+      // custom provider's truthy non-string id (a number, an object, …) or a
+      // whitespace-only id entered the window, and the redelivery that should
+      // have run the handlers again was swallowed as a duplicate.
+
+      function seenIds(c: StripeCore): Map<unknown, true> {
+        return (c as unknown as { _seenWebhookIds: Map<unknown, true> })._seenWebhookIds;
+      }
+
+      it.each([
+        ["a number", 42],
+        ["zero", 0],
+        ["an object", { id: "evt_in_an_object" }],
+        ["an array", ["evt_in_an_array"]],
+        ["true", true],
+        ["null", null],
+        ["an empty string", ""],
+        ["a whitespace-only string", "   "],
+        ["a tab / newline string", "\t\n"],
+      ])("an id that is %s bypasses dedup: every delivery runs the handlers and nothing is recorded", async (_label, id) => {
+        let calls = 0;
+        const deduped: unknown[] = [];
+        core.addEventListener("stripe-checkout:webhook-deduped", (e) => deduped.push((e as CustomEvent).detail));
+        core.registerWebhookHandler("x.y", () => { calls++; });
+        // Same value (same reference for the object / array) on every delivery.
+        provider.verifyWebhook = () => ({
+          id,
+          type: "x.y",
+          data: { object: {} },
+          created: 1,
+        } as unknown as StripeEvent);
+
+        await core.handleWebhook("raw", "sig");
+        await core.handleWebhook("raw", "sig");
+        await core.handleWebhook("raw", "sig");
+
+        expect(calls).toBe(3);
+        expect(deduped).toEqual([]);
+        expect(seenIds(core).size).toBe(0);
+      });
+
+      it("a non-string id is neither recorded nor evicted around a fatal handler throw", async () => {
+        // A recorded string id that must survive untouched.
+        provider.verifyWebhook = () => ({ id: "evt_kept", type: "other.type", data: { object: {} }, created: 1 });
+        await core.handleWebhook("raw", "sig");
+
+        let attempts = 0;
+        core.registerWebhookHandler("x.y", () => {
+          attempts++;
+          if (attempts === 1) throw new Error("transient DB lock");
+        }, { fatal: true });
+        provider.verifyWebhook = () => ({ id: 7, type: "x.y", data: { object: {} }, created: 2 } as unknown as StripeEvent);
+
+        await expect(core.handleWebhook("raw", "sig")).rejects.toThrow(/transient DB lock/);
+        await core.handleWebhook("raw", "sig");
+        await core.handleWebhook("raw", "sig");
+
+        expect(attempts).toBe(3);
+        expect([...seenIds(core).keys()]).toEqual(["evt_kept"]);
+      });
+
+      it("a non-blank string id is still deduped, as delivered (not trimmed)", async () => {
+        const calls: unknown[] = [];
+        const deduped: unknown[] = [];
+        core.addEventListener("stripe-checkout:webhook-deduped", (e) => deduped.push((e as CustomEvent).detail));
+        core.registerWebhookHandler("x.y", (ev) => { calls.push(ev.id); });
+        const deliver = async (id: unknown) => {
+          provider.verifyWebhook = () => ({ id, type: "x.y", data: { object: {} }, created: 1 } as unknown as StripeEvent);
+          await core.handleWebhook("raw", "sig");
+        };
+
+        await deliver("evt_a");
+        await deliver(42);        // bypasses dedup; does not disturb evt_a's entry
+        await deliver("evt_a");   // duplicate
+        await deliver(" evt_a "); // a different (non-blank) string key
+        await deliver(" evt_a "); // duplicate of that key
+
+        expect(calls).toEqual(["evt_a", 42, " evt_a "]);
+        expect(deduped).toEqual([
+          { eventId: "evt_a", type: "x.y" },
+          { eventId: " evt_a ", type: "x.y" },
+        ]);
+        expect([...seenIds(core).keys()]).toEqual(["evt_a", " evt_a "]);
+      });
+
+      it("ids that bypass dedup take no slot, so they never evict a recorded string id", async () => {
+        const small = new StripeCore(provider, { webhookSecret: "whsec_test", webhookDedupCapacity: 2 });
+        try {
+          let calls = 0;
+          small.registerWebhookHandler("x.y", () => { calls++; });
+          const deliver = async (id: unknown) => {
+            provider.verifyWebhook = () => ({ id, type: "x.y", data: { object: {} }, created: 1 } as unknown as StripeEvent);
+            await small.handleWebhook("raw", "sig");
+          };
+
+          await deliver("evt_1");
+          await deliver("evt_2");
+          for (const id of [1, 2, 3, { n: 4 }, "  "]) await deliver(id);
+          expect(calls).toBe(7);
+
+          // Both string ids are still in the window: their redeliveries are deduped.
+          await deliver("evt_1");
+          await deliver("evt_2");
+          expect(calls).toBe(7);
+          expect([...seenIds(small).keys()]).toEqual(["evt_1", "evt_2"]);
+        } finally {
+          small.dispose();
+        }
+      });
+    });
+
     it("cross-mode fold defense: setup_intent.* event with matching id does NOT flip a payment-mode active intent", async () => {
       // Stripe uses type-prefixed ids (`pi_` / `seti_`) so a colliding id
       // across modes is virtually impossible in practice, but the

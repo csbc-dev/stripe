@@ -342,6 +342,11 @@ class StripeCore extends EventTarget {
     * これは process-local で durable ではない(マルチプロセス/再起動を跨がない)。
     * handler 側は引き続き `event.id` をキーに冪等化すること。
     *
+    * window に入るのは、空白以外の文字を 1 つ以上含む文字列の `event.id` だけで、
+    * 届いた値のまま(trim せず)キーにする。空文字・空白だけの文字列・欠落・
+    * 文字列でない値(数値・object・配列など)の `id` は dedup を素通りし、
+    * 配送のたびに fold と handler が走り、window の枠も使わない。
+    *
     * fatal handler が throw した場合は、当該 `event.id` を dedup window から
     * evict して re-throw する。これにより HTTP 5xx + Stripe retry で再配送可能。
    */
@@ -373,7 +378,17 @@ class StripeCore extends EventTarget {
 }
 ```
 
-**`verifyWebhook` の戻り値の形**: Core は署名検証の後、event のどのメンバーを読むよりも前に、provider が返した値の形を確かめる(retrieve の結果に対する検査と同じ方針。§4)。条件は、object(`null` でも配列でもない)であること、`type` が空でない文字列であること、`data` と `data.object` が object であること。満たさなければ、固定メッセージ `"[@csbc-dev/stripe] provider.verifyWebhook did not return a valid event: <理由>."` で reject する。理由には欄の名前と値の型名(`null` / `number` / `array` / `empty string` など)だけを書き、値は含めない。署名検証の失敗と同じく何も変えない: observable state、Core の target へのイベント、handler、dedup window のどれにも触れないので、provider を直した後に同じ event id が再び届けば(Stripe の再送、ダッシュボードからの再送)通常どおり処理される。`id` は検査しない(空・欠落の `id` は dedup を通らないだけ、という従来の契約)。独自 `IStripeProvider` の `verifyWebhook` はこの形を返すこと。
+**`verifyWebhook` の戻り値の形**: Core は署名検証の後、event のどのメンバーを読むよりも前に、provider が返した値の形を確かめる(retrieve の結果に対する検査と同じ方針。§4)。条件は、object(`null` でも配列でもない)であること、`type` が空でない文字列であること、`data` と `data.object` が object であること。満たさなければ、固定メッセージ `"[@csbc-dev/stripe] provider.verifyWebhook did not return a valid event: <理由>."` で reject する。理由には欄の名前と値の型名(`null` / `number` / `array` / `empty string` など)だけを書き、値は含めない。署名検証の失敗と同じく何も変えない: observable state、Core の target へのイベント、handler、dedup window のどれにも触れないので、provider を直した後に同じ event id が再び届けば(Stripe の再送、ダッシュボードからの再送)通常どおり処理される。`id` は検査しない(空白以外の文字を含む文字列でない `id` は dedup を通らないだけ、という従来の契約。上の `registerWebhookHandler` の項)。独自 `IStripeProvider` の `verifyWebhook` はこの形を返すこと。
+
+**HTTP ルートの応答コードと Stripe の再送**: Stripe は 2xx 以外の応答(3xx / 4xx / 5xx、タイムアウト、接続失敗)をすべて配送失敗とみなし、live モードでは指数バックオフで最大 3 日間、sandbox では数時間のうちに 3 回再送する。4xx を返しても再送は止まらず、再送を止めるのは 2xx だけである([Automatic retries](https://docs.stripe.com/webhooks#automatic-retries)、[Respond to automatic retries](https://docs.stripe.com/events/manage-webhook-endpoints#process-undelivered-events))。したがって応答コードは再送するかどうかを選ぶ手段ではなく、エンドポイントの Event deliveries タブとログに出る診断である。アプリの HTTP ルートは次のように返す(README のルート例):
+
+| `handleWebhook` の結果 | 応答 | 理由 |
+|---|---|---|
+| resolve(dedup で抑止された重複を含む) | 200 | 配送完了。Stripe の再送が止まる |
+| `stripe-signature` ヘッダが無い、または署名検証の失敗(`StripeSignatureVerificationError`) | 400 | Stripe の例と同じ。偽造は Stripe の配送ではないので再送されない。本物の配送なら signing secret か raw body の誤りで、Stripe が再送を続けるので、直せば通る |
+| それ以外の reject(fatal handler の throw、`[@csbc-dev/stripe]` で始まる入力・設定・provider の形の不正、dispose 済みの Core) | 500 | サーバー側の失敗。Stripe が再送するので、原因を直せば同じ event が処理される |
+
+署名検証の失敗と形の不正が observable state・handler・dedup window に触れないのは、この再送で同じ event id が届いたときに通常どおり処理するためである。失敗した配送に 2xx を返してはならない(event が ack され再送が終わる)。失敗が数日続くエンドポイントは Stripe に無効化されるので、500 はログに流して監視する。
 
 設計トレードオフ: Core は webhook を受けると handler 実行前に observable state を fold する。
 そのため fatal handler が throw した場合でも UI は先に `succeeded` などを観測しうる一方、
@@ -534,9 +549,10 @@ Shell クラス (`Stripe`) はモジュール realm 共有の static 注入点�
   default は `loadStripe` ベースで `STRIPE_JS_URL` を尊重するローダ。
 - `Stripe.setLogger(logger)` / `Stripe.resetLogger()` — best-effort 経路 (remote
   disconnect の `_disposeRemoteWithBestEffortReset`、`abort()` の `_teardownElements`
-  と `cancelIntent` (phase `cancelIntent`)、submit 後の `reportConfirmation` (phase
-  `report-confirmation`)、孤児 intent の `cancelIntent` / `reset` 等) で発生した例外の観測 sink を差し替える。これらの失敗は
-  `submit()` の結果を変えないため呼び出し元へは伝播しないが、黙って捨てずに必ず logger へ流す。シグネチャは `(phase: string, error: unknown) => void`。
+  と `cancelIntent` (phase `cancelIntent`)、`reset()` と、cancel する intent が無いときの `abort()` が呼ぶ Core の
+  `reset` (phase `reset`。local モードで Core の `reset()` が同期的に throw した場合、たとえば dispose 済みの Core も同じ)、
+  submit 後の `reportConfirmation` (phase `report-confirmation`)、孤児 intent の `cancelIntent` / `reset` 等) で発生した例外の観測 sink を差し替える。これらの失敗は
+  呼び出したメソッド(`submit()` / `abort()` / `reset()` など)の結果を変えないため呼び出し元へは伝播しない(`abort()` は reject しない)が、黙って捨てずに必ず logger へ流す。シグネチャは `(phase: string, error: unknown) => void`。
   default は no-op。`stripe-checkout:dispose-warning` がバブルできない (要素が DOM-detached
   済み) 状況でも production observability に流すための fanout。logger が throw しても
   cleanup は継続する (内部で try/catch される)。

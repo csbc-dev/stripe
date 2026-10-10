@@ -65,7 +65,7 @@ function handleWebhook(req: IncomingMessage, res: ServerResponse): void {
       res.end("webhook secret not configured — skipped");
       return;
     }
-    if (typeof sig !== "string") {
+    if (typeof sig !== "string" || sig === "") {
       res.writeHead(400, { "content-type": "text/plain" });
       res.end("missing stripe-signature header");
       return;
@@ -75,28 +75,29 @@ function handleWebhook(req: IncomingMessage, res: ServerResponse): void {
     // one whose active intent matches reacts. Production multi-tenant servers
     // MUST instead route to the owning session by intentId and add durable,
     // DB-backed idempotency (see ../../README.md and ../../SPEC.md §6.2 / §9).
-    let signatureOrInputError = false;
-    let handlerError = false;
+    let signatureError = false;
+    let serverError = false;
     for (const core of liveCores) {
       try {
         await core.handleWebhook(raw, sig);
       } catch (err) {
         const e = err as { type?: string; message?: string };
-        const isSig = e?.type === "StripeSignatureVerificationError";
-        const isInput = typeof e?.message === "string" && e.message.startsWith("[@csbc-dev/stripe]");
-        if (isSig || isInput) {
-          signatureOrInputError = true;
+        if (e?.type === "StripeSignatureVerificationError") {
+          signatureError = true;
         } else {
-          // A fatal webhook handler throw (default fatal:true) is a genuine
-          // fulfillment failure — return 5xx so Stripe retries delivery.
-          handlerError = true;
-          console.error("[webhook] handler error:", e?.message ?? err);
+          // A fatal webhook handler throw (default fatal:true), or a
+          // `[@csbc-dev/stripe]` config / provider error: a failure on our side.
+          serverError = true;
+          console.error("[webhook] error:", e?.message ?? err);
         }
       }
     }
-    // 4xx => Stripe stops retrying (forged sig / unprocessable input);
-    // 5xx => Stripe retries (transient fulfillment failure); 200 => acked.
-    res.writeHead(signatureOrInputError ? 400 : handlerError ? 500 : 200);
+    // Stripe retries every non-2xx response (4xx included) for up to 3 days in
+    // live mode; only a 2xx stops the retries
+    // (https://docs.stripe.com/webhooks#automatic-retries). 400 = not a valid
+    // Stripe delivery (bad signature); 500 = our failure, fixed by a retry;
+    // 200 = acked. See ../../SPEC.md §6.2.
+    res.writeHead(signatureError ? 400 : serverError ? 500 : 200);
     res.end();
   });
 }

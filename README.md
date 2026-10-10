@@ -90,30 +90,44 @@ core.registerWebhookHandler("payment_intent.succeeded", async (event) => {
 });
 
 // Wire to an HTTP endpoint. `rawBody` MUST be the unparsed request body.
-// Response codes control Stripe's retry policy (SPEC §6.2 / §9):
-//   4xx — Stripe stops retrying. Use for requests we can prove are
-//     unprocessable regardless of how often Stripe tries:
-//       · StripeSignatureVerificationError (forged/wrong signing secret)
-//       · stripe-checkout input/config guards (missing rawBody, missing
-//         stripe-signature header, webhookSecret not configured on the
-//         Core, a custom provider's verifyWebhook returning a malformed
-//         event). These come through as plain Errors whose `message`
-//         starts with `[@csbc-dev/stripe]`.
-//   5xx — Stripe retries per its delivery policy. Reserve for fatal
-//     fulfillment handler failures (DB write failed, downstream 5xx).
+// Stripe treats every response other than 2xx (and a timeout) as a failed
+// delivery and retries it: for up to three days with exponential backoff
+// in live mode, three times over a few hours in a sandbox. A 4xx does NOT
+// stop the retries; only a 2xx does (https://docs.stripe.com/webhooks#automatic-retries).
+// The status code is a diagnostic shown in the endpoint's Event deliveries
+// tab, not a way to choose whether Stripe retries (SPEC §6.2):
+//   200 — handled, or a duplicate the Core's dedup window suppressed.
+//   400 — not a valid Stripe delivery: no `stripe-signature` header, or
+//     StripeSignatureVerificationError. A forged request is not Stripe's,
+//     so nothing retries it. A genuine delivery that fails here means the
+//     signing secret or the raw body is wrong; Stripe keeps retrying it,
+//     and it goes through once that is fixed.
+//   500 — everything else is a failure on our side: a fatal handler threw
+//     (DB write failed, downstream 5xx), or a `[@csbc-dev/stripe]` error
+//     (raw body missing, no webhookSecret on the Core, a custom provider's
+//     verifyWebhook returning a malformed event, a disposed Core). Stripe
+//     retries, so the event is processed once the cause is fixed.
+// Never answer 2xx for a failure you still need handled: that acknowledges
+// the event and ends the retries. Stripe disables an endpoint that keeps
+// failing for several days, so log and alert on the 500s. A response that
+// takes too long also counts as failed; keep handlers quick.
 // StripeCore keeps a best-effort in-memory dedup window keyed by
 // `event.id` and may suppress duplicate deliveries on the same process.
 // Durable idempotency still belongs in your handler storage layer.
 app.post("/webhooks/stripe", async (req, res) => {
+  const signature = req.headers["stripe-signature"];
+  if (typeof signature !== "string" || signature === "") {
+    res.status(400).end();
+    return;
+  }
   try {
-    await core.handleWebhook(req.rawBody, req.headers["stripe-signature"]);
+    await core.handleWebhook(req.rawBody, signature);
     res.status(200).end();
   } catch (err) {
-    const e = err as { type?: string; message?: string };
-    const isSignatureError = e?.type === "StripeSignatureVerificationError";
-    const isInputOrConfigError =
-      typeof e?.message === "string" && e.message.startsWith("[@csbc-dev/stripe]");
-    res.status(isSignatureError || isInputOrConfigError ? 400 : 500).end();
+    // Log `err` server-side; never echo its message in the response.
+    const isSignatureError =
+      (err as { type?: unknown } | null)?.type === "StripeSignatureVerificationError";
+    res.status(isSignatureError ? 400 : 500).end();
   }
 });
 ```
@@ -148,7 +162,7 @@ The Quick Start is **deliberately minimal** and **not production-ready**. Before
 - **Enable idempotent intent creation** by supplying `buildIdempotencyKey` to `StripeSdkProvider` (or implement it in your own `IStripeProvider`). On network flake, retries without a key can create multiple intents for the same cart/user.
 - **Prefer `await el.abort()` before removing the element** when you need deterministic cancel of the active PaymentIntent. Automatic disconnect teardown is best-effort; in a narrow window (disconnect during in-flight intent create), the intent may survive until Stripe natural expiry.
 - **Understand SetupIntent cancel defaults**: by default `cancelIntent` does not call Stripe's `setupIntents.cancel` (state-only reset). If dashboard cleanup of stale SetupIntents matters, set `cancelSetupIntents: true` on `StripeCore` and use a provider that implements `cancelSetupIntent`.
-- **Keep webhook handlers idempotent** even with Core dedup enabled. Core suppresses duplicate `event.id` deliveries only within an in-memory per-process window; multi-process routing and process restarts still require DB-backed idempotency keyed by `event.id`.
+- **Keep webhook handlers idempotent** even with Core dedup enabled. Core suppresses duplicate `event.id` deliveries only within an in-memory per-process window; multi-process routing and process restarts still require DB-backed idempotency keyed by `event.id`. Only a non-blank string `event.id` enters that window: an event from a custom provider whose `id` is empty, whitespace-only, missing or not a string (a number, an object) is never deduped and runs the handlers on every delivery.
 - **Consider `registerResumeAuthorizer`** for multi-tenant deployments so a leaked `client_secret` alone cannot resume a foreign user's intent.
 - **Handle WebSocket disconnects in your app** (remote mode only). The `<stripe-checkout>` element connects once per mount and does NOT auto-reconnect on `close` / `error` events (mobile network drop, server rolling deploy, LB idle timeout). Subscribe to `stripe-checkout:error` and, on `code: "transport_unavailable"`, remove + re-append the element — or prompt the user to retry. See SPEC §9.3 for the rationale (auto-reconnect would push backoff policy, in-flight promise handling, and infinite-retry safety onto the library).
 - **Sanitize errors** that cross the wire: the built-in sanitizer keeps `code` / `decline_code` / `type` and forwards `message` only for Stripe-shaped errors (type starts with `Stripe` or matches a known Stripe taxonomy token like `card_error` / `invalid_request_error`) and our own `[@csbc-dev/stripe]`-prefixed internals — anything else collapses to a generic `"Payment failed."` so a raw `new Error("FATAL: ...")` from an `IntentBuilder` does not reach the browser. **Do not fake Stripe type tokens on your own errors** (`Object.assign(err, { type: "card_error" })`) — that bypasses the allowlist. Custom handlers you add (webhook fulfillment, authorizers) must be equally careful. See SPEC §6.3.1.

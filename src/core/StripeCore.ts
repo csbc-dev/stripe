@@ -125,9 +125,10 @@ function isObjectRecord(value: unknown): value is { readonly [key: string]: unkn
  * lookup all key on it); `data` and `data.object` are objects (the fold and
  * every handler read `event.data.object`).
  *
- * Deliberately NOT checked: `id`. An empty or missing id is the documented
- * dedup-bypass contract (see `handleWebhook`) and nothing in the Core
- * dereferences it. `created` is never read by the Core.
+ * Deliberately NOT checked: `id`. An id that is not a non-blank string is
+ * the documented dedup-bypass contract (`webhookDedupKey`, see
+ * `handleWebhook`) and nothing else in the Core reads it. `created` is
+ * never read by the Core.
  *
  * The reason names the field and the value's type only (`typeNameOf`),
  * never the value: the result is a provider's parse of an HTTP body.
@@ -142,6 +143,26 @@ function webhookEventDefect(value: unknown): string | null {
   if (!isObjectRecord(data)) return `data is not an object (${typeNameOf(data)})`;
   if (!isObjectRecord(data.object)) return `data.object is not an object (${typeNameOf(data.object)})`;
   return null;
+}
+
+/**
+ * The key under which `handleWebhook` records an event in the dedup window,
+ * or `null` when the event bypasses dedup.
+ *
+ * Only a string with at least one non-whitespace character is a key, and it
+ * is used as delivered (not trimmed). Every other `id` bypasses dedup: the
+ * empty string, a whitespace-only string, a missing id, and any value that
+ * is not a string (a number, an object, an array, `true`). Such an event
+ * runs the fold and its handlers on every delivery and takes no slot in the
+ * window.
+ *
+ * The check used to be "truthy", so a custom provider's numeric or object
+ * id entered the window (as a non-string `Map` key, against
+ * `_seenWebhookIds`' `Map<string, true>` type) while the documented
+ * contract said only a non-empty string does.
+ */
+function webhookDedupKey(id: unknown): string | null {
+  return typeof id === "string" && id.trim() !== "" ? id : null;
 }
 
 /**
@@ -491,7 +512,8 @@ export class StripeCore extends EventTarget {
    *
    * Idempotency requirement: this Core keeps a best-effort in-memory dedup
    * window (sized by `webhookDedupCapacity` constructor option; default
-   * 1024 recent `event.id` values) and short-circuits
+   * 1024 recent `event.id` values; only a non-blank string id is recorded,
+   * any other id bypasses the window) and short-circuits
    * duplicate delivery with success semantics. This suppresses rapid retry
    * storms on a single process, but it is NOT durability:
    * - multi-process deployments each have their own window,
@@ -1744,6 +1766,18 @@ export class StripeCore extends EventTarget {
    * accepted here and forwarded verbatim to the provider. SPEC §9.3 / §6.2
    * ("Webhook endpoint の raw body 保全").
    *
+   * Dedup: an event whose `id` is a non-blank string is recorded in the
+   * in-memory dedup window, and a later delivery of the same id resolves
+   * without running the fold or the handlers (`stripe-checkout:webhook-
+   * deduped`). Any other `id` (empty, whitespace-only, missing, or not a
+   * string, such as a number or an object) bypasses dedup: the event is
+   * processed on every delivery and is never recorded.
+   *
+   * HTTP status for the route (SPEC §6.2): Stripe retries every non-2xx
+   * response, 4xx included, so the code is a diagnostic, not a retry
+   * switch. Resolve → 200. A missing `stripe-signature` header or a
+   * signature verification failure → 400. Any other rejection → 500.
+   *
    * `signatureHeader` is the value of the `stripe-signature` HTTP header.
    * Node's raw `req.headers` types the field as `string | string[] |
    * undefined`; for Stripe this is always a single value, but framework
@@ -1791,9 +1825,13 @@ export class StripeCore extends EventTarget {
       verified = this._provider.verifyWebhook(rawBody, signatureHeader, this._webhookSecret);
     } catch (e: unknown) {
       // Signature verification failure must propagate so the HTTP route
-      // returns 4xx and Stripe does not keep retrying a payload we cannot
-      // trust. Do NOT sanitize into `this._error` — a forged request should
-      // not mutate our observable state.
+      // can answer 400. That does not stop Stripe's retries (Stripe retries
+      // every non-2xx response); it marks the request as one we refuse. A
+      // forged request is not Stripe's, so nothing retries it, and a genuine
+      // delivery that fails here (wrong signing secret, mangled raw body)
+      // is retried by Stripe and goes through once that is fixed. Do NOT
+      // sanitize into `this._error` — a forged request should not mutate
+      // our observable state.
       //
       // Security note for HTTP routes: do NOT echo `err.message` to the
       // client response. The caller of this Core is a forged-or-bad
@@ -1827,28 +1865,31 @@ export class StripeCore extends EventTarget {
     // delivery serialization expectation that complements this in-process
     // window.
     //
-    // `event.id`-empty contract: the dedup membership / insertion sites
-    // below are guarded with `if (event.id)`, so an event arriving with
-    // an empty / non-string `id` bypasses dedup entirely and runs
-    // handlers on every retry. The default `StripeSdkProvider.
-    // verifyWebhook` raises in this case (see provider for the
-    // `event.id` non-empty check), but CUSTOM `IStripeProvider`
-    // implementations MUST also guarantee a non-empty `event.id` after
-    // signature verification or accept this dedup-bypass cost. A
-    // future hardening could fail-loud here too, but that risks
-    // breaking custom providers that intentionally pass synthetic
-    // events through `handleWebhook` for tooling purposes (e.g.
+    // Dedup-bypass contract: only an `id` that is a non-blank string is a
+    // dedup key (`webhookDedupKey`). An empty, whitespace-only, missing or
+    // non-string `id` (a number, an object, …) bypasses dedup entirely:
+    // the membership check, the insertion and the fatal-throw eviction
+    // below all use the same key, so such an event runs handlers on every
+    // retry and never takes a slot in the window. The default
+    // `StripeSdkProvider.verifyWebhook` raises on a non-string or empty
+    // id (see provider for the `event.id` check), but CUSTOM
+    // `IStripeProvider` implementations MUST also guarantee a non-blank
+    // string `event.id` after signature verification or accept this
+    // dedup-bypass cost. A future hardening could fail-loud here too, but
+    // that risks breaking custom providers that intentionally pass
+    // synthetic events through `handleWebhook` for tooling purposes (e.g.
     // replaying historical events from a backup queue); for now the
     // JSDoc is the contract.
-    if (event.id && this._seenWebhookIds.has(event.id)) {
+    const dedupKey = webhookDedupKey(event.id);
+    if (dedupKey !== null && this._seenWebhookIds.has(dedupKey)) {
       this._target.dispatchEvent(new CustomEvent("stripe-checkout:webhook-deduped", {
-        detail: { eventId: event.id, type: event.type },
+        detail: { eventId: dedupKey, type: event.type },
         bubbles: true,
       }));
       return;
     }
-    if (event.id) {
-      this._seenWebhookIds.set(event.id, true);
+    if (dedupKey !== null) {
+      this._seenWebhookIds.set(dedupKey, true);
       // Eviction: Map preserves insertion order, so `keys().next().value`
       // is the oldest id. `delete` is O(1). The old Set+Array pair used
       // `shift()` on the Array which is O(n); this branch stays O(1)
@@ -1914,7 +1955,7 @@ export class StripeCore extends EventTarget {
       // EventTarget and (worse) pulling the disposed-and-nulled
       // `_provider` into any retrieve-fallback the handler triggers.
       // The Map.delete + Array snapshot patterns elsewhere in this
-      // method (`_seenWebhookIds.delete(event.id)` on fatal re-throw)
+      // method (`_seenWebhookIds.delete(dedupKey)` on fatal re-throw)
       // also stop being meaningful after dispose; short-circuiting is
       // the only safe action.
       if (this._disposed) return;
@@ -1926,7 +1967,7 @@ export class StripeCore extends EventTarget {
           // this event id from the in-memory dedup window before rethrow.
           // `Map.delete` is O(1); the old `Array.indexOf` + `splice` pair
           // was O(n) against the dedup capacity.
-          if (event.id) this._seenWebhookIds.delete(event.id);
+          if (dedupKey !== null) this._seenWebhookIds.delete(dedupKey);
           throw e;
         }
         this._target.dispatchEvent(new CustomEvent("stripe-checkout:webhook-warning", {

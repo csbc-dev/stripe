@@ -257,8 +257,10 @@ export interface ConfirmationReport {
  * `StripeCore.handleWebhook` checks this right after signature verification
  * and rejects anything else with a fixed `[@csbc-dev/stripe]` error (field
  * name and value type only), without touching observable state, handlers or
- * the dedup window. An empty or missing `id` is accepted; such an event
- * bypasses dedup.
+ * the dedup window. `id` is not checked: only a non-blank string `id` enters
+ * the dedup window, and an event whose `id` is empty, whitespace-only,
+ * missing or not a string (a number, an object, …) bypasses dedup and is
+ * processed on every delivery.
  */
 export interface StripeEvent {
   id: string;
