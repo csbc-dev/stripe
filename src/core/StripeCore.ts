@@ -166,6 +166,13 @@ function webhookDedupKey(id: unknown): string | null {
 }
 
 /**
+ * What a waiter's `disposed` promise resolves to in `_joinInflightWebhook`,
+ * so the waiter can tell `dispose()` winning the race from the first
+ * delivery resolving (with `undefined`).
+ */
+const DISPOSED_WHILE_WAITING: unique symbol = Symbol("disposed while waiting");
+
+/**
  * Headless Stripe payments core.
  *
  * Lives server-side. Holds the Stripe secret key via the injected
@@ -286,15 +293,17 @@ export class StripeCore extends EventTarget {
    * outcome is known: an early 200 would end Stripe's retries even when the
    * first delivery then fails.
    *
-   * The entry is removed when the processing settles, before the promise
-   * itself settles, so a delivery that arrives after a failure is processed
-   * again instead of joining the failed attempt. `dispose()` clears the map.
+   * The entry is removed when the outcome is decided, before the promise
+   * settles, so a delivery that arrives after a failure is processed again
+   * instead of joining the failed attempt. `dispose()` clears the map.
    */
   private _inflightWebhooks: Map<string, Promise<void>> = new Map();
   /**
    * One callback per delivery waiting in `_joinInflightWebhook`. `dispose()`
    * calls them so the waiters reject with the disposed error at once instead
    * of waiting for a handler of the first delivery that is still running.
+   * A waiter whose first delivery had already settled when `dispose()` ran
+   * keeps that outcome: the release loses the race (`_joinInflightWebhook`).
    */
   private _inflightWebhookWaiters: Set<() => void> = new Set();
 
@@ -1723,8 +1732,10 @@ export class StripeCore extends EventTarget {
    * / reset / handleWebhook) `raiseError`, and all in-memory registrations
    * (intent builder, resume authorizer, webhook handlers, webhook dedup
    * window, in-flight webhook entries, active intent) are cleared. A webhook
-   * delivery that was waiting for an in-flight delivery of the same event
-   * rejects with the disposed error.
+   * delivery still being processed skips its remaining handlers and rejects
+   * with the disposed error once its current await returns, and a delivery
+   * waiting for it rejects with the same error at once (SPEC §6.2). A
+   * delivery whose outcome was already decided keeps it.
    *
    * Secret clearing (SPEC §9.2): dispose also nulls out `_webhookSecret`,
    * `_userContext`, and the `_provider` reference. In a multi-tenant
@@ -1760,7 +1771,9 @@ export class StripeCore extends EventTarget {
     this._seenWebhookIds.clear();
     // Deliveries waiting for an in-flight first delivery reject with the
     // disposed error now (`_joinInflightWebhook`). The first delivery itself
-    // keeps running until its current handler returns, as before.
+    // keeps running until its current await (the fold or a handler)
+    // returns, then rejects with the same error without running the
+    // remaining handlers (`_throwIfDisposedDuringWebhook`).
     this._inflightWebhooks.clear();
     for (const release of this._inflightWebhookWaiters) release();
     this._inflightWebhookWaiters.clear();
@@ -1811,6 +1824,16 @@ export class StripeCore extends EventTarget {
    * duplicate rejects with the disposed error at once. Consequence: a
    * handler must not await `handleWebhook` for its own event; that call
    * would wait for the handler itself.
+   *
+   * Dispose mid-processing (SPEC §6.2): if `dispose()` runs before the
+   * outcome is decided (while the fold or any handler, the last one
+   * included, is being awaited, or in a `webhook-warning` listener), the
+   * delivery runs no further handler and rejects with the disposed error
+   * once that returns, whatever the awaited code did. The route answers 500 and Stripe retries, so another
+   * Core or process handles the event; duplicates waiting on it reject the
+   * same way. The outcome is decided when the Core resumes after the last
+   * handler (after the fold, when no handler is registered) and finds the
+   * Core not disposed; a `dispose()` after that changes nothing.
    *
    * HTTP status for the route (SPEC §6.2): Stripe retries every non-2xx
    * response, 4xx included, so the code is a diagnostic, not a retry
@@ -1975,14 +1998,25 @@ export class StripeCore extends EventTarget {
 
     // The in-flight entry is in place before any handler runs:
     // `_processWebhookEvent` runs synchronously only up to the fold's first
-    // `await`, and the handlers come after it. `finally` removes it before
-    // `processing` settles, so whoever awaits `processing` (this delivery,
-    // its waiters, the route) already sees the map without it: a delivery
-    // after a failure is processed again rather than joining the failure.
-    // The identity check keeps a late cleanup from removing a newer entry
+    // `await`, and the handlers come after it. The same `await` means
+    // `processing` is initialized by the time the callback below runs.
+    //
+    // `processing` is `_processWebhookEvent`'s own promise, not one derived
+    // from it (no `.finally` wrapper): it settles in the same synchronous
+    // step that decides the outcome (the last dispose check). A waiter races
+    // it against `dispose()` (`_joinInflightWebhook`), so the waiter and
+    // this delivery agree on whether the dispose came first. A wrapper
+    // would settle a few microtasks later, and a dispose in between would
+    // reject the waiters while this delivery resolved.
+    //
+    // The callback removes the entry in that same step, before `processing`
+    // settles, so whoever awaits `processing` (this delivery, its waiters,
+    // the route) already sees the map without it: a delivery after a
+    // failure is processed again rather than joining the failure. The
+    // identity check keeps a late cleanup from removing a newer entry
     // (only `dispose()` clears the map while an entry is in flight, and a
     // disposed Core accepts no new delivery, so today it is defensive).
-    const processing: Promise<void> = this._processWebhookEvent(event, dedupKey).finally(() => {
+    const processing: Promise<void> = this._processWebhookEvent(event, dedupKey, () => {
       if (this._inflightWebhooks.get(dedupKey) === processing) this._inflightWebhooks.delete(dedupKey);
     });
     this._inflightWebhooks.set(dedupKey, processing);
@@ -1998,11 +2032,21 @@ export class StripeCore extends EventTarget {
    * route answers this delivery as it answers the first one: a failure is
    * a 500 for both, and Stripe retries.
    *
-   * A disposed Core cannot vouch for the event: once `dispose()` has run,
-   * the waiter rejects with the disposed error, the same one a delivery
-   * arriving after dispose gets. `dispose()` releases waiters at once
+   * A disposed Core cannot vouch for the event: if `dispose()` runs before
+   * the first delivery's outcome is decided, the waiter rejects with the
+   * disposed error, the same one a delivery arriving after dispose gets.
+   * The first delivery rejects with it too (`_throwIfDisposedDuringWebhook`),
+   * so both answer 500. `dispose()` releases waiters at once
    * (`_inflightWebhookWaiters`), without waiting for a handler of the first
    * delivery that is still running.
+   *
+   * The race winner decides, not `_disposed` read afterwards. `processing`
+   * settles in the step that decides the first delivery's outcome, so it
+   * wins exactly when the outcome was decided before `dispose()` ran. The
+   * waiter then takes that outcome even though the Core is disposed by the
+   * time it resumes; it only skips `webhook-deduped`, since a disposed Core
+   * dispatches nothing. Reading `_disposed` instead would reject a waiter
+   * whose first delivery resolved just before the dispose.
    *
    * The per-waiter `disposed` promise, instead of one shared per Core,
    * keeps `Promise.race` from piling reactions onto a promise that lives
@@ -2010,18 +2054,19 @@ export class StripeCore extends EventTarget {
    */
   private async _joinInflightWebhook(processing: Promise<void>, dedupKey: string, type: string): Promise<void> {
     let releaseOnDispose!: () => void;
-    const disposed = new Promise<void>((resolve) => { releaseOnDispose = resolve; });
+    const disposed = new Promise<typeof DISPOSED_WHILE_WAITING>((resolve) => {
+      releaseOnDispose = () => resolve(DISPOSED_WHILE_WAITING);
+    });
     this._inflightWebhookWaiters.add(releaseOnDispose);
-    let failure: { error: unknown } | null = null;
+    let winner: void | typeof DISPOSED_WHILE_WAITING;
     try {
-      await Promise.race([processing, disposed]);
-    } catch (e: unknown) {
-      failure = { error: e };
+      // A rejection of `processing` (the first delivery's error) propagates.
+      winner = await Promise.race([processing, disposed]);
+    } finally {
+      this._inflightWebhookWaiters.delete(releaseOnDispose);
     }
-    this._inflightWebhookWaiters.delete(releaseOnDispose);
-    if (this._disposed) raiseError("StripeCore has been disposed.");
-    if (failure !== null) throw failure.error;
-    this._dispatchWebhookDeduped(dedupKey, type);
+    if (winner === DISPOSED_WHILE_WAITING) raiseError("StripeCore has been disposed.");
+    if (!this._disposed) this._dispatchWebhookDeduped(dedupKey, type);
   }
 
   private _dispatchWebhookDeduped(eventId: string, type: string): void {
@@ -2035,72 +2080,132 @@ export class StripeCore extends EventTarget {
    * The fold and the registered handlers for one delivery: the part of
    * `handleWebhook` that a duplicate of an in-flight delivery does not run.
    * `dedupKey` is `null` for an event that bypasses dedup.
+   *
+   * Dispose mid-processing (SPEC §6.2): `_throwIfDisposedDuringWebhook`
+   * runs after the fold, after each handler (the last one included) and
+   * after each `webhook-warning` dispatch, whose listener may dispose
+   * synchronously. Once `dispose()` has run, the delivery runs no further
+   * handler and rejects with the disposed error, whatever the awaited fold
+   * or handler did (a fatal handler's own throw included), so the route
+   * answers 500 and Stripe retries. Before this check existed the loop
+   * returned instead, and a delivery disposed mid-way resolved: the route
+   * answered 200 for an event whose remaining fatal handlers never ran,
+   * and Stripe stopped retrying it.
+   *
+   * The outcome is decided when this method returns or throws: the last
+   * of those checks passing is the boundary. `onSettled` runs in that same
+   * synchronous step, before the returned promise settles. A `dispose()`
+   * after that step changes neither this delivery's outcome nor that of
+   * the duplicates waiting on it (`_joinInflightWebhook`).
    */
-  private async _processWebhookEvent(event: StripeEvent, dedupKey: string | null): Promise<void> {
-    // Reflect common event types into observable state BEFORE app handlers.
-    // Trade-off: if a fatal handler throws, UI may transiently observe a
-    // terminal state (e.g. succeeded) while the webhook HTTP route returns
-    // 5xx and Stripe retries. This is intentional eventual consistency:
-    // retries re-run fold idempotently, while handler-side durability still
-    // controls acknowledgement semantics.
-    //
-    // Only the currently-active intent is folded in; events for other intents
-    // (different user, old session) pass through to handlers but do not move
-    // UI state.
-    await this._foldWebhookIntoState(event);
+  private async _processWebhookEvent(
+    event: StripeEvent,
+    dedupKey: string | null,
+    onSettled?: () => void,
+  ): Promise<void> {
+    try {
+      // Reflect common event types into observable state BEFORE app handlers.
+      // Trade-off: if a fatal handler throws, UI may transiently observe a
+      // terminal state (e.g. succeeded) while the webhook HTTP route returns
+      // 5xx and Stripe retries. This is intentional eventual consistency:
+      // retries re-run fold idempotently, while handler-side durability still
+      // controls acknowledgement semantics.
+      //
+      // Only the currently-active intent is folded in; events for other intents
+      // (different user, old session) pass through to handlers but do not move
+      // UI state.
+      //
+      // The fold returns early (without touching state) when it finds the
+      // Core disposed after its retrieve await; the check below turns that
+      // into the rejection. It also comes before the handler lookup, which
+      // a disposed Core's cleared `_webhookHandlers` would answer with
+      // "no handler" (the old path to a resolve).
+      await this._foldWebhookIntoState(event);
+      this._throwIfDisposedDuringWebhook(dedupKey);
 
-    // Dispatch to registered handlers. Fatal/non-fatal semantics mirror
-    // s3-uploader's registerPostProcess. Run sequentially so a fatal throw
-    // aborts the chain deterministically and the HTTP route sees the
-    // rejection before Stripe considers the webhook delivered.
-    //
-    // Snapshot the handler array BEFORE iterating: a handler may call
-    // its own returned disposer (`unregister()` from
-    // `registerWebhookHandler`), which `splice`s the entry out of the
-    // backing array. A `for-of` iterator over the live array would then
-    // skip the NEXT entry (the splice shifts every subsequent element
-    // down by one index, and the iterator's internal index advances
-    // independently). Conversely, a handler that REGISTERS a new
-    // handler mid-fire would have the new entry observed by the same
-    // iteration, leading to "handler fires on the event that registered
-    // it" surprise. Both pathological behaviors are pinned down by
-    // freezing the dispatch list at entry: it captures the set of
-    // handlers as-of when this event arrived, and any registration
-    // changes apply to the NEXT event only.
-    const rawHandlers = this._webhookHandlers.get(event.type);
-    if (!rawHandlers || rawHandlers.length === 0) return;
-    const handlers = [...rawHandlers];
-    for (const entry of handlers) {
-      // A handler may have invoked `dispose()` during its own await,
-      // which `clear()`s `_webhookHandlers` (line ~1334). The `for-of`
-      // iterator over the array we snapshotted to `handlers` keeps
-      // running independently of that mutation, so without this guard
-      // every subsequent handler in this event's chain would run on a
-      // disposed Core — re-dispatching on the released `_target`
-      // EventTarget and (worse) pulling the disposed-and-nulled
-      // `_provider` into any retrieve-fallback the handler triggers.
-      // The Map.delete + Array snapshot patterns elsewhere in this
-      // method (`_seenWebhookIds.delete(dedupKey)` on fatal re-throw)
-      // also stop being meaningful after dispose; short-circuiting is
-      // the only safe action.
-      if (this._disposed) return;
-      try {
-        await entry.handler(event);
-      } catch (e: unknown) {
+      // Dispatch to registered handlers. Fatal/non-fatal semantics mirror
+      // s3-uploader's registerPostProcess. Run sequentially so a fatal throw
+      // aborts the chain deterministically and the HTTP route sees the
+      // rejection before Stripe considers the webhook delivered.
+      //
+      // Snapshot the handler array BEFORE iterating: a handler may call
+      // its own returned disposer (`unregister()` from
+      // `registerWebhookHandler`), which `splice`s the entry out of the
+      // backing array. A `for-of` iterator over the live array would then
+      // skip the NEXT entry (the splice shifts every subsequent element
+      // down by one index, and the iterator's internal index advances
+      // independently). Conversely, a handler that REGISTERS a new
+      // handler mid-fire would have the new entry observed by the same
+      // iteration, leading to "handler fires on the event that registered
+      // it" surprise. Both pathological behaviors are pinned down by
+      // freezing the dispatch list at entry: it captures the set of
+      // handlers as-of when this event arrived, and any registration
+      // changes apply to the NEXT event only.
+      const rawHandlers = this._webhookHandlers.get(event.type);
+      if (!rawHandlers || rawHandlers.length === 0) return;
+      const handlers = [...rawHandlers];
+      for (const entry of handlers) {
+        let failure: { error: unknown } | null = null;
+        try {
+          await entry.handler(event);
+        } catch (e: unknown) {
+          failure = { error: e };
+        }
+        // `dispose()` may have run during the handler's await (the handler
+        // itself, or anything else). The snapshot above keeps iterating
+        // after `dispose()` clears `_webhookHandlers`, so without this check
+        // the remaining handlers would run on a disposed Core. Checked
+        // before the handler's own failure, like the waiter's check in
+        // `_joinInflightWebhook`: a disposed Core answers with the disposed
+        // error, and a warning is not dispatched on it.
+        this._throwIfDisposedDuringWebhook(dedupKey, failure);
+        if (failure === null) continue;
         if (entry.fatal) {
           // Fatal errors opt back into Stripe retry semantics by removing
           // this event id from the in-memory dedup window before rethrow.
           // `Map.delete` is O(1); the old `Array.indexOf` + `splice` pair
           // was O(n) against the dedup capacity.
           if (dedupKey !== null) this._seenWebhookIds.delete(dedupKey);
-          throw e;
+          throw failure.error;
         }
         this._target.dispatchEvent(new CustomEvent("stripe-checkout:webhook-warning", {
-          detail: { error: e, event },
+          detail: { error: failure.error, event },
           bubbles: true,
         }));
+        // A warning listener may have disposed the Core synchronously.
+        this._throwIfDisposedDuringWebhook(dedupKey);
       }
+    } finally {
+      onSettled?.();
     }
+  }
+
+  /**
+   * Rejects a delivery that finds the Core disposed while it is being
+   * processed (SPEC §6.2), with the same disposed error a delivery
+   * arriving after `dispose()` gets. The route answers 500, so Stripe
+   * retries and another Core or process handles the event.
+   *
+   * The id leaves the dedup window, as after a fatal throw, so a rejected
+   * delivery never leaves its id behind. `dispose()` has already cleared
+   * the window; the delete covers an id recorded after the clear (a
+   * provider's `verifyWebhook` that disposes the Core synchronously).
+   *
+   * `handlerFailure` is the throw of the handler whose await the dispose
+   * interrupted, if it failed. The disposed error replaces it as the
+   * delivery's outcome (fatal or not, it would otherwise be lost: no
+   * warning is dispatched on a disposed Core), so it rides along as the
+   * error's `cause` for the route's log. Webhook errors never cross the
+   * remote wire, so the cause stays server-side.
+   */
+  private _throwIfDisposedDuringWebhook(dedupKey: string | null, handlerFailure: { error: unknown } | null = null): void {
+    if (!this._disposed) return;
+    if (dedupKey !== null) this._seenWebhookIds.delete(dedupKey);
+    if (handlerFailure === null) raiseError("StripeCore has been disposed.");
+    const error = new Error("[@csbc-dev/stripe] StripeCore has been disposed.");
+    // Same attributes as ES2022 `new Error(message, { cause })` (lib is ES2020).
+    Object.defineProperty(error, "cause", { value: handlerFailure.error, writable: true, configurable: true, enumerable: false });
+    throw error;
   }
 
   /**
