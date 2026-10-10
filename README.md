@@ -110,7 +110,9 @@ core.registerWebhookHandler("payment_intent.succeeded", async (event) => {
 // Never answer 2xx for a failure you still need handled: that acknowledges
 // the event and ends the retries. Stripe disables an endpoint that keeps
 // failing for several days, so log and alert on the 500s. A response that
-// takes too long also counts as failed; keep handlers quick.
+// takes too long also counts as failed, and this route answers only after
+// every handler has run, by design (see "Why the webhook route answers
+// after the handlers run" below), so keep handlers quick.
 // StripeCore keeps a best-effort in-memory dedup window keyed by
 // `event.id` and may suppress duplicate deliveries on the same process.
 // Durable idempotency still belongs in your handler storage layer.
@@ -131,6 +133,17 @@ app.post("/webhooks/stripe", async (req, res) => {
   }
 });
 ```
+
+#### Why the webhook route answers after the handlers run
+
+Stripe recommends returning a 2xx quickly, before any complex logic that could time out, and processing events from an asynchronous queue ([Quickly return a 2xx response](https://docs.stripe.com/webhooks#acknowledge-events-immediately), [Handle events asynchronously](https://docs.stripe.com/webhooks#handle-events-asynchronously)). `handleWebhook` deliberately does not. It settles only after signature verification, the event shape check, dedup, the state fold and every registered handler (fatal and non-fatal, awaited one at a time) have run, and the route above answers with that outcome. The fold of a `succeeded` event may also make one `retrieveIntent` call to Stripe before the handlers run.
+
+- **Why.** A failed fatal handler becomes a 500, so Stripe's own retries (up to three days in live mode) carry the failure. A 2xx sent first would acknowledge the event before anyone knew whether it was handled. Your app therefore needs no queue, dead-letter store or reprocessing job of its own for webhook failures. The dedup window completes this: a fatal throw evicts the event id, so the retry runs again, while a handled id stays, so a retry reaching the same process ends in 200 without rerunning anything. Your handler's own `event.id` idempotency covers other processes and restarts. Together they make every event converge at least once, as long as the cause is fixed within Stripe's retry period.
+- **Cost.** The response time is the processing time. A slow handler makes Stripe time the delivery out and retry it, even if the handler eventually succeeds. Stripe disables an endpoint that stays unresponsive or keeps returning errors for several days ([Stripe support](https://support.stripe.com/questions/why-is-stripe-trying-to-reach-my-webhook-endpoints)), which stops every event type it receives. There is also one gap: the dedup entry is recorded before the handlers run, so a delivery of the same event that reaches the same process while the first one is still running is deduped and answered 200. If the first one then throws, Stripe already has its 2xx and stops retrying, and the event needs a manual resend ([Manual retries](https://docs.stripe.com/webhooks#manual-retries)). This only happens when a handler is still running when the next delivery arrives.
+- **Recommendation.** Keep handlers fast. Make the fatal handler only record the work somewhere durable, for example by inserting the event into your job queue or a table keyed uniquely by `event.id`, and throw if that fails. Then run fulfillment, emails and downstream API calls from your queue worker. Non-fatal handlers are awaited before the response too, so keep them fast as well. Measure the route's latency and alert on timeouts and 500s.
+- **If you need to answer 2xx first.** Respond 200 once the `stripe-signature` header is present, then call `core.handleWebhook(rawBody, signature)` in the same request without awaiting it, and log its rejection. Stripe then never retries a failure (a handler, signature or shape failure has already been acknowledged), so detecting and reprocessing failed events becomes your app's job, and the Event deliveries tab no longer shows whether processing succeeded. Call `handleWebhook` right away rather than queueing the raw body: stripe-node rejects a signature whose timestamp is older than its tolerance (five minutes by default, [Preventing replay attacks](https://docs.stripe.com/webhooks#replay-attacks)).
+
+See SPEC.md §6.2 for the full rationale.
 
 ### Browser
 

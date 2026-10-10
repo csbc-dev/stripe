@@ -52,7 +52,7 @@ function createFakeClient(overrides: Partial<Record<string, any>> = {}): {
     },
     webhooks: {
       constructEvent(_p, _h, _s) {
-        return { id: "evt_1", type: "test", data: { object: {} }, created: 0 };
+        return overrides.constructEventResult ?? { id: "evt_1", type: "test", data: { object: {} }, created: 0 };
       },
     },
   };
@@ -392,6 +392,57 @@ describe("StripeSdkProvider", () => {
     const provider = new StripeSdkProvider(client);
     const view = await provider.retrieveIntent("payment", "pi_abc");
     expect(view.metadata).toBeUndefined();
+  });
+
+  describe("verifyWebhook event id", () => {
+    // The Core dedups a webhook only by a non-blank string `event.id`
+    // (`webhookDedupKey`). The provider used to reject only a non-string
+    // or empty id, so a whitespace-only id passed verification and then
+    // silently bypassed the Core's dedup window. The provider now applies
+    // the Core's rule: it rejects every id whose `trim()` is empty, with
+    // the same error as the other id rejections.
+    const NO_ID = "[@csbc-dev/stripe] verifyWebhook: Stripe event has no id after signature verification.";
+
+    function verifyWithId(id: unknown) {
+      const { client } = createFakeClient({
+        constructEventResult: { id, type: "payment_intent.succeeded", data: { object: { id: "pi_1" } }, created: 1 },
+      });
+      return new StripeSdkProvider(client).verifyWebhook("{}", "t=1,v1=sig", "whsec_test");
+    }
+
+    it.each([
+      ["a single space", " "],
+      ["several spaces", "   "],
+      ["a tab", "\t"],
+      ["a newline", "\n"],
+      ["a CRLF", "\r\n"],
+      ["mixed whitespace", " \t\r\n "],
+    ])("rejects an id made only of %s (regression: blank id bypassed Core dedup)", (_label, id) => {
+      expect(() => verifyWithId(id)).toThrow(NO_ID);
+    });
+
+    it.each([
+      ["an empty string", ""],
+      ["undefined", undefined],
+      ["null", null],
+      ["a number", 42],
+      ["an object", { id: "evt_1" }],
+    ])("still rejects an id that is %s", (_label, id) => {
+      expect(() => verifyWithId(id)).toThrow(NO_ID);
+    });
+
+    it("returns a normal id unchanged", () => {
+      expect(verifyWithId("evt_1PqR")).toEqual({
+        id: "evt_1PqR",
+        type: "payment_intent.succeeded",
+        data: { object: { id: "pi_1" } },
+        created: 1,
+      });
+    });
+
+    it("keeps an id with surrounding whitespace as delivered, like the Core's dedup key (no trim)", () => {
+      expect(verifyWithId(" evt_padded\n").id).toBe(" evt_padded\n");
+    });
   });
 
   it("Symbol-keyed _internalResetWarnings resets the missing-idempotency-key warning latch (test seam)", () => {

@@ -373,6 +373,8 @@ class StripeCore extends EventTarget {
    * rawBody は Buffer/string(body-parser の前段で保全されたもの)。
    * signatureHeader は `stripe-signature` ヘッダの値。
   * 署名検証 → event の形の検証 → dedup → status fold → 登録済み handler 実行。
+  * resolve / reject するのは handler(fatal / non-fatal とも)をすべて実行し終えた後で、
+  * HTTP ルートはその結果で応答する(下の「処理してから応答する設計」)。
    */
   handleWebhook(rawBody: string | Buffer | Uint8Array, signatureHeader: string): Promise<void>;
 }
@@ -389,6 +391,32 @@ class StripeCore extends EventTarget {
 | それ以外の reject(fatal handler の throw、`[@csbc-dev/stripe]` で始まる入力・設定・provider の形の不正、dispose 済みの Core) | 500 | サーバー側の失敗。Stripe が再送するので、原因を直せば同じ event が処理される |
 
 署名検証の失敗と形の不正が observable state・handler・dedup window に触れないのは、この再送で同じ event id が届いたときに通常どおり処理するためである。失敗した配送に 2xx を返してはならない(event が ack され再送が終わる)。失敗が数日続くエンドポイントは Stripe に無効化されるので、500 はログに流して監視する。
+
+**処理してから応答する設計(意図的)**: Stripe は、タイムアウトを起こしうる複雑な処理の前に 2xx をすばやく返すことを推奨し、受け取った event を非同期のキューで処理する構成を勧めている([Quickly return a 2xx response](https://docs.stripe.com/webhooks#acknowledge-events-immediately)、[Create a handler](https://docs.stripe.com/webhooks#webhook-endpoint-def)、[Handle events asynchronously](https://docs.stripe.com/webhooks#handle-events-asynchronously))。`handleWebhook` はこれに従わない。署名検証・形の検証・dedup・fold・登録済み handler の実行(fatal / non-fatal とも、登録順に 1 つずつ await)をすべて終えてから resolve / reject し、HTTP ルートはその結果で応答する(上の表)。fold は succeeded 分岐で `provider.retrieveIntent` を 1 回呼ぶことがあり(§6.4)、これも応答までの時間に含まれる。この順序は意図したものである。
+
+理由:
+
+- **失敗を確実に Stripe の再送に乗せる。** fatal handler の失敗はそのまま 500 になり、Stripe が再送する(live モードで最大 3 日間)。先に 2xx を返すと、その時点で event は配送済みになり、後で handler が失敗しても Stripe は再送しない。応答コードが処理の結果を表すので、Event deliveries タブの `Failed` が「まだ処理できていない event」と一致する。
+- **アプリにキューや再処理の仕組みを要求しない。** 再送を待つ行列は Stripe 側にある。失敗した event を保存して後から処理し直すジョブ、dead letter、その監視を、webhook の失敗のためにアプリが持たなくてよい。Core も永続化を持たない(dedup window はプロセス内のメモリだけ)。
+- **dedup と組み合わせて at-least-once で収束する。** fatal handler が throw すると Core はその `event.id` を dedup window から外すので、再送は最初から処理される。成功した event の id は window に残るので、同じプロセスに届いた再送(タイムアウト後の再送、ダッシュボードからの再送)は fold も handler も走らせずに 200 で終わる。別のプロセスや再起動後に届いた再送は、handler 側の `event.id` による冪等化が吸収する。原因が Stripe の再送期間のうちに直れば、各 event の fatal handler は少なくとも 1 回成功し、重複した配送の副作用は dedup と冪等化で打ち消される(例外は下の「処理中の重複」)。
+
+代償:
+
+- **応答時間が処理時間になる。** handler が遅いと Stripe は応答を待ちきれずにタイムアウトとし(Event deliveries の `(Timed out) ERR`)、配送失敗として再送する([Fix HTTP status codes](https://docs.stripe.com/webhooks#fix-http-status-codes))。handler が最後には成功していても、その配送は失敗の扱いである。Stripe が何秒待つかは、ここで引用したページには書かれていない。
+- **失敗が続くとエンドポイントが無効化される。** 数日にわたって応答しない、またはエラーを返し続けるエンドポイントについて、Stripe は配送をやめ、webhook の設定でそのエンドポイントを無効にする([Why is Stripe trying to reach my webhook endpoints?](https://support.stripe.com/questions/why-is-stripe-trying-to-reach-my-webhook-endpoints))。毎回タイムアウトする遅い handler もこれに当たる。無効になると、そのエンドポイントで受けていた他の種類の event も届かなくなる。
+- **処理中の重複は ack される。** dedup window への登録は fold と handler の前に行う。そのため、最初の配送の handler がまだ走っている間に同じ id が同じプロセスに届くと(タイムアウト後の再送、ダッシュボードからの再送)、その配送は dedup で抑止され 200 で終わる。その後で最初の配送の fatal handler が throw すると、id は window から外れるが、Stripe はその event の 2xx をすでに受け取っているので自動の再送は終わる。取りこぼした event は、ダッシュボード(event の作成から 15 日まで)か Stripe CLI(30 日まで)から手で再送する([Manual retries](https://docs.stripe.com/webhooks#manual-retries))。これが起きるのは handler が次の配送が届くまで走り続けたときだけなので、handler を短く保つことが対策になる。
+
+推奨:
+
+- **handler は速く保つ。** fatal handler では、処理を引き受けたことを失われない場所に記録するだけにする。たとえば `event.id` を一意キーにして event をアプリのジョブキューや DB のテーブルに登録し、登録に失敗したら throw する(500 になり Stripe が再送する)。注文の確定、メール送信、外部 API の呼び出し、会計システムの更新といった重い処理は、そのキューの worker が行う。worker の失敗と再実行はアプリの責任になるが、event は受け取った時点で失われない場所にある。
+- non-fatal handler も応答の前に await されるので、同じく速く保つ(監査ログや通知の送信そのものをキューに積む)。
+- ルートの応答時間を計測し、500 と `Timed out` を監視する。
+
+**2xx を先に返す構成にしたい場合**: ルートで `stripe-signature` ヘッダがあることだけを確かめて先に 200 を返し、同じリクエストの中で続けて `core.handleWebhook(rawBody, signature)` を呼ぶ(`await` せず、reject は `.catch` でログに流す)。この構成では次のことに注意する。
+
+- Stripe は失敗した event を再送しない。fatal handler の失敗、署名検証の失敗、形の不正はすべて 200 で ack 済みなので、失敗の検出と再処理はアプリの責任になる(失敗した `event.id` を記録してダッシュボードか CLI から再送する、Events API で event を取り直してアプリ側で処理する、など)。Event deliveries タブの表示も処理の成否を表さなくなる。
+- `handleWebhook` は受け取ってすぐに呼ぶ。raw body と署名ヘッダをキューに積んで後から呼ぶと、stripe-node の署名検証はタイムスタンプが許容幅(既定 5 分)を過ぎた配送を拒否する([Preventing replay attacks](https://docs.stripe.com/webhooks#replay-attacks))。処理を後に回したいなら、上の推奨どおり handler の中で検証済みの event をアプリ側に記録する。
+- 応答と処理が切り離されるので、処理を待たずに次の配送を受け付け、同じ intent の webhook が並列に走りやすくなる。下の「並列 webhook の直列化」に従う。
 
 設計トレードオフ: Core は webhook を受けると handler 実行前に observable state を fold する。
 そのため fatal handler が throw した場合でも UI は先に `succeeded` などを観測しうる一方、
