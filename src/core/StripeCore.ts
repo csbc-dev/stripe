@@ -6,7 +6,8 @@ import {
   UserContext, PaymentIntentOptions, SetupIntentOptions, IntentBuilderResult,
   ResumeAuthorizer, UnknownStatusDetail,
 } from "../types.js";
-import { extractCardPaymentMethod, validateReportedPaymentMethod } from "../internal/paymentMethodShape.js";
+import { extractCardPaymentMethod, toObservablePaymentMethod } from "../internal/paymentMethodShape.js";
+import { toObservableAmount } from "../internal/amountShape.js";
 import {
   STRIPE_TAXONOMY_TOKEN_RE,
   STRIPE_ERROR_CODE_RE,
@@ -546,24 +547,38 @@ export class StripeCore extends EventTarget {
     const prev = this._amount;
     if (prev === a) return;
     if (prev && a && prev.value === a.value && prev.currency === a.currency) return;
-    // Store a defensive shallow copy so a caller that retains the original
+    // Store a defensive copy so a caller that retains the original
     // reference (provider-returned object, IntentBuilder-produced struct)
     // and mutates it AFTER this set cannot retroactively change observable
     // state, the dedup baseline (`prev.value === a.value`), or future
     // event details. The getter (`get amount()`) and the dispatched event
     // detail already return / forward copies; this closes the same gate
     // on the storage side.
-    this._amount = a ? { ...a } : null;
-    this._target.dispatchEvent(new CustomEvent("stripe-checkout:amount-changed", { detail: a ? { ...a } : null, bubbles: true }));
+    //
+    // The copy names the two documented fields instead of spreading, so
+    // nothing but `{ value, currency }` can reach the wire-visible slot
+    // (the event detail is the `update`, the getter feeds `sync`). Values
+    // from a provider are validated before they get here — see
+    // `toObservableAmount`.
+    this._amount = a ? { value: a.value, currency: a.currency } : null;
+    this._target.dispatchEvent(new CustomEvent("stripe-checkout:amount-changed", {
+      detail: a ? { value: a.value, currency: a.currency } : null,
+      bubbles: true,
+    }));
   }
 
   private _setPaymentMethod(pm: StripePaymentMethod | null): void {
     const prev = this._paymentMethod;
     if (prev === pm) return;
     if (prev && pm && prev.id === pm.id && prev.brand === pm.brand && prev.last4 === pm.last4) return;
-    // Same defensive-copy rationale as `_setAmount`.
-    this._paymentMethod = pm ? { ...pm } : null;
-    this._target.dispatchEvent(new CustomEvent("stripe-checkout:paymentMethod-changed", { detail: pm ? { ...pm } : null, bubbles: true }));
+    // Same defensive, documented-fields-only copy as `_setAmount`. Report
+    // and provider values are validated before they get here — see
+    // `toObservablePaymentMethod`.
+    this._paymentMethod = pm ? { id: pm.id, brand: pm.brand, last4: pm.last4 } : null;
+    this._target.dispatchEvent(new CustomEvent("stripe-checkout:paymentMethod-changed", {
+      detail: pm ? { id: pm.id, brand: pm.brand, last4: pm.last4 } : null,
+      bubbles: true,
+    }));
   }
 
   private _setIntentId(id: string | null): void {
@@ -925,11 +940,13 @@ export class StripeCore extends EventTarget {
     this._activeIntent = { id: creation.intentId, mode, generation: gen };
     // amount is only meaningful in payment mode (SPEC §5.1). In setup mode
     // force it to null so a prior payment-mode amount does not bleed through
-    // into a subsequent setup session on the same Core. Copy the two
-    // documented fields so the observable `amount` and the `amount` in the
-    // return value below are the same `{ value, currency }` shape.
-    const amount: StripeAmount | null = mode === "payment" && creation.amount
-      ? { value: creation.amount.value, currency: creation.amount.currency }
+    // into a subsequent setup session on the same Core. `toObservableAmount`
+    // rebuilds the provider's value as `{ value, currency }` (finite number,
+    // non-empty string) — the same rule every `retrieveIntent` path uses —
+    // so the observable `amount` and the `amount` in the return value below
+    // are that shape, and a value that does not fit is treated as absent.
+    const amount: StripeAmount | null = mode === "payment"
+      ? toObservableAmount(creation.amount) ?? null
       : null;
     // Dispatch order: amount → intentId → status. A listener that
     // subscribes to `intentId-changed` and reads `el.amount` must see
@@ -998,7 +1015,7 @@ export class StripeCore extends EventTarget {
         // controlled strings onto the observable surface. A failed
         // validation collapses to "no report" and the server-side
         // retrieve fallback below picks up the real value from Stripe.
-        const validated = report.paymentMethod ? validateReportedPaymentMethod(report.paymentMethod) : undefined;
+        const validated = report.paymentMethod ? toObservablePaymentMethod(report.paymentMethod) : undefined;
         if (validated) {
           this._setPaymentMethod(validated);
         } else if (!this._paymentMethod) {
@@ -1012,7 +1029,11 @@ export class StripeCore extends EventTarget {
           try {
             const view = await this._provider.retrieveIntent(active.mode, active.id);
             if (gen !== this._generation) return; // superseded during fetch
-            if (view.paymentMethod) this._setPaymentMethod(view.paymentMethod);
+            // Rebuild, never forward, the provider's object: see
+            // `toObservablePaymentMethod`. A value that does not fit counts
+            // as "no card found" — pm stays null for the webhook to fill.
+            const retrieved = toObservablePaymentMethod(view.paymentMethod);
+            if (retrieved) this._setPaymentMethod(retrieved);
           } catch { /* keep pm null; webhook will reconcile later */ }
         }
         // Re-check generation: the retrieveIntent catch above swallows
@@ -1094,13 +1115,24 @@ export class StripeCore extends EventTarget {
   * misconfigured webhook environments.
    */
   private _reconcileFromIntentView(mode: StripeMode, view: { status: string; amount?: StripeAmount; paymentMethod?: StripePaymentMethod; lastPaymentError?: StripeError }): void {
-    if (view.paymentMethod) this._setPaymentMethod(view.paymentMethod);
+    // The view comes from `IStripeProvider.retrieveIntent`, which a custom
+    // provider may fill with extra members or non-JSON values. Rebuild
+    // `paymentMethod` / `amount` from their documented fields before they
+    // touch observable state (both are wire-visible: event detail →
+    // `update`, getter → `sync`; @wc-bindable/remote ≥ 0.10 drops a value
+    // holding `undefined` / `Date` / `NaN`). A value that does not fit is
+    // treated as not reported and the current value stays — same as a
+    // view that omits the field. `lastPaymentError` goes through
+    // `_sanitizeError` below.
+    const paymentMethod = toObservablePaymentMethod(view.paymentMethod);
+    if (paymentMethod) this._setPaymentMethod(paymentMethod);
     // amount is only meaningful in payment mode (SPEC §5.1). Reflect it
     // only for payment-mode views — if a custom provider returns amount on
     // a setup intent view, drop it rather than leak it through the bindable
     // surface. Symmetric with the amount-clear in `requestIntent`.
     if (mode === "payment") {
-      if (view.amount) this._setAmount(view.amount);
+      const amount = toObservableAmount(view.amount);
+      if (amount) this._setAmount(amount);
     } else if (this._amount !== null) {
       this._setAmount(null);
     }
@@ -1820,7 +1852,10 @@ export class StripeCore extends EventTarget {
               // either keeps the fold from mutating state past its
               // ownership boundary.
               if (this._disposed || gen !== this._generation) return;
-              if (view.paymentMethod) this._setPaymentMethod(view.paymentMethod);
+              // Rebuilt from the documented fields, same as the other
+              // retrieve paths (`toObservablePaymentMethod`).
+              const retrieved = toObservablePaymentMethod(view.paymentMethod);
+              if (retrieved) this._setPaymentMethod(retrieved);
             } catch {
               /* best-effort. Fall through — but the guard below still
                  covers the case where generation advanced DURING the
