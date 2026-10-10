@@ -467,7 +467,9 @@ export class StripeSdkProvider implements IStripeProvider {
     // Delegates to stripe-node's constructEvent, which performs the HMAC-SHA256
     // over the raw body + timestamp check. It throws on failure — we let the
     // throw propagate so StripeCore.handleWebhook returns the error to the
-    // HTTP route unchanged (4xx → Stripe stops retrying a forged request).
+    // HTTP route unchanged, which answers 400. Stripe retries every non-2xx
+    // response, 400 included; a forged request is simply not Stripe's, so
+    // nothing retries it.
     const event = this._client.webhooks.constructEvent(rawBody, signatureHeader, secret);
     // Stripe's contract guarantees `id` and `type` on every event that
     // passes signature verification. A missing value here means the SDK

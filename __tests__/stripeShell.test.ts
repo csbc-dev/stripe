@@ -4084,6 +4084,63 @@ describe("<stripe-checkout> Shell", () => {
         }
       });
 
+      it.each(["local", "remote"] as const)("%s: abort() with no intent resolves when the Core reset fails, and logs the failure once", async (kind) => {
+        // SPEC §7.6: with no intent to cancel, abort() resets the Core, and
+        // that reset is best-effort like the others. In local mode
+        // `StripeCore.reset()` throws synchronously (here: a disposed Core);
+        // abort() awaited it without a catch, so it rejected with that error
+        // and the failure never reached `Stripe._logger`. Remote mode already
+        // routed the rejected RPC to the logger.
+        const logged: { phase: string; error: unknown }[] = [];
+        WcsStripe.setLogger((phase, error) => logged.push({ phase, error }));
+        // No publishable-key: nothing auto-prepares, so there is no intent.
+        el = createEl({ mode: "payment" });
+        const events = recordErrors(el);
+        let shellProxy: RemoteShellProxy | null = null;
+        try {
+          if (kind === "local") {
+            el.attachLocalCore(core);
+          } else {
+            const { client, server } = createMockTransportPair();
+            shellProxy = new RemoteShellProxy(core, server);
+            el._connectRemote(client);
+          }
+          await flushTransport(4);
+          expect(el.intentId).toBeNull();
+          core.dispose();
+
+          const mark = events.length;
+          await expect(el.abort()).resolves.toBeUndefined();
+          await flushTransport(4);
+
+          expect(el.error).toBeNull();
+          expect(reportsSince(events, mark)).toEqual([]);
+          expect(logged.map((c) => c.phase)).toEqual(["reset"]);
+          expect((logged[0].error as Error).message).toBe("[@csbc-dev/stripe] StripeCore has been disposed.");
+        } finally {
+          shellProxy?.dispose();
+        }
+      });
+
+      it("local: abort() with no intent resolves when the Core reset throws a non-disposed failure, and logs it once", async () => {
+        const logged: { phase: string; error: unknown }[] = [];
+        WcsStripe.setLogger((phase, error) => logged.push({ phase, error }));
+        el = createEl({ mode: "payment", "publishable-key": "pk_test_window" });
+        el.attachLocalCore(core);
+        await el.prepare();
+        // Back to "no intent" without touching the Core's reset spy below.
+        el.reset();
+        expect(el.intentId).toBeNull();
+        logged.length = 0;
+        const reset = vi.spyOn(core, "reset").mockImplementation(() => { throw new Error("synthetic core reset failure"); });
+
+        await expect(el.abort()).resolves.toBeUndefined();
+
+        expect(reset).toHaveBeenCalledTimes(1);
+        expect(logged.map((c) => c.phase)).toEqual(["reset"]);
+        expect((logged[0].error as Error).message).toBe("synthetic core reset failure");
+      });
+
       it.each(["local", "remote"] as const)("%s: a rejected cancelIntent during abort() is logged once, never reported on el.error", async (kind) => {
         // SPEC §7.6: a best-effort failure is never dropped silently. abort()
         // used to swallow its cancel's rejection with an empty catch, so a
