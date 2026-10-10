@@ -133,6 +133,8 @@ app.post("/webhooks/stripe", async (req, res) => {
 
 Auto-prepare mounts Stripe Elements as soon as the element is connected and a `publishable-key` is present. `submit()` drives confirmation. 3DS redirect returns are detected and folded back into state via an authenticated `resumeIntent` call (the element reads Stripe's `payment_intent_client_secret` from the URL as the ownership token).
 
+If that resume fails, what happens to the redirect params depends only on whether the Core's answer carries a Stripe error `code`. With a code (`resume_client_secret_mismatch`, `resume_not_authorized`, a Stripe reject such as `resource_missing`) the failure is decisive: the params are stripped so a reload does not resume again. Without one (the server could not reach Stripe, the WebSocket dropped, the command never reached the Core) it is transient: the params stay in the URL, auto-prepare stays blocked, and the next connect / re-mount / reload retries the resume — the charge may already have gone through at Stripe. Local and remote mode classify the same failure the same way; in remote mode an `error` the Core held before the resume was sent (for example one delivered by the initial sync) never counts as its answer. See SPEC.md §4.
+
 ## Security — Your Responsibilities
 
 The Quick Start is **deliberately minimal** and **not production-ready**. Before shipping, read SPEC.md §9 and at a minimum:

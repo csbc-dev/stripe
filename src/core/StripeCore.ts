@@ -1345,12 +1345,15 @@ export class StripeCore extends EventTarget {
       // Same rationale as `requestIntent`'s IntentBuilder / provider-create
       // catches. A transient provider failure during resume is not a
       // definitive Core decision — the Shell's `_resumeFromRedirect`
-      // classifies the rejection by its `code` (a sanitized Stripe
-      // taxonomy code means "decisive", no code means "transient") and,
-      // in remote mode, also by whether an `error` update crossed the
-      // wire during the resume (see `_remoteErrorSeq`). The `code` and
-      // message portions the Shell surfaces from the throw must still
-      // come through the same allowlist as observable `_error`.
+      // classifies the failure by its `code` alone, in both modes: a
+      // sanitized Stripe taxonomy code means "decisive" (the redirect URL
+      // is consumed), no code means "transient" (the URL is kept for a
+      // retry). In remote mode it reads the code off the rejection, or
+      // off the `error` this branch publishes before throwing, so both
+      // must carry the same sanitized `code` (they do: one `sanitized`
+      // value feeds both). The `code` and message portions the Shell
+      // surfaces from the throw must still come through the same
+      // allowlist as observable `_error`.
       const sanitized = this._sanitizeError(e);
       if (gen === this._generation) {
         this._setError(sanitized);

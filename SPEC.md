@@ -158,6 +158,30 @@ UI を `loading` に直結すると、サーバーサイドの intent 作成や 
 
 raw な authorizer 例外(ACL lookup 失敗、DB エラー、stack trace など)は **wire には乗らない**。代わりに Core の target に `stripe-checkout:authorizer-error` が dispatch され、`detail: { error, intentId, mode }` を運ぶ。operator はサーバー側でこの event を subscribe してログに流せばよい(`stripe-checkout:webhook-warning` と同じ観測点モデル)。
 
+**resume 失敗の分類(redirect URL を消費するか残すか)**: resume が reject したとき、Shell は失敗を「決定的」か「一時的」かに分類して redirect URL の扱いを決める。規則は local / remote で同一で、**Core の回答が Stripe error-code taxonomy(`STRIPE_ERROR_CODE_RE`: 小文字・`_`・`.`、96 文字以内)に合う `code` を持つかどうか**だけで決まる:
+
+- **決定的**(`code` あり)— `resume_client_secret_mismatch` / `resume_not_authorized`、Stripe API の application-level reject(`resource_missing` 等)。同じ URL で再試行しても同じ拒否になるので、Shell は redirect パラメータ(`payment_intent` / `payment_intent_client_secret` / `setup_intent` / `setup_intent_client_secret` / `redirect_status`)を `history.replaceState` で取り除き、同じ要素での再 resume も止める(reload のたびに resume が繰り返される無限ループの防止)。成功時も同じ扱い。
+- **一時的**(それ以外)— `code` の無い Core 側の失敗(provider が Stripe に届かない `StripeConnectionError`・ネットワーク例外、generation の supersede、Core の validation throw)と、Core まで届かなかった失敗(cmd 送信失敗、切断、remote 層が合成する大文字の `WC_BINDABLE_*` code)。URL を残し、次の契機(再接続・再マウント・reload)で resume を再試行できるようにする。3DS 自体は Stripe 側で完了している可能性があり、ここで URL を捨てると intent の終局状態を fold し直す手段が無くなって、同じカートに新しい intent を auto-prepare してしまう(二重課金の露出)。
+
+| 失敗 | local: throw の `code` | remote: reject の `code` | remote: 送信後に Core が publish した `error` | 分類 / URL |
+|---|---|---|---|---|
+| 成功 | — | — | — | 消費 |
+| clientSecret 不一致 | `resume_client_secret_mismatch` | 同じ | 同じ code | 決定的 / 消費 |
+| authorizer 拒否(`false` / throw) | `resume_not_authorized` | 同じ | 同じ code | 決定的 / 消費 |
+| Stripe API の reject(`resource_missing` 等) | taxonomy code | 同じ | 同じ code | 決定的 / 消費 |
+| code 付きの失敗だが Core は publish しない(supersede) | taxonomy code | 同じ | なし | 決定的 / 消費 |
+| provider が Stripe に届かない(code 無し) | なし | なし | code 無しの `error` | 一時的 / 保持 |
+| code 無しで Core も publish しない(supersede、disposed Core 等) | なし | なし | なし | 一時的 / 保持 |
+| Core まで届かない(送信失敗・切断・producer 側の reject) | — | なし or `WC_BINDABLE_*` | なし | 一時的 / 保持 |
+
+remote では reject の `code`(`@wc-bindable/remote` ≥ 0.10 で throw envelope に載る)に加え、**その resume の RPC を送った時点以降に、同じ接続で** Core が publish した `error`(`update`)の `code` も見る(throw に `code` を載せない 0.10 未満の producer への backstop。Core はどちらにも同じサニタイズ済み `code` を載せる)。このとき数えるのは non-null の `update` だけで、次は数えない:
+
+- **初期 `sync` の値と、それより前に届いた `update`**。producer は接続の最初に届いた `sync` に先に答えるため、これらはこの接続から送ったどの RPC よりも前の Core 状態である。post-redirect のページ読み込みでは resume は `_connectRemote` の直後、`sync` 応答が適用される前に送られる(proxy の既定 `preSyncBehavior: "eager"`。`"queue"` なら `sync` 適用直後に送られる)が、どちらでも基準は「`sync` 適用後」になる。Shell は client transport を薄く包んで `sync` フレームを識別する。
+- RPC 送信前から残っていた `error`、および `null`(各コマンド冒頭の `_setError(null)` はエラー報告ではない)。
+- 別の接続で publish されたもの(切断・再接続をまたぐ窓は無効)。
+
+remote の `el.error` も同じ窓で決める: 送信後に Core が publish した `error` があればそれ(`declineCode` / `type` を含む完全形)、無ければ reject 自体をサニタイズしたもの。初期 `sync` が運んだ古い `error` が今回の失敗の代わりに表示されることはない。
+
 ---
 
 ## 5. wcBindable Surface
@@ -524,7 +548,7 @@ wc-bindable-protocol remote の既存ワイヤ形式に乗る(新しい message 
 
 本パッケージでは Shell が hint と confirmation report を省略形で組み立て(`_buildIntentHint`、`compactStripeError`)、Core がサニタイズ済み `StripeError` と `requestIntent` の戻り値を省略形で組み立て直す。独自 Shell を実装する場合も同じ規則に従うこと。独自 `IStripeProvider` の `retrieveIntent` が返す `amount` / `paymentMethod` は observable(§8.2)にそのまま載るため、JsonValue で返すこと。
 
-**エラーの伝達**: コマンドが reject したとき、throw envelope は `name` / `message` / `stack` に加えて、remote 0.10 以降は producer が付けた文字列 `code` も運ぶ(`WC_BINDABLE_` 接頭辞の application code は `WC_BINDABLE_REMOTE_THROW` に置換される)。非 `Error` の throw は `name: "NonErrorThrow"` の `Error` として届く。`declineCode` / `type` は envelope に乗らないため、完全な `StripeError` は Core が throw の直前に publish する `error` の `update`(§8.2)から読む。Shell は受け取った `code` を Stripe taxonomy(小文字のみ)で allowlist するので、remote 層が合成する大文字の `WC_BINDABLE_*` code が `el.error.code` に現れることはない。
+**エラーの伝達**: コマンドが reject したとき、throw envelope は `name` / `message` / `stack` に加えて、remote 0.10 以降は producer が付けた文字列 `code` も運ぶ(`WC_BINDABLE_` 接頭辞の application code は `WC_BINDABLE_REMOTE_THROW` に置換される)。非 `Error` の throw は `name: "NonErrorThrow"` の `Error` として届く。`declineCode` / `type` は envelope に乗らないため、完全な `StripeError` は Core が throw の直前に publish する `error` の `update`(§8.2)から読む。Shell は受け取った `code` を Stripe taxonomy(小文字のみ)で allowlist するので、remote 層が合成する大文字の `WC_BINDABLE_*` code が `el.error.code` に現れることはない。3DS resume の失敗分類(§4「resume 失敗の分類」)は、reject の `code` か、その RPC の送信後に Core が publish した `error` の `code` だけを使い、初期 `sync` が運ぶ値は使わない。
 
 ### 8.1 Shell → Core(`cmd` / 戻りは `return`)
 
