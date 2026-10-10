@@ -264,9 +264,20 @@ export interface StripeEvent {
  * a 3DS redirect. The Core calls `retrieveIntent` when the Shell reports
  * `outcome: "processing"` to resolve the terminal state without waiting on
  * the webhook.
+ *
+ * `retrieveIntent` must resolve with an object. The Core treats any other
+ * result (`null`, `undefined`, a primitive, an array) as "no answer": a 3DS
+ * resume fails with a code-less error (transient — the redirect URL is
+ * kept, SPEC §4), and the other retrieve paths change nothing.
  */
 export interface StripeIntentView {
   id: string;
+  /**
+   * Stripe's status string. A value that is not a string is handled as an
+   * unknown status: observable `status` is left unchanged and
+   * `stripe-checkout:unknown-status` fires with `status: ""` and a `reason`
+   * naming the value's type (never the value itself).
+   */
   status: string;
   mode: StripeMode;
   /**
@@ -312,6 +323,10 @@ export interface StripeIntentView {
    * state, the wcBindable bindable surface, any `CustomEvent.detail`, any
    * attribute, dataset entry, or log sink. The Core reads it exactly once
    * for comparison and discards it; no other subsystem has a reason to.
+   *
+   * A missing or non-string value counts as "not populated": the resume is
+   * rejected with `resume_client_secret_mismatch` (after the same
+   * constant-time compare).
    */
   clientSecret?: string;
 }
@@ -409,8 +424,12 @@ export interface WcsStripeValues extends WcsStripeCoreValues {
  *
  * `intentId` can be null on the core path if the Core has no
  * `_activeIntent` at dispatch time. `status` is the raw string Stripe
- * returned, or `""` for the shell-malformed path. `reason` is optional,
- * set only when there is additional diagnostic context beyond `status`.
+ * returned, or `""` for the shell-malformed path and when the status was
+ * not a string at all (the value itself is never put in the detail).
+ * `reason` is optional, set only when there is additional diagnostic
+ * context beyond `status` — on the core path, for a status that was not a
+ * string, it names the value's type
+ * (`"retrieveIntent returned a non-string status (number)."`).
  */
 export interface UnknownStatusDetail {
   source: "core" | "shell-confirm" | "shell-malformed";

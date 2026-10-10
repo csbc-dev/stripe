@@ -44,6 +44,8 @@ interface StoredIntent {
 export interface ServerState {
   intents: Map<string, StoredIntent>;
   resumeFixtures: Map<string, StoredIntent>;
+  /** Intent ids whose `retrieveIntent` resolves with `null` (a misbehaving custom provider). */
+  noViewIntents: Set<string>;
   createCalls: Array<{ mode: StripeMode; options: PaymentIntentOptions | SetupIntentOptions }>;
   retrieveCalls: Array<{ mode: StripeMode; id: string }>;
   cancelCalls: string[];
@@ -61,6 +63,7 @@ function createState(): ServerState {
   return {
     intents: new Map(),
     resumeFixtures: new Map(),
+    noViewIntents: new Set(),
     createCalls: [],
     retrieveCalls: [],
     cancelCalls: [],
@@ -151,6 +154,7 @@ class FakeStripeProvider implements IStripeProvider {
 
   async retrieveIntent(mode: StripeMode, id: string): Promise<StripeIntentView> {
     this._state.retrieveCalls.push({ mode, id });
+    if (this._state.noViewIntents.has(id)) return null as unknown as StripeIntentView;
     const stored = this._state.resumeFixtures.get(id) ?? this._state.intents.get(id);
     if (!stored) {
       throw new Error(`unknown intent: ${id}`);
@@ -254,6 +258,7 @@ export async function startServer(port = 0): Promise<RunningServer> {
     reset() {
       state.intents.clear();
       state.resumeFixtures.clear();
+      state.noViewIntents.clear();
       state.createCalls.length = 0;
       state.retrieveCalls.length = 0;
       state.cancelCalls.length = 0;
