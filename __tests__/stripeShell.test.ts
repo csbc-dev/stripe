@@ -7,7 +7,7 @@ import type {
 } from "../src/components/Stripe";
 import type {
   IStripeProvider, IntentCreationResult, PaymentIntentOptions, SetupIntentOptions,
-  StripeEvent, StripeIntentView, StripeMode,
+  StripeError, StripeEvent, StripeIntentView, StripeMode,
 } from "../src/types";
 import { RemoteShellProxy } from "@wc-bindable/remote";
 import type {
@@ -2685,7 +2685,7 @@ describe("<stripe-checkout> Shell", () => {
       (el as any)._setErrorStateFromUnknown(Object.assign(
         new Error("RemoteCoreProxy: invoke(\"requestIntent\") args is not a JsonValue"),
         { code: "WC_BINDABLE_INVALID_JSON_VALUE" },
-      ));
+      ), null);
       expect(el.error?.code).toBeUndefined();
       expect(el.error).toEqual({ message: "RemoteCoreProxy: invoke(\"requestIntent\") args is not a JsonValue" });
     });
@@ -2699,7 +2699,7 @@ describe("<stripe-checkout> Shell", () => {
         declineCode: "insufficient_funds",
         type: "card_error",
         message: "Declined.",
-      });
+      }, null);
       expect(el.error?.code).toBe("card_declined");
       expect(el.error?.declineCode).toBe("insufficient_funds");
       expect(el.error?.type).toBe("card_error");
@@ -2714,7 +2714,7 @@ describe("<stripe-checkout> Shell", () => {
         code: "card_declined",
         decline_code: "insufficient_funds",
         message: "Declined.",
-      });
+      }, null);
       expect(el.error?.code).toBe("card_declined");
       expect(el.error?.declineCode).toBe("insufficient_funds");
       expect(el.error?.type).toBeUndefined();
@@ -2725,7 +2725,7 @@ describe("<stripe-checkout> Shell", () => {
       el = createEl({ mode: "payment", "publishable-key": "pk_test_local" });
       el.attachLocalCore(core);
 
-      (el as any)._setErrorStateFromUnknown({ message: "x" });
+      (el as any)._setErrorStateFromUnknown({ message: "x" }, null);
       expect(el.error?.code).toBeUndefined();
       expect(el.error?.declineCode).toBeUndefined();
       expect(el.error?.type).toBeUndefined();
@@ -3121,6 +3121,621 @@ describe("<stripe-checkout> Shell", () => {
       } finally {
         shellProxy.dispose();
       }
+    });
+  });
+
+  describe("RPC error window: only an error the Core published after the RPC was sent reports that RPC's failure (regression)", () => {
+    // Every RPC whose rejection the Shell reports on `el.error` (requestIntent,
+    // resumeIntent, input setWithAck) takes a window right before it is sent.
+    // On rejection: if the Core published an `error` after the send on the
+    // same connection (and the rejection is not a remote-layer failure), that
+    // publish IS the failure's report — the mirror dispatched it once, with
+    // declineCode / type — and the Shell adds nothing. Otherwise the Shell
+    // reports the rejection itself, once. Before this, requestIntent and
+    // setWithAck compared against "the last time the Shell set an error
+    // locally", so an error the Core had published BEFORE the RPC went out
+    // (a decline reported by reportConfirmation, a failed cancel, a webhook
+    // fold) stood in for the RPC's own failure: the failure was never shown.
+    // Best-effort RPCs (reportConfirmation, cleanup cancelIntent, reset)
+    // never report their rejection on `el.error` in either mode; their Core
+    // publishes reach it once through the mirror (remote) or the Core's own
+    // dispatch (local). All remote runs use the real 0.10 proxy pair.
+
+    const STALE: StripeError = {
+      code: "card_declined",
+      declineCode: "insufficient_funds",
+      type: "card_error",
+      message: "Stale decline from an earlier attempt.",
+    };
+    const OTHER: StripeError = {
+      code: "processing_error",
+      type: "card_error",
+      message: "Another call's failure.",
+    };
+    const DISPOSED: StripeError = { message: "[@csbc-dev/stripe] StripeCore has been disposed." };
+    const INPUT_REFUSED: StripeError = { message: "[@csbc-dev/stripe] amountCurrency rejected by the server." };
+
+    /** Record every `stripe-checkout:error` detail the element dispatches. */
+    function recordErrors(target: EventTarget): unknown[] {
+      const events: unknown[] = [];
+      target.addEventListener("stripe-checkout:error", (e) => events.push((e as CustomEvent).detail));
+      return events;
+    }
+
+    /** Non-null error reports dispatched since `from` (a Core command's `_setError(null)` clear is not a report). */
+    function reportsSince(events: unknown[], from: number): unknown[] {
+      return events.slice(from).filter((d) => d !== null);
+    }
+
+    /** The Core publishes an error that answers no Shell RPC (a webhook fold, another tab's call, …). */
+    function corePublishes(c: StripeCore, err: StripeError): void {
+      (c as unknown as { _setError(e: StripeError | null): void })._setError(err);
+    }
+
+    /** Make the Core refuse one input without publishing anything (a Core subclass validating it). */
+    function refuseInput(c: StripeCore, name: "amountCurrency" | "amountValue", onSet?: () => void): void {
+      Object.defineProperty(c, name, {
+        configurable: true,
+        get: () => null,
+        set: () => {
+          onSet?.();
+          throw new Error(`[@csbc-dev/stripe] ${name} rejected by the server.`);
+        },
+      });
+    }
+
+    /** A server transport that lets a test answer one command / set itself. */
+    function interceptingServer(
+      pair: { server: ServerTransport },
+      intercept: (msg: ClientMessage, reply: (msg: ServerMessage) => void) => boolean,
+    ): ServerTransport {
+      return {
+        send: (msg) => pair.server.send(msg),
+        onMessage: (handler) => pair.server.onMessage((msg) => {
+          if (intercept(msg, (m) => pair.server.send(m))) return;
+          handler(msg);
+        }),
+      };
+    }
+
+    function hasLocalError(): boolean {
+      return (el as unknown as { _hasLocalError: boolean })._hasLocalError;
+    }
+
+    describe("requestIntent", () => {
+      it("an error published before the RPC was sent does not stand in for a failure the Core does not publish", async () => {
+        el = createEl({ mode: "payment" });
+        const events = recordErrors(el);
+        const { client, server } = createMockTransportPair();
+        const shellProxy = new RemoteShellProxy(core, server);
+        try {
+          el._connectRemote(client);
+          await flushTransport(4);
+          corePublishes(core, STALE);
+          await flushTransport(2);
+          expect(el.error).toEqual(STALE);
+
+          // The Core now rejects requestIntent before touching its state.
+          core.dispose();
+          const mark = events.length;
+          el.setAttribute("publishable-key", "pk_test_window");
+          await expect(el.prepare()).rejects.toThrow(/disposed/);
+          await flushTransport(2);
+
+          expect(el.error).toEqual(DISPOSED);
+          expect(reportsSince(events, mark)).toEqual([DISPOSED]);
+        } finally {
+          shellProxy.dispose();
+        }
+      });
+
+      it("a failure the Core publishes after the RPC was sent is reported once, by the mirror, declineCode / type intact", async () => {
+        provider.createPaymentIntent = async () => {
+          throw Object.assign(new Error("Your card has insufficient funds."), {
+            type: "card_error",
+            code: "card_declined",
+            decline_code: "insufficient_funds",
+          });
+        };
+        el = createEl({ mode: "payment" });
+        const events = recordErrors(el);
+        const { client, server } = createMockTransportPair();
+        const shellProxy = new RemoteShellProxy(core, server);
+        try {
+          el._connectRemote(client);
+          await flushTransport(4);
+          corePublishes(core, OTHER);
+          await flushTransport(2);
+
+          const mark = events.length;
+          el.setAttribute("publishable-key", "pk_test_window");
+          await expect(el.prepare()).rejects.toThrow(/insufficient funds/);
+          await flushTransport(2);
+
+          const expected = {
+            code: "card_declined",
+            declineCode: "insufficient_funds",
+            type: "card_error",
+            message: "Your card has insufficient funds.",
+          };
+          expect(el.error).toEqual(expected);
+          expect(reportsSince(events, mark)).toEqual([expected]);
+          expect(hasLocalError()).toBe(false);
+        } finally {
+          shellProxy.dispose();
+        }
+      });
+
+      it.each(["local", "remote"] as const)("%s: a failure the Core does not publish is reported once by the Shell", async (kind) => {
+        // The Core's generation moves on while the provider call is in
+        // flight: requestIntent throws "superseded" without publishing.
+        provider.createPaymentIntent = async () => {
+          core.reset();
+          return { intentId: "pi_superseded", clientSecret: "pi_superseded_secret", mode: "payment" };
+        };
+        const superseded = { message: "[@csbc-dev/stripe] requestIntent superseded." };
+        el = createEl({ mode: "payment" });
+        const events = recordErrors(el);
+        let shellProxy: RemoteShellProxy | null = null;
+        try {
+          if (kind === "local") {
+            el.attachLocalCore(core);
+          } else {
+            const { client, server } = createMockTransportPair();
+            shellProxy = new RemoteShellProxy(core, server);
+            el._connectRemote(client);
+          }
+          await flushTransport(4);
+          const mark = events.length;
+          el.setAttribute("publishable-key", "pk_test_window");
+          await expect(el.prepare()).rejects.toThrow(/superseded/);
+          await flushTransport(2);
+
+          expect(el.error).toEqual(superseded);
+          expect(reportsSince(events, mark)).toEqual([superseded]);
+        } finally {
+          shellProxy?.dispose();
+        }
+      });
+
+      it("a remote-layer failure is reported by the Shell even when another call's error is published inside its window", async () => {
+        const pair = createMockTransportPair();
+        const server = interceptingServer(pair, (msg, reply) => {
+          if (msg.type !== "cmd" || msg.name !== "requestIntent") return false;
+          // Another call's failure lands while requestIntent is in flight …
+          corePublishes(core, OTHER);
+          // … and the producer refuses requestIntent before the Core runs it.
+          reply({
+            type: "throw",
+            id: msg.id,
+            error: { name: "Error", message: 'Command "requestIntent" is not declared in wcBindable.commands', code: "WC_BINDABLE_UNDECLARED_COMMAND" },
+          });
+          return true;
+        });
+        el = createEl({ mode: "payment" });
+        const events = recordErrors(el);
+        const shellProxy = new RemoteShellProxy(core, server);
+        try {
+          el._connectRemote(pair.client);
+          await flushTransport(4);
+          const mark = events.length;
+          el.setAttribute("publishable-key", "pk_test_window");
+          await expect(el.prepare()).rejects.toThrow(/not declared/);
+          await flushTransport(2);
+
+          // Two failures, one report each; the upper-case code stays off `el.error`.
+          const refused = { message: 'Command "requestIntent" is not declared in wcBindable.commands' };
+          expect(reportsSince(events, mark)).toEqual([OTHER, refused]);
+          expect(el.error).toEqual(refused);
+        } finally {
+          shellProxy.dispose();
+        }
+      });
+
+      it("across a reconnect, neither the old connection's publishes nor the new one's sync / earlier publishes stand in", async () => {
+        el = createEl({ mode: "payment" });
+        const events = recordErrors(el);
+        const first = createMockTransportPair();
+        const firstProxy = new RemoteShellProxy(core, first.server);
+        try {
+          el._connectRemote(first.client);
+          await flushTransport(4);
+          corePublishes(core, STALE);
+          await flushTransport(2);
+        } finally {
+          (el as unknown as { _disposeRemote: () => void })._disposeRemote();
+          firstProxy.dispose();
+        }
+
+        const second = createMockTransportPair();
+        const secondProxy = new RemoteShellProxy(core, second.server);
+        try {
+          el._connectRemote(second.client);
+          await flushTransport(4);
+          // The new connection's sync carries STALE; a publish on it precedes the RPC.
+          expect(el.error).toEqual(STALE);
+          corePublishes(core, OTHER);
+          await flushTransport(2);
+
+          core.dispose();
+          const mark = events.length;
+          el.setAttribute("publishable-key", "pk_test_window");
+          await expect(el.prepare()).rejects.toThrow(/disposed/);
+          await flushTransport(2);
+
+          expect(el.error).toEqual(DISPOSED);
+          expect(reportsSince(events, mark)).toEqual([DISPOSED]);
+        } finally {
+          secondProxy.dispose();
+        }
+      });
+    });
+
+    describe("input setWithAck", () => {
+      it("after a declined card, the Core refusing an input without publishing is still reported", async () => {
+        // The decline is set locally first, then reportConfirmation makes the
+        // Core publish it: that publish predates the setWithAck below.
+        fakes.setConfirmResult({
+          error: { type: "card_error", code: "card_declined", decline_code: "insufficient_funds", message: "Your card has insufficient funds." },
+        });
+        el = createEl({ mode: "payment" });
+        const events = recordErrors(el);
+        const { client, server } = createMockTransportPair();
+        const shellProxy = new RemoteShellProxy(core, server);
+        try {
+          el._connectRemote(client);
+          await flushTransport(4);
+          el.setAttribute("publishable-key", "pk_test_window");
+          await el.prepare();
+          await el.submit();
+          await flushTransport(4);
+          expect(el.error).toEqual({
+            code: "card_declined",
+            declineCode: "insufficient_funds",
+            type: "card_error",
+            message: "Your card has insufficient funds.",
+          });
+
+          refuseInput(core, "amountCurrency");
+          const mark = events.length;
+          el.setAttribute("amount-currency", "usd");
+          await flushTransport(4);
+
+          expect(el.error).toEqual(INPUT_REFUSED);
+          expect(reportsSince(events, mark)).toEqual([INPUT_REFUSED]);
+        } finally {
+          shellProxy.dispose();
+        }
+      });
+
+      it("a refusal the Core publishes after the set was sent is reported once, by the mirror", async () => {
+        const published: StripeError = {
+          code: "amount_too_large",
+          type: "invalid_request_error",
+          message: "Amount must be no more than 99,999,999.",
+        };
+        el = createEl({ mode: "payment" });
+        const events = recordErrors(el);
+        const { client, server } = createMockTransportPair();
+        const shellProxy = new RemoteShellProxy(core, server);
+        try {
+          el._connectRemote(client);
+          await flushTransport(4);
+          corePublishes(core, STALE);
+          await flushTransport(2);
+
+          refuseInput(core, "amountValue", () => corePublishes(core, published));
+          const mark = events.length;
+          el.setAttribute("amount-value", "100000000");
+          await flushTransport(4);
+
+          expect(el.error).toEqual(published);
+          expect(reportsSince(events, mark)).toEqual([published]);
+          expect(hasLocalError()).toBe(false);
+        } finally {
+          shellProxy.dispose();
+        }
+      });
+
+      it("connect-time: an error delivered by the initial sync does not stand in for the Core refusing an input", async () => {
+        corePublishes(core, STALE);
+        refuseInput(core, "amountCurrency");
+        el = createEl({ mode: "payment", "amount-currency": "usd" });
+        const events = recordErrors(el);
+        const { client, server } = createMockTransportPair();
+        const shellProxy = new RemoteShellProxy(core, server);
+        try {
+          // The set goes out before the sync snapshot arrives.
+          el._connectRemote(client);
+          await flushTransport(6);
+
+          expect(el.error).toEqual(INPUT_REFUSED);
+          expect(reportsSince(events, 0)).toEqual([STALE, INPUT_REFUSED]);
+        } finally {
+          shellProxy.dispose();
+        }
+      });
+
+      it("a remote-layer refusal is reported by the Shell even when another call's error is published inside its window", async () => {
+        const pair = createMockTransportPair();
+        const server = interceptingServer(pair, (msg, reply) => {
+          if (msg.type !== "set" || msg.name !== "amountCurrency") return false;
+          corePublishes(core, OTHER);
+          reply({
+            type: "throw",
+            id: msg.id!,
+            error: { name: "Error", message: 'Input "amountCurrency" is not declared in wcBindable.inputs', code: "WC_BINDABLE_UNDECLARED_INPUT" },
+          });
+          return true;
+        });
+        el = createEl({ mode: "payment" });
+        const events = recordErrors(el);
+        const shellProxy = new RemoteShellProxy(core, server);
+        try {
+          el._connectRemote(pair.client);
+          await flushTransport(4);
+          const mark = events.length;
+          el.setAttribute("amount-currency", "usd");
+          await flushTransport(4);
+
+          const refused = { message: 'Input "amountCurrency" is not declared in wcBindable.inputs' };
+          expect(reportsSince(events, mark)).toEqual([OTHER, refused]);
+          expect(el.error).toEqual(refused);
+        } finally {
+          shellProxy.dispose();
+        }
+      });
+
+      it("a rejection that arrives from a replaced connection is reported, not paired with the new connection's publish", async () => {
+        // Connection 1: hold the server's answers back.
+        refuseInput(core, "amountCurrency");
+        const first = createMockTransportPair();
+        let hold = false;
+        const held: ServerMessage[] = [];
+        const firstServer: ServerTransport = {
+          send: (msg) => { if (hold) held.push(msg); else first.server.send(msg); },
+          onMessage: (handler) => first.server.onMessage(handler),
+        };
+        el = createEl({ mode: "payment" });
+        const events = recordErrors(el);
+        const firstProxy = new RemoteShellProxy(core, firstServer);
+        const secondCore = new StripeCore(new FakeProvider(), { webhookSecret: "whsec_test" });
+        const second = createMockTransportPair();
+        const secondProxy = new RemoteShellProxy(secondCore, second.server);
+        try {
+          el._connectRemote(first.client);
+          await flushTransport(4);
+          hold = true;
+          el.setAttribute("amount-currency", "usd"); // refused on connection 1, answer held
+          await flushTransport(2);
+
+          // The element is moved: the old connection is torn down in the
+          // background (its proxy lives until the cleanup's reset returns) and
+          // a new one is established.
+          el.remove();
+          document.body.appendChild(el);
+          el._connectRemote(second.client);
+          await flushTransport(4);
+          corePublishes(secondCore, OTHER);
+          await flushTransport(2);
+          expect(el.error).toEqual(OTHER);
+
+          const mark = events.length;
+          hold = false;
+          for (const msg of held.splice(0)) first.server.send(msg);
+          await flushTransport(4);
+
+          expect(el.error).toEqual(INPUT_REFUSED);
+          expect(reportsSince(events, mark)).toEqual([INPUT_REFUSED]);
+        } finally {
+          firstProxy.dispose();
+          secondProxy.dispose();
+        }
+      });
+    });
+
+    describe("resumeIntent", () => {
+      const INTENT = "pi_window";
+      const REDIRECT = `?payment_intent=${INTENT}&payment_intent_client_secret=${INTENT}_secret_ok`;
+
+      it("an error published before the RPC was sent does not stand in for a failure the Core does not publish", async () => {
+        el = createEl({ mode: "payment" });
+        const events = recordErrors(el);
+        const { client, server } = createMockTransportPair();
+        const shellProxy = new RemoteShellProxy(core, server);
+        try {
+          el._connectRemote(client);
+          await flushTransport(4);
+          corePublishes(core, STALE);
+          await flushTransport(2);
+
+          core.dispose();
+          setUrlSearch(REDIRECT);
+          const mark = events.length;
+          await (el as unknown as { _resumeFromRedirect: () => Promise<void> })._resumeFromRedirect();
+          await flushTransport(2);
+
+          expect(el.error).toEqual(DISPOSED);
+          expect(reportsSince(events, mark)).toEqual([DISPOSED]);
+          expect((el as unknown as { _resumed: boolean })._resumed).toBe(false);
+          expect(new URLSearchParams(globalThis.location.search).has("payment_intent")).toBe(true);
+        } finally {
+          shellProxy.dispose();
+        }
+      });
+
+      it("a remote-layer rejection does not borrow a decisive code another call published inside its window", async () => {
+        // If it did, the URL would be consumed although the Core never ran
+        // the resume — the duplicate-charge exposure SPEC §4 guards against.
+        const published: StripeError = { code: "resource_missing", type: "invalid_request_error", message: "No such payment_intent: pi_other" };
+        const pair = createMockTransportPair();
+        const server = interceptingServer(pair, (msg, reply) => {
+          if (msg.type !== "cmd" || msg.name !== "resumeIntent") return false;
+          corePublishes(core, published);
+          reply({
+            type: "throw",
+            id: msg.id,
+            error: { name: "Error", message: 'Command "resumeIntent" is not declared in wcBindable.commands', code: "WC_BINDABLE_UNDECLARED_COMMAND" },
+          });
+          return true;
+        });
+        el = createEl({ mode: "payment" });
+        const events = recordErrors(el);
+        const shellProxy = new RemoteShellProxy(core, server);
+        try {
+          el._connectRemote(pair.client);
+          await flushTransport(4);
+          setUrlSearch(REDIRECT);
+          const mark = events.length;
+          await (el as unknown as { _resumeFromRedirect: () => Promise<void> })._resumeFromRedirect();
+          await flushTransport(2);
+
+          const refused = { message: 'Command "resumeIntent" is not declared in wcBindable.commands' };
+          expect(reportsSince(events, mark)).toEqual([published, refused]);
+          expect(el.error).toEqual(refused);
+          expect((el as unknown as { _resumed: boolean })._resumed).toBe(false);
+          expect(new URLSearchParams(globalThis.location.search).has("payment_intent")).toBe(true);
+        } finally {
+          shellProxy.dispose();
+        }
+      });
+    });
+
+    describe("best-effort RPCs (reportConfirmation, cancelIntent, reset)", () => {
+      it.each(["local", "remote"] as const)("%s: a cancel the Core fails and publishes during abort() is reported once", async (kind) => {
+        provider.cancelPaymentIntent = async () => {
+          throw Object.assign(new Error("This PaymentIntent's status is succeeded, so it cannot be canceled."), {
+            type: "invalid_request_error",
+            code: "payment_intent_unexpected_state",
+          });
+        };
+        el = createEl({ mode: "payment", "publishable-key": "pk_test_window" });
+        const events = recordErrors(el);
+        let shellProxy: RemoteShellProxy | null = null;
+        try {
+          if (kind === "local") {
+            el.attachLocalCore(core);
+          } else {
+            const { client, server } = createMockTransportPair();
+            shellProxy = new RemoteShellProxy(core, server);
+            el._connectRemote(client);
+          }
+          await el.prepare();
+          await flushTransport(4);
+
+          const mark = events.length;
+          await el.abort();
+          await flushTransport(4);
+
+          const expected = {
+            code: "payment_intent_unexpected_state",
+            type: "invalid_request_error",
+            message: "This PaymentIntent's status is succeeded, so it cannot be canceled.",
+          };
+          expect(el.error).toEqual(expected);
+          expect(reportsSince(events, mark)).toEqual([expected]);
+          expect(hasLocalError()).toBe(false);
+        } finally {
+          shellProxy?.dispose();
+        }
+      });
+
+      it("the failed cancel's publish does not stand in for a later input refusal", async () => {
+        provider.cancelPaymentIntent = async () => {
+          throw Object.assign(new Error("This PaymentIntent's status is succeeded, so it cannot be canceled."), {
+            type: "invalid_request_error",
+            code: "payment_intent_unexpected_state",
+          });
+        };
+        el = createEl({ mode: "payment", "publishable-key": "pk_test_window" });
+        const events = recordErrors(el);
+        const { client, server } = createMockTransportPair();
+        const shellProxy = new RemoteShellProxy(core, server);
+        try {
+          el._connectRemote(client);
+          await el.prepare();
+          await el.abort();
+          await flushTransport(4);
+          expect(el.error?.code).toBe("payment_intent_unexpected_state");
+
+          refuseInput(core, "amountCurrency");
+          const mark = events.length;
+          el.setAttribute("amount-currency", "usd");
+          await flushTransport(4);
+
+          expect(el.error).toEqual(INPUT_REFUSED);
+          expect(reportsSince(events, mark)).toEqual([INPUT_REFUSED]);
+        } finally {
+          shellProxy.dispose();
+        }
+      });
+
+      it.each(["local", "remote"] as const)("%s: a rejected reportConfirmation is logged, never reported on el.error", async (kind) => {
+        const logged: { phase: string; error: unknown }[] = [];
+        WcsStripe.setLogger((phase, error) => logged.push({ phase, error }));
+        el = createEl({ mode: "payment", "publishable-key": "pk_test_window" });
+        const events = recordErrors(el);
+        let shellProxy: RemoteShellProxy | null = null;
+        try {
+          if (kind === "local") {
+            el.attachLocalCore(core);
+          } else {
+            const { client, server } = createMockTransportPair();
+            shellProxy = new RemoteShellProxy(core, server);
+            el._connectRemote(client);
+          }
+          await el.prepare();
+          await flushTransport(4);
+          corePublishes(core, STALE);
+          await flushTransport(2);
+          vi.spyOn(core, "reportConfirmation").mockRejectedValue(new Error("synthetic report failure"));
+
+          const mark = events.length;
+          await expect(el.submit()).resolves.toBeUndefined();
+          await flushTransport(4);
+
+          // The Core never learned of the success, so its earlier error stays.
+          expect(el.error).toEqual(STALE);
+          expect(reportsSince(events, mark)).toEqual([]);
+          const reports = logged.filter((c) => c.phase === "report-confirmation");
+          expect(reports).toHaveLength(1);
+          expect((reports[0].error as Error).message).toBe("synthetic report failure");
+        } finally {
+          shellProxy?.dispose();
+        }
+      });
+
+      it.each(["local", "remote"] as const)("%s: a rejected Core reset is logged, never reported on el.error", async (kind) => {
+        const logged: { phase: string; error: unknown }[] = [];
+        WcsStripe.setLogger((phase, error) => logged.push({ phase, error }));
+        el = createEl({ mode: "payment", "publishable-key": "pk_test_window" });
+        const events = recordErrors(el);
+        let shellProxy: RemoteShellProxy | null = null;
+        try {
+          if (kind === "local") {
+            el.attachLocalCore(core);
+          } else {
+            const { client, server } = createMockTransportPair();
+            shellProxy = new RemoteShellProxy(core, server);
+            el._connectRemote(client);
+          }
+          await el.prepare();
+          await flushTransport(4);
+          vi.spyOn(core, "reset").mockImplementation(() => { throw new Error("synthetic core reset failure"); });
+
+          const mark = events.length;
+          el.reset();
+          await flushTransport(4);
+
+          expect(el.error).toBeNull();
+          expect(reportsSince(events, mark)).toEqual([]);
+          const resets = logged.filter((c) => c.phase === "reset");
+          expect(resets).toHaveLength(1);
+          expect((resets[0].error as Error).message).toBe("synthetic core reset failure");
+        } finally {
+          shellProxy?.dispose();
+        }
+      });
     });
   });
 

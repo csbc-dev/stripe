@@ -172,15 +172,16 @@ raw な authorizer 例外(ACL lookup 失敗、DB エラー、stack trace など)
 | code 付きの失敗だが Core は publish しない(supersede) | taxonomy code | 同じ | なし | 決定的 / 消費 |
 | provider が Stripe に届かない(code 無し) | なし | なし | code 無しの `error` | 一時的 / 保持 |
 | code 無しで Core も publish しない(supersede、disposed Core 等) | なし | なし | なし | 一時的 / 保持 |
-| Core まで届かない(送信失敗・切断・producer 側の reject) | — | なし or `WC_BINDABLE_*` | なし | 一時的 / 保持 |
+| Core まで届かない(送信失敗・切断・producer 側の reject) | — | なし or `WC_BINDABLE_*` | なし(`WC_BINDABLE_*` の reject では窓の publish を見ない) | 一時的 / 保持 |
 
-remote では reject の `code`(`@wc-bindable/remote` ≥ 0.10 で throw envelope に載る)に加え、**その resume の RPC を送った時点以降に、同じ接続で** Core が publish した `error`(`update`)の `code` も見る(throw に `code` を載せない 0.10 未満の producer への backstop。Core はどちらにも同じサニタイズ済み `code` を載せる)。このとき数えるのは non-null の `update` だけで、次は数えない:
+remote では reject の `code`(`@wc-bindable/remote` ≥ 0.10 で throw envelope に載る)に加え、**その resume の RPC を送った時点以降に、同じ接続で** Core が publish した `error`(`update`)の `code` も見る(throw に `code` を載せない 0.10 未満の producer への backstop。Core はどちらにも同じサニタイズ済み `code` を載せる)。この「送信時点の窓」は resume だけのものではなく、Shell が失敗を報告するすべての RPC に共通の規則である(§8「RPC の失敗の報告」)。このとき数えるのは non-null の `update` だけで、次は数えない:
 
 - **初期 `sync` の値と、それより前に届いた `update`**。producer は接続の最初に届いた `sync` に先に答えるため、これらはこの接続から送ったどの RPC よりも前の Core 状態である。post-redirect のページ読み込みでは resume は `_connectRemote` の直後、`sync` 応答が適用される前に送られる(proxy の既定 `preSyncBehavior: "eager"`。`"queue"` なら `sync` 適用直後に送られる)が、どちらでも基準は「`sync` 適用後」になる。Shell は client transport を薄く包んで `sync` フレームを識別する。
 - RPC 送信前から残っていた `error`、および `null`(各コマンド冒頭の `_setError(null)` はエラー報告ではない)。
 - 別の接続で publish されたもの(切断・再接続をまたぐ窓は無効)。
+- reject 自体が remote 層の失敗(`WC_BINDABLE_REMOTE_THROW` 以外の `WC_BINDABLE_*`)のときの、窓の中の publish。Core は resume を実行していないので、それは別の呼び出しの publish である。
 
-remote の `el.error` も同じ窓で決める: 送信後に Core が publish した `error` があればそれ(`declineCode` / `type` を含む完全形)、無ければ reject 自体をサニタイズしたもの。初期 `sync` が運んだ古い `error` が今回の失敗の代わりに表示されることはない。
+remote の `el.error` も同じ窓で決める(§8 の規則 1 / 2): 送信後に Core が publish した `error` があればそれ(`declineCode` / `type` を含む完全形。ミラーが表示済み)、無ければ reject 自体をサニタイズしたもの。初期 `sync` が運んだ古い `error` や送信前に publish された `error` が、今回の失敗の代わりに表示されることはない。
 
 ---
 
@@ -548,7 +549,22 @@ wc-bindable-protocol remote の既存ワイヤ形式に乗る(新しい message 
 
 本パッケージでは Shell が hint と confirmation report を省略形で組み立て(`_buildIntentHint`、`compactStripeError`)、Core がサニタイズ済み `StripeError` と `requestIntent` の戻り値を省略形で組み立て直す。独自 Shell を実装する場合も同じ規則に従うこと。独自 `IStripeProvider` の `retrieveIntent` が返す `amount` / `paymentMethod` は observable(§8.2)にそのまま載るため、JsonValue で返すこと。
 
-**エラーの伝達**: コマンドが reject したとき、throw envelope は `name` / `message` / `stack` に加えて、remote 0.10 以降は producer が付けた文字列 `code` も運ぶ(`WC_BINDABLE_` 接頭辞の application code は `WC_BINDABLE_REMOTE_THROW` に置換される)。非 `Error` の throw は `name: "NonErrorThrow"` の `Error` として届く。`declineCode` / `type` は envelope に乗らないため、完全な `StripeError` は Core が throw の直前に publish する `error` の `update`(§8.2)から読む。Shell は受け取った `code` を Stripe taxonomy(小文字のみ)で allowlist するので、remote 層が合成する大文字の `WC_BINDABLE_*` code が `el.error.code` に現れることはない。3DS resume の失敗分類(§4「resume 失敗の分類」)は、reject の `code` か、その RPC の送信後に Core が publish した `error` の `code` だけを使い、初期 `sync` が運ぶ値は使わない。
+**エラーの伝達**: コマンドが reject したとき、throw envelope は `name` / `message` / `stack` に加えて、remote 0.10 以降は producer が付けた文字列 `code` も運ぶ(`WC_BINDABLE_` 接頭辞の application code は `WC_BINDABLE_REMOTE_THROW` に置換される)。非 `Error` の throw は `name: "NonErrorThrow"` の `Error` として届く。`declineCode` / `type` は envelope に乗らないため、完全な `StripeError` は Core が throw の直前に publish する `error` の `update`(§8.2)から読む。Shell は受け取った `code` を Stripe taxonomy(小文字のみ)で allowlist するので、remote 層が合成する大文字の `WC_BINDABLE_*` code が `el.error.code` に現れることはない。
+
+**RPC の失敗の報告(送信時点の窓)**: Shell が Core に送る RPC のうち、失敗を `el.error` に報告するもの(`prepare()` の `requestIntent`、3DS 復帰の `resumeIntent`、入力の `setWithAck`)は、送信の直前に「窓」(その接続と、その時点までに Core が publish した `error` の数)を取る。reject を受けたら次の規則で報告者を決め、1 つの失敗につき `stripe-checkout:error` を 1 回だけ dispatch する:
+
+1. 送信後に**同じ接続で** Core が non-null の `error` を publish しており、かつ reject が remote 層の失敗でない → その publish が今回の失敗の報告である。`bind()` のミラーが `declineCode` / `type` を含む完全形で既に 1 回 dispatch しているので、Shell は何もしない(Core は `_setError` で publish してから throw し、producer は `update` を `throw` より先に送るので、reject が届いた時点でミラーは適用済み)。
+2. それ以外 → Shell が reject をサニタイズして 1 回報告する。該当するのは、Core が publish せずに reject したとき(validation の `raiseError`、dispose 済みの Core、generation の supersede、同じ値で dedup された `_setError`)、remote 層の失敗(`WC_BINDABLE_` 接頭辞の code。ただし Core の throw を表しうる `WC_BINDABLE_REMOTE_THROW` は除く。consumer 側の `_TIMEOUT` / `_DISPOSED` / `_TERMINAL_FAILURE` / 送信前の `_INVALID_JSON_VALUE`、producer が Core に触れる前に返す `_UNDECLARED_COMMAND` / `_UNDECLARED_INPUT` / `_PROTOCOL_ERROR` など)、窓を取った接続が切断・置換された後に届いた reject である。
+
+窓で数えるのは、その接続の初期 `sync` を適用した後に届いた non-null の `update` だけである(§4 と同じ規則)。送信前から Core にあった `error`、つまり送信前に publish されたもの(`reportConfirmation` で記録された decline、失敗した cancel、webhook の fold など)や初期 `sync` が運んだものは、今回の失敗の報告として扱わない。扱うと今回の失敗が表示されず、古い error が見えたままになる。別の接続で publish された `error` とも対応付けない。
+
+local モード(`attachLocalCore`)にはミラーも接続も無いので、窓は常に「publish なし」と答え、Shell の報告は従来と変わらない。RPC を伴わない Shell 側の失敗(Stripe.js のロード・Elements の mount・confirm の throw、WebSocket の初期化失敗)も、常に Shell が報告する。
+
+best-effort の RPC(submit 後の `reportConfirmation`、孤児 intent の `cancelIntent`、`abort()` の `cancelIntent`、`reset`)は、どちらのモードでも reject を `el.error` に報告しない(`reportConfirmation` と孤児 intent の `cancelIntent` / `reset` は `Stripe._logger` に流す。§7.6)。Core がそれらの呼び出しで `error` を publish した場合は、ミラー(remote)または Core 自身の dispatch(local)が 1 回だけ報告する。上の規則により、その publish が後続の別の RPC の失敗の報告と取り違えられることはない。
+
+3DS resume の失敗分類(§4「resume 失敗の分類」)は、reject の `code` か、規則 1 で今回の失敗の報告と判定された `error` の `code` だけを使う。初期 `sync` が運ぶ値も、remote 層の失敗の窓に入った別の呼び出しの publish も使わない。
+
+既知の制約: 窓は publish の数で判定するので、同じ接続で並行している別の RPC が窓の中で `error` を publish すると、publish せずに失敗した RPC がそれを自分の報告と取り違えることがある(その失敗は表示されない)。remote 層の失敗はこの取り違えから除外される(規則 1)。
 
 ### 8.1 Shell → Core(`cmd` / 戻りは `return`)
 
