@@ -83,7 +83,7 @@ type RetrievedIntentView = { readonly [key: string]: unknown };
  * nothing and leave the webhook to decide.
  */
 function isRetrievedIntentView(value: unknown): value is RetrievedIntentView {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  return isObjectRecord(value);
 }
 
 /**
@@ -104,6 +104,44 @@ function typeNameOf(value: unknown): string {
   if (value === null) return "null";
   if (Array.isArray(value)) return "array";
   return typeof value;
+}
+
+/** A non-null, non-array object: the container check of `isRetrievedIntentView` and `webhookEventDefect`. */
+function isObjectRecord(value: unknown): value is { readonly [key: string]: unknown } {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Why an `IStripeProvider.verifyWebhook` result cannot be handled as a
+ * `StripeEvent`, or `null` when it can. Same policy as
+ * `isRetrievedIntentView`: the provider seam is open to custom
+ * implementations, so `handleWebhook` checks the shape it relies on before
+ * reading any member, instead of failing with a raw TypeError
+ * (`event.id` of `null`, `event.type.startsWith` of a number) or handing
+ * registered handlers an event they cannot read.
+ *
+ * Checked: the event is an object (not `null`, not an array); `type` is a
+ * non-empty string (the dedup detail, the fold's mode prefix and the handler
+ * lookup all key on it); `data` and `data.object` are objects (the fold and
+ * every handler read `event.data.object`).
+ *
+ * Deliberately NOT checked: `id`. An empty or missing id is the documented
+ * dedup-bypass contract (see `handleWebhook`) and nothing in the Core
+ * dereferences it. `created` is never read by the Core.
+ *
+ * The reason names the field and the value's type only (`typeNameOf`),
+ * never the value: the result is a provider's parse of an HTTP body.
+ */
+function webhookEventDefect(value: unknown): string | null {
+  if (!isObjectRecord(value)) return `not an event object (${typeNameOf(value)})`;
+  const type = value.type;
+  if (typeof type !== "string" || type === "") {
+    return `type is not a non-empty string (${type === "" ? "empty string" : typeNameOf(type)})`;
+  }
+  const data = value.data;
+  if (!isObjectRecord(data)) return `data is not an object (${typeNameOf(data)})`;
+  if (!isObjectRecord(data.object)) return `data.object is not an object (${typeNameOf(data.object)})`;
+  return null;
 }
 
 /**
@@ -1691,7 +1729,9 @@ export class StripeCore extends EventTarget {
 
   /**
    * Called from the app's HTTP route that receives Stripe webhooks. Verifies
-   * the signature header against the webhook signing secret, dispatches the
+   * the signature header against the webhook signing secret, checks that the
+   * provider returned a well-formed event (`webhookEventDefect`; a broken one
+   * rejects with a sanitized error and changes nothing), dispatches the
    * parsed event to registered handlers, and folds common `payment_intent.*`
    * / `setup_intent.*` events back into observable state so subscribed Shells
    * see the terminal status without a round-trip through the client.
@@ -1744,9 +1784,11 @@ export class StripeCore extends EventTarget {
       raiseError("signatureHeader must be a non-empty string.");
     }
 
-    let event: StripeEvent;
+    // `unknown` until the shape check below: a custom provider can return
+    // anything despite the `StripeEvent` signature.
+    let verified: unknown;
     try {
-      event = this._provider.verifyWebhook(rawBody, signatureHeader, this._webhookSecret);
+      verified = this._provider.verifyWebhook(rawBody, signatureHeader, this._webhookSecret);
     } catch (e: unknown) {
       // Signature verification failure must propagate so the HTTP route
       // returns 4xx and Stripe does not keep retrying a payload we cannot
@@ -1761,6 +1803,21 @@ export class StripeCore extends EventTarget {
       // server-side instead.
       throw e;
     }
+
+    // Shape check, after signature verification and before any member is
+    // read (`webhookEventDefect`). A broken event is rejected with a fixed,
+    // sanitized `[@csbc-dev/stripe]` error that names the field and the
+    // value's type, never the value — the same style as the rawBody /
+    // signatureHeader rejections above. Like a signature failure it touches
+    // nothing: no observable state, no event on the target, no handler, and
+    // no dedup entry, so a later delivery of the same event id (Stripe's
+    // retry, a resend from the dashboard) is processed normally once the
+    // provider is fixed.
+    const defect = webhookEventDefect(verified);
+    if (defect !== null) {
+      raiseError(`provider.verifyWebhook did not return a valid event: ${defect}.`);
+    }
+    const event = verified as StripeEvent;
 
     // Dedup is checked BEFORE fold + handler dispatch, so a duplicate
     // delivery short-circuits both. This is intentional: refolding is

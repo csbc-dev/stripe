@@ -123,6 +123,92 @@ async function flushTransport(rounds = 4): Promise<void> {
 /** The Core's code-less failure when `retrieveIntent` resolves with something that is not an object. */
 const NO_VIEW_MESSAGE = "[@csbc-dev/stripe] provider.retrieveIntent did not return an intent view object.";
 
+/**
+ * WebSocket stand-in bridged to a server-side `RemoteShellProxy`, so the
+ * Shell's real `_initRemote` path (its `onFail` handler + the 0.10
+ * `WebSocketClientTransport` + `RemoteCoreProxy`) runs end to end. Same
+ * harness as s3-uploader's, plus `signal` support: the Shell registers its
+ * socket listeners with an `AbortSignal`. Listener dispatch follows the DOM
+ * rule that a listener removed earlier in the same dispatch does not run.
+ */
+const bridgedSockets: BridgedWebSocket[] = [];
+
+class BridgedWebSocket {
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSING = 2;
+  static readonly CLOSED = 3;
+
+  readyState = BridgedWebSocket.CONNECTING;
+  private _listeners = new Map<string, Array<{ fn: (ev: unknown) => void; once: boolean }>>();
+  private _serverHandler: ((m: ClientMessage) => void) | null = null;
+
+  constructor(readonly url: string) {
+    bridgedSockets.push(this);
+  }
+
+  /** The server end of this socket, for a `RemoteShellProxy`. */
+  readonly server: ServerTransport = {
+    send: (m) => {
+      const frame = JSON.stringify(m);
+      queueMicrotask(() => {
+        if (this.readyState === BridgedWebSocket.OPEN) this._fire("message", { type: "message", data: frame });
+      });
+    },
+    onMessage: (h) => { this._serverHandler = h; },
+  };
+
+  addEventListener(type: string, fn: (ev: unknown) => void, opts?: boolean | AddEventListenerOptions): void {
+    const options = typeof opts === "object" ? opts : {};
+    if (options.signal?.aborted) return;
+    const list = this._listeners.get(type) ?? [];
+    if (list.some(l => l.fn === fn)) return;
+    list.push({ fn, once: !!options.once });
+    this._listeners.set(type, list);
+    options.signal?.addEventListener("abort", () => this.removeEventListener(type, fn), { once: true });
+  }
+  removeEventListener(type: string, fn: (ev: unknown) => void): void {
+    const list = this._listeners.get(type);
+    if (list) this._listeners.set(type, list.filter(l => l.fn !== fn));
+  }
+  send(data: string): void {
+    if (this.readyState !== BridgedWebSocket.OPEN) throw new Error("InvalidStateError: socket is not open");
+    queueMicrotask(() => this._serverHandler?.(JSON.parse(data) as ClientMessage));
+  }
+  close(): void { this.readyState = BridgedWebSocket.CLOSED; }
+
+  open(): void {
+    this.readyState = BridgedWebSocket.OPEN;
+    this._fire("open", { type: "open" });
+  }
+  /** The connection drops after it was established. */
+  drop(): void {
+    this.readyState = BridgedWebSocket.CLOSED;
+    this._fire("close", { type: "close" });
+  }
+  /** The connection never comes up (`error` then `close`, as browsers do). */
+  fail(): void {
+    this._fire("error", { type: "error" });
+    this.readyState = BridgedWebSocket.CLOSED;
+    this._fire("close", { type: "close" });
+  }
+
+  private _fire(type: string, ev: unknown): void {
+    for (const entry of [...(this._listeners.get(type) ?? [])]) {
+      if (!this._listeners.get(type)?.includes(entry)) continue;
+      if (entry.once) this.removeEventListener(type, entry.fn);
+      entry.fn(ev);
+    }
+  }
+}
+
+/** A promise the test settles by hand. */
+function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => { resolve = r; });
+  return { promise, resolve };
+}
+
 describe("<stripe-checkout> Shell", () => {
   let el: WcsStripe;
   let provider: FakeProvider;
@@ -3997,6 +4083,294 @@ describe("<stripe-checkout> Shell", () => {
           shellProxy?.dispose();
         }
       });
+
+      it.each(["local", "remote"] as const)("%s: a rejected cancelIntent during abort() is logged once, never reported on el.error", async (kind) => {
+        // SPEC §7.6: a best-effort failure is never dropped silently. abort()
+        // used to swallow its cancel's rejection with an empty catch, so a
+        // cancel that failed without the Core publishing anything reached
+        // neither `el.error` nor `Stripe._logger`.
+        const logged: { phase: string; error: unknown }[] = [];
+        WcsStripe.setLogger((phase, error) => logged.push({ phase, error }));
+        el = createEl({ mode: "payment", "publishable-key": "pk_test_window" });
+        const events = recordErrors(el);
+        let shellProxy: RemoteShellProxy | null = null;
+        try {
+          if (kind === "local") {
+            el.attachLocalCore(core);
+          } else {
+            const { client, server } = createMockTransportPair();
+            shellProxy = new RemoteShellProxy(core, server);
+            el._connectRemote(client);
+          }
+          await el.prepare();
+          await flushTransport(4);
+          vi.spyOn(core, "cancelIntent").mockRejectedValue(new Error("synthetic cancel failure"));
+
+          const mark = events.length;
+          await expect(el.abort()).resolves.toBeUndefined();
+          await flushTransport(4);
+
+          expect(el.error).toBeNull();
+          expect(reportsSince(events, mark)).toEqual([]);
+          const cancels = logged.filter((c) => c.phase === "cancelIntent");
+          expect(cancels).toHaveLength(1);
+          expect((cancels[0].error as Error).message).toBe("synthetic cancel failure");
+        } finally {
+          shellProxy?.dispose();
+        }
+      });
+
+      it("a cancel the Core fails and publishes during abort() is logged once as well as reported once (remote)", async () => {
+        provider.cancelPaymentIntent = async () => {
+          throw Object.assign(new Error("This PaymentIntent's status is succeeded, so it cannot be canceled."), {
+            type: "invalid_request_error",
+            code: "payment_intent_unexpected_state",
+          });
+        };
+        const logged: { phase: string; error: unknown }[] = [];
+        WcsStripe.setLogger((phase, error) => logged.push({ phase, error }));
+        el = createEl({ mode: "payment", "publishable-key": "pk_test_window" });
+        const events = recordErrors(el);
+        const { client, server } = createMockTransportPair();
+        const shellProxy = new RemoteShellProxy(core, server);
+        try {
+          el._connectRemote(client);
+          await el.prepare();
+          await flushTransport(4);
+
+          const mark = events.length;
+          await el.abort();
+          await flushTransport(4);
+
+          // The mirror is the one report; the logger gets the rejection once.
+          expect(reportsSince(events, mark)).toHaveLength(1);
+          const cancels = logged.filter((c) => c.phase === "cancelIntent");
+          expect(cancels).toHaveLength(1);
+          expect((cancels[0].error as { code?: unknown }).code).toBe("payment_intent_unexpected_state");
+        } finally {
+          shellProxy.dispose();
+        }
+      });
+    });
+
+    describe("a dropped WebSocket is reported once, as transport_unavailable (regression)", () => {
+      // `onFail` reports the drop (`transport_unavailable`) and then
+      // `_disposeRemote` rejects every pending RPC with
+      // `WC_BINDABLE_DISPOSED`. Those rejections are the drop's consequence:
+      // reporting them as well fired a second `stripe-checkout:error` and
+      // replaced the informative `transport_unavailable` on `el.error` with
+      // "RemoteCoreProxy disposed". Same rule as s3-uploader's
+      // `_connectionFailureSeq`. These tests run the Shell's real
+      // `_initRemote` against `BridgedWebSocket` and a real 0.10
+      // `RemoteShellProxy`.
+      const WS_URL = "ws://test.invalid/stripe";
+      let origWs: typeof WebSocket;
+      let configSnapshot: { enableRemote: boolean; remoteSettingType: "env" | "config"; remoteCoreUrl: string };
+
+      beforeEach(() => {
+        configSnapshot = { ...stripeConfig.remote };
+        origWs = globalThis.WebSocket;
+        (globalThis as unknown as { WebSocket: unknown }).WebSocket = BridgedWebSocket;
+        bridgedSockets.length = 0;
+        setConfig({ remote: { enableRemote: true, remoteSettingType: "config", remoteCoreUrl: WS_URL } });
+      });
+
+      afterEach(() => {
+        // Detach while the stand-in is still installed, so the element's
+        // teardown runs against the socket it was built with.
+        document.body.innerHTML = "";
+        (globalThis as unknown as { WebSocket: typeof WebSocket }).WebSocket = origWs;
+        setConfig({ remote: configSnapshot });
+      });
+
+      /** Mount an element in remote mode; its socket is still CONNECTING. */
+      function mount(attrs: Record<string, string> = {}): { ws: BridgedWebSocket; events: unknown[] } {
+        const node = document.createElement("stripe-checkout-test") as WcsStripe;
+        for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+        const events = recordErrors(node);
+        document.body.appendChild(node);
+        el = node;
+        expect(bridgedSockets).toHaveLength(1);
+        const ws = bridgedSockets[0];
+        new RemoteShellProxy(core, ws.server);
+        return { ws, events };
+      }
+
+      function expectConnectionError(reports: unknown[], kind: "lost" | "failed"): void {
+        const transportError = { code: "transport_unavailable", message: `WebSocket connection ${kind}: ${WS_URL}` };
+        expect(reports).toEqual([transportError]);
+        expect(el.error).toEqual(transportError);
+      }
+
+      it("while requestIntent is in flight", async () => {
+        const create = deferred();
+        const createPaymentIntent = provider.createPaymentIntent.bind(provider);
+        provider.createPaymentIntent = async (opts) => {
+          await create.promise;
+          return createPaymentIntent(opts);
+        };
+        const { ws, events } = mount({ mode: "payment" });
+        ws.open();
+        await flushTransport(4);
+
+        const mark = events.length;
+        el.setAttribute("publishable-key", "pk_test_drop"); // auto-prepare sends requestIntent
+        const pending = el.prepare();
+        await flushTransport(4);
+        ws.drop();
+        const rejection = await pending.then(() => null, (e: unknown) => e);
+        create.resolve();
+        await flushTransport(4);
+
+        // prepare() still rejects with the remote layer's code …
+        expect((rejection as { code?: unknown }).code).toBe("WC_BINDABLE_DISPOSED");
+        // … but the only report is the drop itself, which names the cause.
+        expectConnectionError(reportsSince(events, mark), "lost");
+      });
+
+      it("while the 3DS resume is in flight: one report, and the redirect URL is kept", async () => {
+        const retrieve = deferred();
+        const retrieveIntent = provider.retrieveIntent.bind(provider);
+        let retrievesStarted = 0;
+        provider.retrieveIntent = async (mode, id) => {
+          retrievesStarted++;
+          await retrieve.promise;
+          return retrieveIntent(mode, id);
+        };
+        setUrlSearch("?payment_intent=pi_drop&payment_intent_client_secret=pi_drop_secret_ok");
+        const { ws, events } = mount({ mode: "payment" }); // the resume is sent on connect
+        ws.open();
+        await flushTransport(4);
+        expect(retrievesStarted).toBe(1); // the Core is inside resumeIntent
+
+        ws.drop();
+        retrieve.resolve();
+        await flushTransport(4);
+
+        expectConnectionError(reportsSince(events, 0), "lost");
+        // A drop is transient: the URL stays for the next connection's resume.
+        expect((el as unknown as { _resumed: boolean })._resumed).toBe(false);
+        expect(new URLSearchParams(globalThis.location.search).has("payment_intent")).toBe(true);
+      });
+
+      it("while an input setWithAck is in flight", async () => {
+        const { ws, events } = mount({ mode: "payment" });
+        ws.open();
+        await flushTransport(4);
+
+        const mark = events.length;
+        el.setAttribute("amount-currency", "usd"); // setWithAck sent, ack not back yet
+        ws.drop();
+        await flushTransport(4);
+
+        expectConnectionError(reportsSince(events, mark), "lost");
+      });
+
+      it("while the connect-time setWithAcks wait for a socket that never opens", async () => {
+        const { ws, events } = mount({ mode: "payment", "amount-value": "1980", "amount-currency": "jpy" });
+
+        ws.fail();
+        await flushTransport(4);
+
+        expectConnectionError(reportsSince(events, 0), "failed");
+      });
+
+      it("a later prepare() on the torn-down element is a separate failure with its own report", async () => {
+        const { ws, events } = mount({ mode: "payment" });
+        ws.open();
+        await flushTransport(4);
+        ws.drop();
+        await flushTransport(2);
+
+        el.setAttribute("publishable-key", "pk_test_drop");
+        await expect(el.prepare()).rejects.toThrow(/no core attached/);
+        await flushTransport(2);
+
+        const reports = reportsSince(events, 0);
+        expect(reports).toHaveLength(2);
+        expect(reports[0]).toEqual({ code: "transport_unavailable", message: `WebSocket connection lost: ${WS_URL}` });
+        expect(reports[1]).toEqual({ message: "[@csbc-dev/stripe] no core attached." });
+        expect(el.error).toEqual(reports[1]);
+      });
+    });
+  });
+
+  describe("a replaced connection's late updates do not reach the element (regression)", () => {
+    // `_disposeRemoteWithBestEffortReset` keeps the old connection bound until
+    // its cleanup (orphan cancel, reset) returns, so the element can already
+    // be on a new connection when the old Core's updates arrive. Those used
+    // to be written into the new connection's `_remoteValues` and dispatched:
+    // the element showed the old Core's `idle` / `intentId: null` over the new
+    // Core's live intent. Only the error COUNT was session-scoped. Real 0.10
+    // proxy pairs on both connections.
+
+    /** Record every bindable property event the element dispatches. */
+    function recordPropertyEvents(target: EventTarget): { type: string; detail: unknown }[] {
+      const seen: { type: string; detail: unknown }[] = [];
+      for (const { event } of WcsStripe.wcBindable.properties) {
+        target.addEventListener(event, (e) => seen.push({ type: e.type, detail: (e as CustomEvent).detail }));
+      }
+      return seen;
+    }
+
+    it("after a reconnect, the old connection's cancel / reset / error updates change no value and dispatch no event", async () => {
+      const secondProvider = new FakeProvider();
+      secondProvider.nextPaymentIntentId = "pi_second";
+      secondProvider.nextClientSecret = "pi_second_secret";
+      const secondCore = new StripeCore(secondProvider, { webhookSecret: "whsec_test" });
+      secondCore.registerIntentBuilder(() => ({ mode: "payment", amount: 500, currency: "usd" }));
+
+      // Connection 1: hold the server's answers back once the element leaves.
+      const first = createMockTransportPair();
+      let hold = false;
+      const held: ServerMessage[] = [];
+      const firstServer: ServerTransport = {
+        send: (msg) => { if (hold) held.push(msg); else first.server.send(msg); },
+        onMessage: (handler) => first.server.onMessage(handler),
+      };
+      const firstProxy = new RemoteShellProxy(core, firstServer);
+      const second = createMockTransportPair();
+      const secondProxy = new RemoteShellProxy(secondCore, second.server);
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_reconnect" });
+      try {
+        el._connectRemote(first.client); // auto-prepare on Core 1
+        await flushTransport(6);
+        expect(el.intentId).toBe("pi_shell");
+        expect(el.status).toBe("collecting");
+
+        hold = true;
+        el.remove(); // the cleanup's orphan cancel reaches Core 1; its updates + return are held
+        await flushTransport(2);
+        document.body.appendChild(el);
+        el._connectRemote(second.client); // auto-prepare on Core 2
+        await flushTransport(6);
+        expect(el.intentId).toBe("pi_second");
+        expect(el.status).toBe("collecting");
+        expect(el.amount).toEqual({ value: 500, currency: "usd" });
+        expect(el.error).toBeNull();
+        // Core 1 also publishes an error after the reconnect (held as well).
+        (core as unknown as { _setError(e: StripeError | null): void })._setError({
+          code: "processing_error",
+          message: "Old connection's failure.",
+        });
+        expect(held.filter((m) => m.type === "update").length).toBeGreaterThan(0);
+
+        const events = recordPropertyEvents(el);
+        hold = false;
+        for (const msg of held.splice(0)) first.server.send(msg);
+        await flushTransport(6); // Core 1's cancel updates + return, then the cleanup's reset
+
+        expect(core.intentId).toBeNull(); // Core 1 did cancel …
+        // … but the element still shows Core 2's session, and nothing fired.
+        expect(el.intentId).toBe("pi_second");
+        expect(el.status).toBe("collecting");
+        expect(el.amount).toEqual({ value: 500, currency: "usd" });
+        expect(el.error).toBeNull();
+        expect(events).toEqual([]);
+      } finally {
+        firstProxy.dispose();
+        secondProxy.dispose();
+      }
     });
   });
 

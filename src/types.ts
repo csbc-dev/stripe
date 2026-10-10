@@ -251,6 +251,14 @@ export interface ConfirmationReport {
  * Narrow view of Stripe's Webhook event. `data.object` is opaque here —
  * apps downcast in their registered handler. Kept minimal so stripe-checkout does
  * not pin itself to a specific stripe-node version's type surface.
+ *
+ * `IStripeProvider.verifyWebhook` must return an object whose `type` is a
+ * non-empty string and whose `data` and `data.object` are objects.
+ * `StripeCore.handleWebhook` checks this right after signature verification
+ * and rejects anything else with a fixed `[@csbc-dev/stripe]` error (field
+ * name and value type only), without touching observable state, handlers or
+ * the dedup window. An empty or missing `id` is accepted; such an event
+ * bypasses dedup.
  */
 export interface StripeEvent {
   id: string;

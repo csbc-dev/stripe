@@ -930,6 +930,92 @@ describe("StripeCore", () => {
         .rejects.toThrow(/signatureHeader/);
     });
 
+    describe("a verifyWebhook result that is not a well-formed event (regression)", () => {
+      // A custom provider's `verifyWebhook` returning a broken event made
+      // handleWebhook throw a raw TypeError (`event.id` of null,
+      // `event.type.startsWith` of a non-string) or silently accept an event
+      // the handlers cannot read. The Core now checks the shape right after
+      // signature verification and rejects with a fixed, sanitized
+      // `[@csbc-dev/stripe]` error — the same policy as the retrieve-view
+      // guard. `LEAK` marks provider values that must never be echoed.
+      const valid = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+        id: "evt_retry",
+        type: "payment_intent.succeeded",
+        data: { object: { id: "pi_123" } },
+        created: 1,
+        ...over,
+      });
+      const withoutKey = (key: string): Record<string, unknown> => {
+        const event = valid();
+        delete event[key];
+        return event;
+      };
+      const cases: [string, unknown, RegExp][] = [
+        ["null", null, /not an event object \(null\)/],
+        ["undefined", undefined, /not an event object \(undefined\)/],
+        ["a string", "evt_LEAK", /not an event object \(string\)/],
+        ["a number", 42, /not an event object \(number\)/],
+        ["an array", [valid({ id: "evt_LEAK" })], /not an event object \(array\)/],
+        ["no type", withoutKey("type"), /type is not a non-empty string \(undefined\)/],
+        ["a numeric type", valid({ type: 42 }), /type is not a non-empty string \(number\)/],
+        ["an object type", valid({ type: { name: "LEAK" } }), /type is not a non-empty string \(object\)/],
+        ["an empty type", valid({ type: "" }), /type is not a non-empty string \(empty string\)/],
+        ["no data", withoutKey("data"), /data is not an object \(undefined\)/],
+        ["null data", valid({ data: null }), /data is not an object \(null\)/],
+        ["string data", valid({ data: "LEAK" }), /data is not an object \(string\)/],
+        ["no data.object", valid({ data: {} }), /data\.object is not an object \(undefined\)/],
+        ["null data.object", valid({ data: { object: null } }), /data\.object is not an object \(null\)/],
+        ["string data.object", valid({ data: { object: "pi_LEAK" } }), /data\.object is not an object \(string\)/],
+        ["array data.object", valid({ data: { object: [{ id: "pi_123" }] } }), /data\.object is not an object \(array\)/],
+      ];
+
+      it.each(cases)("%s: rejected with a sanitized error, after signature verification, touching nothing", async (_label, broken, reason) => {
+        await core.requestIntent({ mode: "payment", hint: {} });
+        expect(core.status).toBe("collecting");
+        let handled = 0;
+        core.registerWebhookHandler("payment_intent.succeeded", () => { handled++; });
+        const dispatched: string[] = [];
+        for (const type of [
+          "stripe-checkout:status-changed", "stripe-checkout:loading-changed", "stripe-checkout:error",
+          "stripe-checkout:paymentMethod-changed", "stripe-checkout:webhook-deduped",
+          "stripe-checkout:webhook-warning", "stripe-checkout:unknown-status",
+        ]) {
+          core.addEventListener(type, () => dispatched.push(type));
+        }
+        const verifyCalls: unknown[][] = [];
+        provider.verifyWebhook = ((...args: unknown[]) => {
+          verifyCalls.push(args);
+          return broken;
+        }) as unknown as FakeProvider["verifyWebhook"];
+
+        const err = await core.handleWebhook("raw", "sig").then(() => null, (e: unknown) => e);
+
+        // Signature verification ran, with the configured secret.
+        expect(verifyCalls).toEqual([["raw", "sig", "whsec_test"]]);
+        // A sanitized Core error, not a raw TypeError, naming only the field
+        // and the value's type.
+        expect(err).toBeInstanceOf(Error);
+        expect(err).not.toBeInstanceOf(TypeError);
+        const message = (err as Error).message;
+        expect(message).toMatch(/^\[@csbc-dev\/stripe\] provider\.verifyWebhook did not return a valid event: /);
+        expect(message).toMatch(reason);
+        expect(message).not.toContain("LEAK");
+        expect((err as { code?: unknown }).code).toBeUndefined();
+        // Nothing was folded, dispatched, or handed to a handler.
+        expect(core.status).toBe("collecting");
+        expect(core.error).toBeNull();
+        expect(handled).toBe(0);
+        expect(dispatched).toEqual([]);
+
+        // The event never entered the dedup window: once the provider is
+        // fixed, Stripe's retry of the same event id goes through.
+        provider.verifyWebhook = () => valid() as unknown as StripeEvent;
+        await core.handleWebhook("raw", "sig");
+        expect(handled).toBe(1);
+        expect(core.status).toBe("succeeded");
+      });
+    });
+
     it("folds payment_intent.succeeded into status when id matches", async () => {
       await core.requestIntent({ mode: "payment", hint: {} });
       provider.webhookEvent = {

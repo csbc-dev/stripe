@@ -91,12 +91,20 @@ interface RemoteSession {
 }
 
 /**
- * Where `Stripe._remoteErrorSeq` stood when an RPC was sent, and on which
- * connection. See `Stripe._coreErrorWindow` / `_coreErrorPublishedSince`.
+ * Where the Shell's two "this failure has already been reported" signals
+ * stood when an RPC was sent: `Stripe._remoteErrorSeq` and the connection it
+ * counts on, and `Stripe._connectionFailureSeq`. See `Stripe._coreErrorWindow`,
+ * `_coreErrorPublishedSince` and `_connectionFailureReportedSince`.
  */
 interface CoreErrorWindow {
   readonly session: RemoteSession | null;
   readonly coreErrors: number;
+  /**
+   * `Stripe._connectionFailureSeq` when the RPC was sent: the WebSocket
+   * failure handler has reported a drop since then iff the counter moved.
+   * Same field as s3-uploader's `ErrorWindow.connectionFailures`.
+   */
+  readonly connectionFailures: number;
 }
 
 /** The Core inputs the Shell forwards (`wcBindable.inputs`). */
@@ -480,6 +488,22 @@ export class Stripe extends HTMLElementCtor {
    * connection never pairs with an RPC sent on another.
    */
   private _remoteErrorSeq: number = 0;
+  /**
+   * Monotonic count of WebSocket failures the `onFail` handler in
+   * `_initRemote` reported (`transport_unavailable`). Every RPC the Shell
+   * reports on `el.error` snapshots it in its window (`_coreErrorWindow`).
+   * A rejection that arrives after the counter moved — the
+   * `WC_BINDABLE_DISPOSED` that `_disposeRemote` gives every pending
+   * `requestIntent` / `resumeIntent` / `setWithAck` — is a consequence of
+   * the drop that has already been reported, so it adds no second
+   * `stripe-checkout:error` and does not replace `transport_unavailable` on
+   * `el.error` (see `_setErrorStateFromUnknown`). Same counter, same rule as
+   * s3-uploader's `_connectionFailureSeq`.
+   *
+   * Never reset, like `_remoteErrorSeq`. In local mode there is no
+   * WebSocket and it never moves.
+   */
+  private _connectionFailureSeq: number = 0;
   /** The error value whose delivery last advanced `_remoteErrorSeq`. */
   private _lastPublishedRemoteError: StripeError | null = null;
   /**
@@ -681,6 +705,13 @@ export class Stripe extends HTMLElementCtor {
       if (failed) return;
       failed = true;
       if (this._ws !== ws) return;
+      // This drop is the one failure reported for whatever is in flight:
+      // `_disposeRemote()` below rejects every pending RPC with
+      // `WC_BINDABLE_DISPOSED`, and `_setErrorStateFromUnknown` drops each of
+      // those rejections because this counter moved after its window was
+      // taken. The event subscribers get is the one below, which names the
+      // cause and the URL (s3-uploader's rule).
+      this._connectionFailureSeq++;
       this._setErrorState({
         code: "transport_unavailable",
         message: `WebSocket connection ${opened ? "lost" : "failed"}: ${safeUrl}`,
@@ -688,6 +719,9 @@ export class Stripe extends HTMLElementCtor {
       this._resetRemoteBusyState();
       this._disposeRemote();
     };
+    // Registered before `WebSocketClientTransport` / the proxy attach their
+    // own close / error listeners below, so `onFail` runs first on a drop:
+    // `_connectionFailureSeq` has moved before the proxy rejects anything.
     ws.addEventListener("error", onFail, { once: true, signal: abort.signal });
     ws.addEventListener("close", onFail, { once: true, signal: abort.signal });
     // `_connectRemote` validates the local-Core / remote-Core mutual
@@ -968,13 +1002,30 @@ export class Stripe extends HTMLElementCtor {
 
   /**
    * Snapshot taken immediately before an RPC is sent (see
-   * `_remoteErrorSeq`). In local mode there is no `bind()` mirror; the
-   * window then has no session and `_coreErrorPublishedSince` always
-   * answers `null`, so every local-mode failure is reported by the Shell
-   * exactly as before.
+   * `_remoteErrorSeq` and `_connectionFailureSeq`). In local mode there is
+   * no `bind()` mirror and no WebSocket; the window then has no session,
+   * `_coreErrorPublishedSince` always answers `null` and
+   * `_connectionFailureReportedSince` always answers `false`, so every
+   * local-mode failure is reported by the Shell exactly as before.
    */
   private _coreErrorWindow(): CoreErrorWindow {
-    return { session: this._remoteSession, coreErrors: this._remoteErrorSeq };
+    return {
+      session: this._remoteSession,
+      coreErrors: this._remoteErrorSeq,
+      connectionFailures: this._connectionFailureSeq,
+    };
+  }
+
+  /**
+   * True when the WebSocket failure handler reported a drop
+   * (`transport_unavailable`) after `since` was taken. The rejection of an
+   * RPC sent before the drop is then the drop's consequence, not a failure
+   * of its own. Always `false` for `SHELL_SIDE_FAILURE`: no RPC was sent.
+   */
+  private _connectionFailureReportedSince(since: CoreErrorWindow | null): boolean {
+    // `== null` also absorbs an untyped caller that passes nothing.
+    if (since == SHELL_SIDE_FAILURE) return false;
+    return this._connectionFailureSeq !== since.connectionFailures;
   }
 
   /**
@@ -1044,6 +1095,16 @@ export class Stripe extends HTMLElementCtor {
     this._proxy = createRemoteCoreProxy(STRIPE_CORE_WC_BINDABLE, this._observeSyncFrames(transport, session));
     this._remoteSession = session;
     this._unbind = bind(this._proxy, (name, value) => {
+      // A delivery from a connection that is no longer the current one
+      // changes nothing. `_disposeRemoteWithBestEffortReset` keeps the old
+      // connection bound until its cleanup (orphan cancel, reset) returns,
+      // and the element may already be on a new connection by then; writing
+      // the old Core's `idle` / `intentId: null` into `_remoteValues` and
+      // dispatching it would overwrite the new connection's state, and an
+      // old `error` would clear the new connection's local error. The
+      // session is the same one `_countsAsCorePublish` checks, so values,
+      // events and the error count all stop at the same boundary.
+      if (session !== this._remoteSession) return;
       this._remoteValues[name] = value;
       if (name === "error" && value) {
         // Count a Core publish (see `_remoteErrorSeq` for what is left
@@ -1109,20 +1170,28 @@ export class Stripe extends HTMLElementCtor {
    * `declineCode` / `type` included, by the time the rejection arrives.
    * The rejection itself carries `name` / `message` / `stack` and (since
    * @wc-bindable/remote 0.10) the producer's string `code`, never
-   * `declineCode` / `type`. Hence the rule (`_coreNotificationOf`):
-   * - the Core published an error after THIS RPC was sent, on the same
-   *   connection, and the rejection is not a remote-layer failure → that
-   *   publish is this failure's notification; stay silent (dispatching the
-   *   sparser copy as well would fire twice and mask the richer error);
+   * `declineCode` / `type`. Hence the rules, in this order:
+   * - the WebSocket failure handler reported a drop after THIS RPC was sent
+   *   (`_connectionFailureReportedSince`) → stay silent. The rejection
+   *   (`WC_BINDABLE_DISPOSED` from `_disposeRemote`) is that drop's
+   *   consequence; reporting it would fire a second event and replace the
+   *   informative `transport_unavailable` on `el.error`. s3-uploader's step 1.
+   * - (`_coreNotificationOf`) the Core published an error after THIS RPC
+   *   was sent, on the same connection, and the rejection is not a
+   *   remote-layer failure → that publish is this failure's notification;
+   *   stay silent (dispatching the sparser copy as well would fire twice and
+   *   mask the richer error);
    * - otherwise → dispatch the sanitized rejection here. That covers a Core
    *   rejection that published nothing (validation `raiseError`, a
    *   disposed Core, a superseded generation, a deduplicated identical
    *   error), a remote-layer failure, a failure on a connection that has
-   *   since been replaced, and every Shell-side or local-mode failure. An
-   *   error that was already on the Core when the RPC went out — published
-   *   earlier, or delivered by the initial `sync` — never stands in for it.
+   *   since been replaced without a reported drop (the element was moved),
+   *   and every Shell-side or local-mode failure. An error that was already
+   *   on the Core when the RPC went out — published earlier, or delivered by
+   *   the initial `sync` — never stands in for it.
    */
   private _setErrorStateFromUnknown(e: unknown, since: CoreErrorWindow | null): void {
+    if (this._connectionFailureReportedSince(since)) return;
     if (this._coreNotificationOf(e, since) !== null) return;
     if (e && typeof e === "object") {
       const rec = e as Record<string, unknown>;
@@ -2526,9 +2595,18 @@ export class Stripe extends HTMLElementCtor {
     try { this._teardownElements(); }
     catch (err) { this._safeLog("teardown", err); }
     if (id) {
+      // Best-effort, like every cleanup cancel (SPEC §7.6 / §8): the
+      // rejection never reaches `el.error` — if the Core published an
+      // `error` for it, the mirror (remote) or the Core's own dispatch
+      // (local) has reported that once — and it is never dropped silently
+      // either: it goes to `Stripe._logger`, same phase as the orphan
+      // cancels in prepare(), `_invalidateForKeyChange` and
+      // `_disposeRemoteWithBestEffortReset`.
       try {
         await this._cancelIntent(id);
-      } catch { /* best-effort */ }
+      } catch (e: unknown) {
+        this._safeLog("cancelIntent", e);
+      }
     } else {
       await this._coreReset();
     }
